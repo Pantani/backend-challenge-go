@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -263,7 +264,7 @@ func consumerConfig() sqsadapter.ConsumerConfig {
 	return sqsadapter.ConsumerConfig{
 		Name: "consumer", QueueURL: "http://sqs/in", DLQURL: "http://sqs/dlq", MaxMessages: 10, WaitTime: time.Second,
 		VisibilityTimeout: 30 * time.Second, ProcessTimeout: time.Second, RetryBase: 2 * time.Second, RetryMax: 10 * time.Second,
-		Senders: sqsadapter.SenderPolicy{"AIDA-PROVIDER-A": {"provider-a"}},
+		MaxReceiveCount: 5, Senders: sqsadapter.SenderPolicy{"AIDA-PROVIDER-A": {"provider-a"}},
 	}
 }
 
@@ -298,7 +299,7 @@ func TestConsumerRetriesTransientFailuresWithBackoff(t *testing.T) {
 	t.Parallel()
 	f := newConsumer(t, &fakeProcessor{results: []error{app.ErrUnavailable, app.ErrConflict}},
 		groupMessage("a", bodyAt("m-a", "2026-09-08T12:00:00Z", "1.00", testWalletA), "1", testWalletA),
-		groupMessage("b", bodyAt("m-b", "2026-09-08T12:00:00Z", "1.00", testWalletB), "9", testWalletB))
+		groupMessage("b", bodyAt("m-b", "2026-09-08T12:00:00Z", "1.00", testWalletB), "4", testWalletB))
 	f.c.PollOnce(context.Background())
 	assert.Empty(t, f.api.deleted, "never deleted before a durable commit")
 	assert.Equal(t, map[string]int32{"rh-a": 2, "rh-b": 10}, f.api.visibility)
@@ -440,6 +441,7 @@ func TestConsumerBackoffCapAndReceiveCountParsing(t *testing.T) {
 	t.Parallel()
 	cfg := consumerConfig()
 	cfg.RetryMax = 24 * time.Hour
+	cfg.MaxReceiveCount = 100
 	f := newConsumerWith(t, cfg, &fakeProcessor{results: []error{app.ErrUnavailable, app.ErrUnavailable, app.ErrUnavailable}},
 		groupMessage("a", bodyAt("m-a", "2026-09-08T12:00:00Z", "1.00", testWalletA), "40", testWalletA),
 		groupMessage("b", bodyAt("m-b", "2026-09-08T12:00:00Z", "1.00", testWalletB), "garbage", testWalletB),
@@ -447,6 +449,72 @@ func TestConsumerBackoffCapAndReceiveCountParsing(t *testing.T) {
 	f.c.PollOnce(context.Background())
 	assert.Equal(t, map[string]int32{"rh-a": 24 * 3600, "rh-b": 2, "rh-c": 2}, f.api.visibility,
 		"the shift is capped and an unreadable count is the first receive")
+}
+
+func TestConsumerDeadLettersTransientFailureAtMaxReceiveCount(t *testing.T) {
+	t.Parallel()
+	f := newConsumer(t, &fakeProcessor{results: []error{app.ErrUnavailable}}, message("a", body("m-a", "1.00"), "5"))
+	f.c.PollOnce(context.Background())
+	require.Len(t, f.api.sent, 1, "the consumer dead-letters it before the broker redrive")
+	assert.Contains(t, aws.ToString(f.api.sent[0].MessageAttributes["failureReason"].StringValue), "gave up after 5 receives")
+	assert.Equal(t, []string{"rh-a"}, f.api.deleted)
+	assert.Empty(t, f.api.visibility)
+}
+
+// byMessageProcessor fails the messages listed in fail and records the ones
+// it processed successfully.
+type byMessageProcessor struct {
+	fail      map[string]error
+	processed []string
+}
+
+func (p *byMessageProcessor) ConsumeMessage(_ context.Context, msg app.InboundMessage) (app.ConsumeResult, error) {
+	if err := p.fail[msg.MessageID]; err != nil {
+		return app.ConsumeResult{}, err
+	}
+	p.processed = append(p.processed, msg.MessageID)
+	return app.ConsumeResult{Result: app.SubmitResult{Transaction: sampleTx()}}, nil
+}
+
+// A FIFO receive returns the failing head of a wallet group together with
+// the message behind it, so both receive counts climb together. The
+// follower must be processed, not dead-lettered for the head's failures:
+// the consumer dead-letters the head itself at MaxReceiveCount, and the
+// broker redrive sits above the follower's inherited count.
+func TestFollowerIsNotDeadLetteredForTheHeadsFailures(t *testing.T) {
+	t.Parallel()
+	cfg := consumerConfig()
+	proc := &byMessageProcessor{fail: map[string]error{"m-head": app.ErrUnavailable}}
+	api := newFakeAPI()
+	c := sqsadapter.NewConsumer(api, cfg, proc, observability.NewLogger(io.Discard, "debug", "t"), &fakeConsumerMetrics{})
+
+	receives := 0
+	api.setReceive(func(context.Context) (*awssqs.ReceiveMessageOutput, error) {
+		receives++ // every receive of the group increments the count of both
+		n := fmt.Sprint(receives)
+		return &awssqs.ReceiveMessageOutput{Messages: []types.Message{
+			message("head", body("m-head", "1.00"), n), message("follower", body("m-follower", "1.00"), n),
+		}}, nil
+	})
+	for range cfg.MaxReceiveCount - 1 {
+		c.PollOnce(context.Background())
+		assert.Empty(t, proc.processed, "the follower waits behind its retried head")
+		assert.Equal(t, int32(0), api.visibility["rh-follower"], "the follower is released, not attempted")
+	}
+	c.PollOnce(context.Background()) // the head reaches MaxReceiveCount
+
+	require.Len(t, api.sent, 1, "only the head is dead-lettered")
+	assert.Equal(t, "head", aws.ToString(api.sent[0].MessageDeduplicationId))
+	assert.Contains(t, aws.ToString(api.sent[0].MessageAttributes["failureReason"].StringValue), "unavailable")
+	assert.Equal(t, []string{"m-follower"}, proc.processed)
+	assert.Equal(t, []string{"rh-head", "rh-follower"}, api.deleted)
+	assert.Less(t, receives, sqsadapter.RedriveMaxReceiveCount(cfg.MaxReceiveCount),
+		"the broker redrive never saw the follower")
+}
+
+func TestRedriveLeavesHeadroomForAFullBatch(t *testing.T) {
+	t.Parallel()
+	assert.Greater(t, sqsadapter.RedriveMaxReceiveCount(5), 5+10)
 }
 
 func TestConsumerReleasesGroupTailWhenDLQSendFails(t *testing.T) {

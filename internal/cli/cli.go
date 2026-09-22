@@ -120,9 +120,10 @@ func serveCmd(ctx context.Context, lookup config.Lookup) error {
 	return serve(ctx, cfg)
 }
 
-// serve runs until SIGINT/SIGTERM (or ctx cancellation), then stops the
-// application within the configured shutdown timeout. Signal handling is
-// released before the stop, so a second signal terminates the process.
+// serve runs until SIGINT/SIGTERM (or ctx cancellation) or until the
+// application asks to shut down (the HTTP server failed), then stops it
+// within the configured shutdown timeout. Signal handling is released before
+// the stop, so a second signal terminates the process.
 func serve(ctx context.Context, cfg config.Config) error {
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -136,11 +137,18 @@ func serve(ctx context.Context, cfg config.Config) error {
 		return err
 	}
 	cancelStart()
-	<-ctx.Done()
+	var exitErr error
+	select {
+	case <-ctx.Done():
+	case sig := <-application.Wait():
+		if sig.ExitCode != 0 {
+			exitErr = fmt.Errorf("application failed (exit code %d)", sig.ExitCode)
+		}
+	}
 	stop()
 	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.ShutdownTimeout)
 	defer cancel()
-	return application.Stop(stopCtx)
+	return errors.Join(exitErr, application.Stop(stopCtx))
 }
 
 // migration is a parsed migrate subcommand.
@@ -228,7 +236,7 @@ func provision(ctx context.Context, lookup config.Lookup, stdout io.Writer) erro
 	}
 	q, err := sqsadapter.Provision(ctx, client, sqsadapter.ProvisionConfig{
 		Names:           bootstrap.QueueNames(cfg),
-		MaxReceiveCount: cfg.SQSMaxReceiveCount, VisibilityTimeout: int(cfg.SQSVisibilityTimeout.Seconds()),
+		MaxReceiveCount: sqsadapter.RedriveMaxReceiveCount(cfg.SQSMaxReceiveCount), VisibilityTimeout: int(cfg.SQSVisibilityTimeout.Seconds()),
 	})
 	if err != nil {
 		return err
