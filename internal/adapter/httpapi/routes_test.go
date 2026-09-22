@@ -242,6 +242,29 @@ func TestGetTransactionRoutes(t *testing.T) {
 	assert.Equal(t, app.Caller{Internal: true}, callers[1])
 }
 
+func TestEscapedExternalIDPreservesPathValues(t *testing.T) {
+	t.Parallel()
+	tx := sampleTx(t, "provider-a", wager.StatusProcessed)
+	var gotProviderID, gotExternalID string
+	f := &fixture{wagers: fakeWagers{byExt: func(_ app.Caller, providerID, externalID string) (*wager.Transaction, error) {
+		gotProviderID, gotExternalID = providerID, externalID
+		return tx, nil
+	}}}
+	cases := []struct {
+		name, path, providerID, externalID string
+	}{
+		{"escaped slash", "/providers/provider%2Fregion/wagering/transactions/external%2Fpart", "provider/region", "external/part"},
+		{"escaped current segment", "/providers/provider-a/wagering/transactions/%2E", "provider-a", "."},
+		{"escaped parent segment", "/providers/provider-a/wagering/transactions/%2E%2E", "provider-a", ".."},
+	}
+	for _, tc := range cases {
+		rec, _ := f.do(t, call{method: http.MethodGet, path: tc.path, token: "admin"})
+		require.Equal(t, http.StatusOK, rec.Code, tc.name)
+		assert.Equal(t, tc.providerID, gotProviderID, tc.name)
+		assert.Equal(t, tc.externalID, gotExternalID, tc.name)
+	}
+}
+
 func TestTransactionResponseWithoutOptionalFields(t *testing.T) {
 	t.Parallel()
 	s := wager.Snapshot{ID: uuid.New(), Origin: wager.OriginInternal, Kind: wager.KindOpening, Status: wager.StatusProcessed,

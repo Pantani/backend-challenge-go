@@ -3,9 +3,11 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -43,4 +45,30 @@ func TestStatusRecorderTracksImplicitWriteAndUnwraps(t *testing.T) {
 	sr.WriteHeader(http.StatusTeapot)
 	assert.Equal(t, http.StatusOK, sr.status, "the first write fixed the status")
 	assert.Same(t, rec, sr.Unwrap())
+}
+
+func TestReadinessProbePanicReturnsUnavailable(t *testing.T) {
+	t.Parallel()
+	logs := &bytes.Buffer{}
+	srv := NewHandler(Deps{
+		Checks: []HealthCheck{{Name: "postgres", Check: func(context.Context) error {
+			panic("dependency boom")
+		}}},
+		Metrics:        testutil.NewMetrics(),
+		MetricsHandler: http.NotFoundHandler(),
+		Logger:         observability.NewLogger(logs, "debug", "test"),
+		ReadyTimeout:   time.Second,
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/health/ready", nil)
+	srv.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	assert.Equal(t, "unready", body["status"])
+	assert.Equal(t, map[string]any{"postgres": "unavailable"}, body["checks"])
+	assert.NotContains(t, rec.Body.String(), "dependency boom", "panic details stay internal")
+	assert.Contains(t, logs.String(), `"check":"postgres"`)
+	assert.Contains(t, logs.String(), "dependency boom")
 }
