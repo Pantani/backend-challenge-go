@@ -222,7 +222,6 @@ func TestApplicationRefusesToStartWithBrokenDependencies(t *testing.T) {
 		"database down": {"DATABASE_URL": "postgres://wallet:wallet@127.0.0.1:1/wallet?sslmode=disable"},
 		"bad database":  {"DATABASE_URL": "postgres://%%%"},
 		"bad listen":    {"HTTP_ADDR": "256.0.0.1:1"},
-		"sender policy": {"SQS_SENDER_PROVIDERS": "missing-equals"},
 	}
 	for name, overrides := range cases {
 		vars := queueVars(names)
@@ -234,6 +233,14 @@ func TestApplicationRefusesToStartWithBrokenDependencies(t *testing.T) {
 		cancelStart()
 		assert.Error(t, err, name)
 	}
+
+	cfg, err := env.Config(queueVars(names))
+	require.NoError(t, err)
+	cfg.SQSSenderProviders = "missing-equals"
+	startCtx, cancelStart := context.WithTimeout(context.Background(), cfg.StartupTimeout)
+	defer cancelStart()
+	app := bootstrap.New(startCtx, cfg, fx.Replace(bootstrap.LogOutput{Writer: io.Discard}))
+	assert.Error(t, app.Err(), "programmatic sender policy bypasses environment validation but not bootstrap validation")
 }
 
 // hookRecorder keeps the stop hooks in execution order (by the function

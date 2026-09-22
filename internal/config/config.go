@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"time"
 
+	sqsadapter "github.com/Pantani/backend-challenge-go/internal/adapter/sqs"
 	"github.com/Pantani/backend-challenge-go/internal/observability"
 )
 
@@ -254,6 +255,7 @@ func (d Database) validate() error {
 
 func (s SQS) validate() error {
 	budget, budgetOK := batchBudget(s.SQSMaxMessages, s.SQSProcessTimeout, s.SQSAckTimeout)
+	_, senderPolicyErr := sqsadapter.ParseSenderPolicy(s.SQSSenderProviders)
 	return errors.Join(check([]rule{
 		{s.SQSConsumers > 0, "SQS_CONSUMERS must be positive"},
 		{s.SQSMaxReceiveCount > 0, "SQS_MAX_RECEIVE_COUNT must be positive"},
@@ -273,7 +275,14 @@ func (s SQS) validate() error {
 	}), wholeSeconds("SQS_WAIT_TIME", s.SQSWaitTime),
 		wholeSeconds("SQS_VISIBILITY_TIMEOUT", s.SQSVisibilityTimeout),
 		wholeSeconds("SQS_RETRY_BASE", s.SQSRetryBase),
-		wholeSeconds("SQS_RETRY_MAX", s.SQSRetryMax))
+		wholeSeconds("SQS_RETRY_MAX", s.SQSRetryMax), namedSenderPolicyError(senderPolicyErr))
+}
+
+func namedSenderPolicyError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("SQS_SENDER_PROVIDERS: %w", err)
 }
 
 // batchBudget returns the worst-case serial processing and acknowledgement

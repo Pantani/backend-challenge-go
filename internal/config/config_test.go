@@ -126,6 +126,22 @@ func TestLoadRejectsNonPositiveSQSValuesByEnvironmentName(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsMalformedSQSSenderProviders(t *testing.T) {
+	t.Parallel()
+	for _, value := range []string{"missing-equals", "=provider-a", "sender=", "sender=a | b", "sender=a||b"} {
+		t.Run(value, func(t *testing.T) {
+			t.Parallel()
+			_, err := config.Load(config.MapLookup(map[string]string{"SQS_SENDER_PROVIDERS": value}))
+			require.ErrorContains(t, err, "SQS_SENDER_PROVIDERS")
+		})
+	}
+
+	_, err := config.Load(config.MapLookup(map[string]string{
+		"SQS_SENDER_PROVIDERS": "sender=provider-a;sender=provider-b",
+	}))
+	require.NoError(t, err, "the adapter parser merges duplicate sender entries")
+}
+
 func TestLoadStartupTimeout(t *testing.T) {
 	t.Parallel()
 	c, err := config.Load(config.MapLookup(map[string]string{"STARTUP_TIMEOUT": "1ms"}))

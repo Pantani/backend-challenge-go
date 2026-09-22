@@ -2,22 +2,26 @@ package bootstrap
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/fx"
 	"go.uber.org/fx/fxtest"
 
+	postgresadapter "github.com/Pantani/backend-challenge-go/internal/adapter/postgres"
 	sqsadapter "github.com/Pantani/backend-challenge-go/internal/adapter/sqs"
 	"github.com/Pantani/backend-challenge-go/internal/app"
 	"github.com/Pantani/backend-challenge-go/internal/config"
@@ -191,4 +195,98 @@ func serveStalledPostgres(t *testing.T, listener net.Listener, accepted chan<- s
 		close(accepted)
 		_, _ = io.Copy(io.Discard, conn)
 	}()
+}
+
+type poolSpy struct {
+	pingErr error
+	ping    func(context.Context) error
+	pings   atomic.Int32
+	closes  atomic.Int32
+}
+
+func (s *poolSpy) open(context.Context, postgresadapter.Config) (poolHandle, error) {
+	return poolHandle{
+		pool: &pgxpool.Pool{},
+		ping: func(ctx context.Context) error {
+			s.pings.Add(1)
+			if s.ping != nil {
+				return s.ping(ctx)
+			}
+			return s.pingErr
+		},
+		close: func() { s.closes.Add(1) },
+	}, nil
+}
+
+type failedPoolConsumer struct{}
+
+func TestPoolOwnershipClosesExactlyOnce(t *testing.T) {
+	t.Run("downstream construction failure", func(t *testing.T) {
+		spy := &poolSpy{}
+		boom := errors.New("downstream construction failed")
+		ctx, cancel := context.WithCancel(context.Background())
+		app := New(ctx, testConfig(t),
+			fx.Replace(poolFactory(spy.open)),
+			fx.Replace(fx.Annotate(fakeQueueAPI{}, fx.As(new(sqsadapter.API)))),
+			fx.Provide(func(*pgxpool.Pool) (failedPoolConsumer, error) { return failedPoolConsumer{}, boom }),
+			fx.Invoke(func(failedPoolConsumer) {}),
+		)
+
+		assert.ErrorIs(t, app.Err(), boom)
+		cancel()
+		assert.EqualValues(t, 1, spy.closes.Load())
+	})
+
+	t.Run("ping failure", func(t *testing.T) {
+		spy := &poolSpy{pingErr: errors.New("ping failed")}
+		app := newAppWithPoolSpy(context.Background(), t, spy)
+		require.NoError(t, app.Err())
+
+		assert.ErrorIs(t, app.Start(context.Background()), spy.pingErr)
+		require.NoError(t, app.Stop(context.Background()))
+		assert.EqualValues(t, 1, spy.pings.Load())
+		assert.EqualValues(t, 1, spy.closes.Load())
+	})
+
+	t.Run("ping timeout", func(t *testing.T) {
+		spy := &poolSpy{ping: func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}}
+		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+		defer cancel()
+		app := newAppWithPoolSpy(ctx, t, spy)
+		require.NoError(t, app.Err())
+
+		assert.ErrorIs(t, app.Start(ctx), context.DeadlineExceeded)
+		require.Eventually(t, func() bool { return spy.closes.Load() == 1 }, time.Second, time.Millisecond)
+		require.NoError(t, app.Stop(context.Background()))
+		assert.EqualValues(t, 1, spy.pings.Load())
+		assert.EqualValues(t, 1, spy.closes.Load())
+	})
+
+	t.Run("successful start transfers ownership to stop", func(t *testing.T) {
+		spy := &poolSpy{}
+		owner := &poolOwner{}
+		ctx, cancel := context.WithCancel(context.Background())
+		lc := fxtest.NewLifecycle(t)
+		_, err := newPool(lc, startupContext{Context: ctx}, testConfig(t), owner, poolFactory(spy.open))
+		require.NoError(t, err)
+		require.NoError(t, lc.Start(ctx))
+
+		cancel()
+		assert.Zero(t, spy.closes.Load(), "startup cancellation no longer owns a successfully started pool")
+		require.NoError(t, lc.Stop(context.Background()))
+		require.NoError(t, lc.Stop(context.Background()))
+		assert.EqualValues(t, 1, spy.pings.Load())
+		assert.EqualValues(t, 1, spy.closes.Load())
+	})
+}
+
+func newAppWithPoolSpy(ctx context.Context, t *testing.T, spy *poolSpy) *fx.App {
+	t.Helper()
+	return New(ctx, testConfig(t),
+		fx.Replace(poolFactory(spy.open)),
+		fx.Replace(fx.Annotate(fakeQueueAPI{}, fx.As(new(sqsadapter.API)))),
+	)
 }

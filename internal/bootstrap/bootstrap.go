@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -48,12 +49,12 @@ type startupContext struct{ context.Context }
 // Options returns every module of the service for the given configuration.
 // It is intended for graph validation; New supplies the real startup context.
 func Options(cfg config.Config) fx.Option {
-	return options(startupContext{Context: context.Background()}, cfg)
+	return options(startupContext{Context: context.Background()}, cfg, &poolOwner{})
 }
 
-func options(startCtx startupContext, cfg config.Config) fx.Option {
+func options(startCtx startupContext, cfg config.Config, owner *poolOwner) fx.Option {
 	return fx.Options(
-		fx.Supply(cfg, startCtx, LogOutput{os.Stdout}),
+		fx.Supply(cfg, startCtx, owner, poolFactory(openPool), LogOutput{os.Stdout}),
 		fx.WithLogger(newFxLogger),
 		ObservabilityModule, PostgresModule, SQSModule, AppModule, AuthModule, WorkerModule, HTTPModule,
 	)
@@ -72,8 +73,13 @@ func newFxLogger(l *slog.Logger) fxevent.Logger {
 // returns. The stop budget is the configured shutdown timeout. extra options
 // (fx.Replace, fx.Decorate, fx.Populate) let tests adjust the graph.
 func New(ctx context.Context, cfg config.Config, extra ...fx.Option) *fx.App {
-	return fx.New(options(startupContext{Context: ctx}, cfg), fx.Options(extra...),
+	owner := &poolOwner{}
+	application := fx.New(options(startupContext{Context: ctx}, cfg, owner), fx.Options(extra...),
 		fx.StartTimeout(cfg.StartupTimeout), fx.StopTimeout(cfg.ShutdownTimeout))
+	if application.Err() != nil {
+		owner.Close()
+	}
+	return application
 }
 
 // ObservabilityModule provides logging and metrics.
@@ -105,23 +111,82 @@ var PostgresModule = fx.Module("postgres",
 	),
 )
 
+type poolHandle struct {
+	pool  *pgxpool.Pool
+	ping  func(context.Context) error
+	close func()
+}
+
+type poolFactory func(context.Context, postgres.Config) (poolHandle, error)
+
+func openPool(ctx context.Context, cfg postgres.Config) (poolHandle, error) {
+	pool, err := postgres.NewPool(ctx, cfg)
+	if err != nil {
+		return poolHandle{}, err
+	}
+	return poolHandle{
+		pool:  pool,
+		ping:  func(ctx context.Context) error { return postgres.Ping(ctx, pool) },
+		close: pool.Close,
+	}, nil
+}
+
+// poolOwner closes its handle exactly once. The startup-context watcher owns
+// cleanup until a successful ping transfers ownership to the lifecycle hook.
+type poolOwner struct {
+	handle           poolHandle
+	closeOnce        sync.Once
+	stopStartupWatch func() bool
+}
+
+func (o *poolOwner) Claim(ctx context.Context, handle poolHandle) {
+	o.handle = handle
+	o.stopStartupWatch = context.AfterFunc(ctx, o.Close)
+}
+
+func (o *poolOwner) Ping(ctx context.Context) error { return o.handle.ping(ctx) }
+
+func (o *poolOwner) TransferToLifecycle() {
+	if o.stopStartupWatch != nil {
+		o.stopStartupWatch()
+	}
+}
+
+func (o *poolOwner) Close() {
+	o.closeOnce.Do(func() {
+		if o.handle.close != nil {
+			o.handle.close()
+		}
+	})
+}
+
 // newPool validates the database on start and closes the pool last.
-func newPool(lc fx.Lifecycle, startCtx startupContext, cfg config.Config) (*pgxpool.Pool, error) {
-	pool, err := postgres.NewPool(startCtx, postgres.Config{
+func newPool(lc fx.Lifecycle, startCtx startupContext, cfg config.Config, owner *poolOwner,
+	factory poolFactory,
+) (*pgxpool.Pool, error) {
+	handle, err := factory(startCtx, postgres.Config{
 		URL: cfg.DatabaseURL, MaxConns: int32(cfg.DBMaxConns),
 		LockTimeout: cfg.DBLockTimeout, StatementTimeout: cfg.DBStatementTimeout,
 	})
 	if err != nil {
 		return nil, err
 	}
+	owner.Claim(startCtx, handle)
 	lc.Append(fx.Hook{
-		OnStart: func(ctx context.Context) error { return postgres.Ping(ctx, pool) },
+		OnStart: func(ctx context.Context) error {
+			if err := owner.Ping(ctx); err != nil {
+				owner.Close()
+				return err
+			}
+			owner.TransferToLifecycle()
+			return nil
+		},
 		OnStop: func(context.Context) error {
-			pool.Close()
+			owner.Close()
 			return nil
 		},
 	})
-	return pool, nil
+	return handle.pool, nil
 }
 
 // SQSModule provides the SQS client, queues, publisher and consumer.

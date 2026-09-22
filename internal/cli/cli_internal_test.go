@@ -220,6 +220,10 @@ func TestMalformedConfigurationAllocatesNoResources(t *testing.T) {
 	require.Error(t, serveCmd(context.Background(), config.MapLookup(map[string]string{"DB_MAX_CONNS": "0"})))
 	require.Error(t, migrateCmd(config.MapLookup(map[string]string{"DB_MAX_CONNS": "0"}), []string{"up"}, &bytes.Buffer{}))
 	require.Error(t, provision(context.Background(), config.MapLookup(map[string]string{"SQS_MAX_MESSAGES": "0"}), &bytes.Buffer{}))
+	require.ErrorContains(t,
+		serveCmd(context.Background(), config.MapLookup(map[string]string{"SQS_SENDER_PROVIDERS": "missing-equals"})),
+		"SQS_SENDER_PROVIDERS",
+	)
 	assert.Zero(t, migrators)
 	assert.Zero(t, sqsClients)
 	assert.Zero(t, applications)
