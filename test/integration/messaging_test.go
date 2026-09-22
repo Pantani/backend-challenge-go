@@ -5,6 +5,7 @@ package integration_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -325,8 +326,9 @@ func (a *prefetchedAPI) ReceiveMessage(ctx context.Context, _ *awssqs.ReceiveMes
 }
 
 type receiveObservation struct {
-	messages int
-	err      error
+	messages       int
+	completedAfter time.Duration
+	err            error
 }
 
 type observedReceiveAPI struct {
@@ -334,12 +336,13 @@ type observedReceiveAPI struct {
 	startedOnce sync.Once
 	started     chan struct{}
 	results     chan receiveObservation
+	startedAt   time.Time
 }
 
 func (a *observedReceiveAPI) ReceiveMessage(ctx context.Context, in *awssqs.ReceiveMessageInput, opts ...func(*awssqs.Options)) (*awssqs.ReceiveMessageOutput, error) {
 	a.startedOnce.Do(func() { close(a.started) })
 	out, err := a.API.ReceiveMessage(ctx, in, opts...)
-	observation := receiveObservation{err: err}
+	observation := receiveObservation{completedAfter: time.Since(a.startedAt), err: err}
 	if out != nil {
 		observation.messages = len(out.Messages)
 	}
@@ -392,39 +395,64 @@ func await[T any](t *testing.T, ch <-chan T, timeout time.Duration, message stri
 	}
 }
 
-func pollOnce(ctx context.Context, consumer *sqsadapter.Consumer) <-chan struct{} {
+func runAsync(run func()) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
-		consumer.PollOnce(ctx)
+		run()
 		close(done)
 	}()
 	return done
 }
 
-func runConsumer(ctx context.Context, consumer *sqsadapter.Consumer) <-chan struct{} {
-	done := make(chan struct{})
-	go func() {
-		consumer.Run(ctx)
-		close(done)
-	}()
-	return done
+type receiveSummary struct {
+	successful           int
+	successfulDuringHead int
+	successfulAfterOld   int
+	messages             int
+	canceled             int
 }
 
-func receiveTotals(t *testing.T, observations <-chan receiveObservation) (int, int) {
+func (s *receiveSummary) add(t *testing.T, observation receiveObservation, headRelease, oldVisibility, canceledAfter time.Duration) {
 	t.Helper()
-	calls, messages := 0, 0
+	if observation.err == nil {
+		s.successful++
+		s.messages += observation.messages
+		if observation.completedAfter < headRelease {
+			s.successfulDuringHead++
+		}
+		if observation.completedAfter > oldVisibility && observation.completedAfter < canceledAfter {
+			s.successfulAfterOld++
+		}
+		return
+	}
+	if errors.Is(observation.err, context.Canceled) {
+		s.canceled++
+		return
+	}
+	assert.NoError(t, observation.err)
+}
+
+func summarizeReceives(t *testing.T, observations <-chan receiveObservation, headRelease, oldVisibility, canceledAfter time.Duration) receiveSummary {
+	t.Helper()
+	var summary receiveSummary
 	for {
 		select {
 		case observation := <-observations:
-			calls++
-			messages += observation.messages
-			if observation.err != nil {
-				assert.ErrorIs(t, observation.err, context.Canceled)
-			}
+			summary.add(t, observation, headRelease, oldVisibility, canceledAfter)
 		default:
-			return calls, messages
+			return summary
 		}
 	}
+}
+
+func TestReceiveSummaryIgnoresCancellation(t *testing.T) {
+	t.Parallel()
+	observations := make(chan receiveObservation, 1)
+	observations <- receiveObservation{err: context.Canceled}
+	summary := summarizeReceives(t, observations, time.Second, 2*time.Second, 3*time.Second)
+	assert.Zero(t, summary.successful)
+	assert.Zero(t, summary.messages)
+	assert.Equal(t, 1, summary.canceled)
 }
 
 func waitUntil(deadline time.Time) {
@@ -437,10 +465,17 @@ func waitUntil(deadline time.Time) {
 
 func TestVisibilityProtectsSlowBatchFromSecondConsumer(t *testing.T) {
 	t.Parallel()
+	// The former per-message rule accepts 1.99s < 2s, while the complete
+	// two-message batch requires a visibility window strictly above 3.98s.
+	// The gates retain at least 200ms of processing headroom per item.
 	const (
-		visibility    = 4 * time.Second
-		processBudget = 1900 * time.Millisecond
-		ackBudget     = 50 * time.Millisecond
+		oldVisibility    = 2 * time.Second
+		visibility       = 4 * time.Second
+		processBudget    = 1940 * time.Millisecond
+		ackBudget        = 50 * time.Millisecond
+		headReleaseAfter = 1600 * time.Millisecond
+		probeUntilAfter  = 3300 * time.Millisecond
+		minHeadroom      = 200 * time.Millisecond
 	)
 	s := newServices(t, defaultPolicy)
 	api, q, _ := provisionQueues(t, 20)
@@ -476,42 +511,47 @@ func TestVisibilityProtectsSlowBatchFromSecondConsumer(t *testing.T) {
 	consumerA := sqsadapter.NewConsumer(&prefetchedAPI{API: api, batch: batch}, consumerConfig, processorA, logger, testutil.NewMetrics())
 	ctxA, cancelA := context.WithCancel(context.Background())
 	t.Cleanup(cancelA)
-	doneA := pollOnce(ctxA, consumerA)
+	doneA := runAsync(func() { consumerA.PollOnce(ctxA) })
 	assert.Equal(t, expectedIDs[0], await(t, processorA.started, time.Second, "consumer A did not start the batch head"))
 
 	processorB := &callProbe{}
-	observedB := &observedReceiveAPI{API: api, started: make(chan struct{}), results: make(chan receiveObservation, 128)}
+	observedB := &observedReceiveAPI{
+		API: api, started: make(chan struct{}), results: make(chan receiveObservation, 128), startedAt: receivedAt,
+	}
 	consumerBConfig := consumerConfig
 	consumerBConfig.WaitTime = 0
 	consumerBConfig.RetryBase = 50 * time.Millisecond
 	consumerB := sqsadapter.NewConsumer(observedB, consumerBConfig, processorB, logger, testutil.NewMetrics())
 	ctxB, cancelB := context.WithCancel(context.Background())
 	t.Cleanup(cancelB)
-	doneB := runConsumer(ctxB, consumerB)
+	doneB := runAsync(func() { consumerB.Run(ctxB) })
 	await(t, observedB.started, time.Second, "consumer B did not start receiving while A was blocked")
 
-	waitUntil(receivedAt.Add(1700 * time.Millisecond))
+	waitUntil(receivedAt.Add(headReleaseAfter))
 	headGate.release()
 	head := await(t, processorA.finished, time.Second, "consumer A did not finish the batch head")
 	assert.NoError(t, head.err)
 	assert.Equal(t, expectedIDs[0], head.messageID)
-	assert.Less(t, head.duration, processBudget)
+	assert.GreaterOrEqual(t, processBudget-head.duration, minHeadroom)
 	assert.Equal(t, expectedIDs[1], await(t, processorA.started, time.Second, "consumer A did not start the batch tail"))
 
-	waitUntil(receivedAt.Add(3500 * time.Millisecond))
+	waitUntil(receivedAt.Add(probeUntilAfter))
+	canceledAfter := time.Since(receivedAt)
 	cancelB()
 	await(t, doneB, time.Second, "consumer B did not stop after cancellation")
-	receiveCalls, receivedMessages := receiveTotals(t, observedB.results)
+	receives := summarizeReceives(t, observedB.results, headReleaseAfter, oldVisibility, canceledAfter)
 
 	tailGate.release()
 	tail := await(t, processorA.finished, time.Second, "consumer A did not finish the batch tail")
 	await(t, doneA, time.Second, "consumer A did not finish the exact batch")
 	assert.NoError(t, tail.err)
 	assert.Equal(t, expectedIDs[1], tail.messageID)
-	assert.Less(t, tail.duration, processBudget)
-	assert.Greater(t, time.Since(receivedAt), 2*time.Second)
-	assert.Positive(t, receiveCalls, "consumer B must poll while A owns the batch")
-	assert.Zero(t, receivedMessages, "consumer B must receive no message during A's protected batch")
+	assert.GreaterOrEqual(t, processBudget-tail.duration, minHeadroom)
+	assert.Greater(t, time.Since(receivedAt), oldVisibility)
+	assert.GreaterOrEqual(t, receives.successful, 2, "consumer B must complete successful polls while A owns the batch")
+	assert.Positive(t, receives.successfulDuringHead, "consumer B must poll successfully while A holds the head")
+	assert.Positive(t, receives.successfulAfterOld, "consumer B must poll successfully after the old visibility boundary")
+	assert.Zero(t, receives.messages, "consumer B must receive no message during A's protected batch")
 	assert.Empty(t, processorB.messageIDs(), "consumer B must receive no message during A's protected batch")
 }
 
