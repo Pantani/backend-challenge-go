@@ -84,6 +84,7 @@ type Application struct {
 	app             lifecycleApplication
 	owner           *poolOwner
 	shutdownTimeout time.Duration
+	buildErr        error
 }
 
 // New builds the application. ctx is the single startup budget for graph
@@ -95,8 +96,8 @@ func New(ctx context.Context, cfg config.Config, extra ...fx.Option) *Applicatio
 	fxApp := fx.New(options(startupContext{Context: ctx}, cfg, owner), fx.Options(extra...),
 		fx.StartTimeout(cfg.StartupTimeout), fx.StopTimeout(cfg.ShutdownTimeout))
 	application := newApplication(fxApp, owner, cfg.ShutdownTimeout)
-	if application.Err() != nil {
-		owner.Close()
+	if err := fxApp.Err(); err != nil {
+		application.buildErr = errors.Join(err, owner.Close())
 	}
 	return application
 }
@@ -106,35 +107,37 @@ func newApplication(app lifecycleApplication, owner *poolOwner, shutdownTimeout 
 }
 
 // Err reports an error encountered while constructing the Fx graph.
-func (a *Application) Err() error { return a.app.Err() }
+func (a *Application) Err() error {
+	if a.buildErr != nil {
+		return a.buildErr
+	}
+	return a.app.Err()
+}
 
 // Start starts the Fx lifecycle and transfers startup resources to runtime
 // ownership only after every start hook has completed successfully.
 func (a *Application) Start(ctx context.Context) error {
 	if err := a.app.Start(ctx); err != nil {
-		a.owner.Close()
-		return err
+		return a.cleanupFailedStart(ctx, err)
 	}
 	if err := a.owner.Transfer(ctx); err != nil {
-		return errors.Join(err, a.stopAfterFailedStart(ctx))
+		return a.cleanupFailedStart(ctx, err)
 	}
 	return nil
 }
 
-func (a *Application) stopAfterFailedStart(ctx context.Context) error {
+func (a *Application) cleanupFailedStart(ctx context.Context, startErr error) error {
 	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), a.shutdownTimeout)
 	defer cancel()
-	err := a.app.Stop(stopCtx)
-	a.owner.Close()
-	return err
+	stopErr := a.app.Stop(stopCtx)
+	closeErr := a.owner.Close()
+	return errors.Join(startErr, stopErr, closeErr)
 }
 
 // Stop stops the Fx lifecycle and closes startup resources even when a stop
 // hook fails or times out.
 func (a *Application) Stop(ctx context.Context) error {
-	err := a.app.Stop(ctx)
-	a.owner.Close()
-	return err
+	return errors.Join(a.app.Stop(ctx), a.owner.Close())
 }
 
 // Wait reports Fx shutdown signals and exit codes.
@@ -172,7 +175,7 @@ var PostgresModule = fx.Module("postgres",
 type poolHandle struct {
 	pool  *pgxpool.Pool
 	ping  func(context.Context) error
-	close func()
+	close func() error
 }
 
 type poolFactory func(context.Context, postgres.Config) (poolHandle, error)
@@ -183,9 +186,12 @@ func openPool(ctx context.Context, cfg postgres.Config) (poolHandle, error) {
 		return poolHandle{}, err
 	}
 	return poolHandle{
-		pool:  pool,
-		ping:  func(ctx context.Context) error { return postgres.Ping(ctx, pool) },
-		close: pool.Close,
+		pool: pool,
+		ping: func(ctx context.Context) error { return postgres.Ping(ctx, pool) },
+		close: func() error {
+			pool.Close()
+			return nil
+		},
 	}, nil
 }
 
@@ -195,35 +201,32 @@ const (
 	poolUnclaimed poolOwnership = iota
 	poolStartupOwned
 	poolRuntimeOwned
+	poolClosing
 	poolClosed
 )
 
 var errStartupOwnershipLost = errors.New("startup resource ownership was lost before application start completed")
 
-// poolOwner serializes the startup watchdog, runtime transfer, and close. In
-// particular, Transfer waits when context.AfterFunc reports a callback already
-// in flight, so a closed pool can never be reported as a healthy runtime.
+// poolOwner serializes the startup watchdog, runtime transfer, and close.
+// Transfer reports a watchdog in flight without waiting, allowing Application
+// to stop runtime work before Close waits for resource release.
 type poolOwner struct {
 	mu               sync.Mutex
 	handle           poolHandle
 	state            poolOwnership
 	stopStartupWatch func() bool
-	startupWatchDone chan struct{}
 	closeDone        chan struct{}
+	closeErr         error
 }
 
 func (o *poolOwner) Claim(ctx context.Context, handle poolHandle) {
 	o.mu.Lock()
 	o.handle = handle
 	o.state = poolStartupOwned
-	o.startupWatchDone = make(chan struct{})
 	o.closeDone = make(chan struct{})
 	o.mu.Unlock()
 
-	stop := context.AfterFunc(ctx, func() {
-		o.Close()
-		close(o.startupWatchDone)
-	})
+	stop := context.AfterFunc(ctx, func() { _ = o.Close() })
 	o.mu.Lock()
 	o.stopStartupWatch = stop
 	o.mu.Unlock()
@@ -232,27 +235,35 @@ func (o *poolOwner) Claim(ctx context.Context, handle poolHandle) {
 func (o *poolOwner) Ping(ctx context.Context) error { return o.handle.ping(ctx) }
 
 func (o *poolOwner) Transfer(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		o.waitStartupWatch()
-		return err
-	}
-	o.mu.Lock()
-	stop, watchDone, state := o.stopStartupWatch, o.startupWatchDone, o.state
-	o.mu.Unlock()
-	if state == poolClosed {
-		return startupOwnershipError(ctx)
-	}
-	if stop != nil && !stop() {
-		<-watchDone
-		return startupOwnershipError(ctx)
-	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if o.state == poolClosed {
+	if ownershipUnavailable(o.state) {
+		return startupOwnershipError(ctx)
+	}
+	if err := o.cancelledTransfer(ctx); err != nil {
+		return err
+	}
+	if !o.stopStartupWatcher() {
 		return startupOwnershipError(ctx)
 	}
 	o.state = poolRuntimeOwned
 	return nil
+}
+
+func ownershipUnavailable(state poolOwnership) bool {
+	return state == poolClosing || state == poolClosed
+}
+
+func (o *poolOwner) cancelledTransfer(ctx context.Context) error {
+	err := ctx.Err()
+	if err != nil && o.stopStartupWatch != nil {
+		o.stopStartupWatch()
+	}
+	return err
+}
+
+func (o *poolOwner) stopStartupWatcher() bool {
+	return o.stopStartupWatch == nil || o.stopStartupWatch()
 }
 
 func startupOwnershipError(ctx context.Context) error {
@@ -262,34 +273,33 @@ func startupOwnershipError(ctx context.Context) error {
 	return errStartupOwnershipLost
 }
 
-func (o *poolOwner) waitStartupWatch() {
+func (o *poolOwner) Close() error {
 	o.mu.Lock()
-	done := o.startupWatchDone
-	o.mu.Unlock()
-	if done != nil {
-		<-done
-	}
-}
-
-func (o *poolOwner) Close() {
-	o.mu.Lock()
-	if o.state == poolClosed {
+	if o.state == poolClosing || o.state == poolClosed {
 		done := o.closeDone
 		o.mu.Unlock()
 		if done != nil {
 			<-done
 		}
-		return
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		return o.closeErr
 	}
-	o.state = poolClosed
+	o.state = poolClosing
 	closeFn, done := o.handle.close, o.closeDone
 	o.mu.Unlock()
+	var err error
 	if closeFn != nil {
-		closeFn()
+		err = closeFn()
 	}
+	o.mu.Lock()
+	o.closeErr = err
+	o.state = poolClosed
 	if done != nil {
 		close(done)
 	}
+	o.mu.Unlock()
+	return err
 }
 
 // newPool validates the database on start and closes the pool last.
@@ -305,17 +315,8 @@ func newPool(lc fx.Lifecycle, startCtx startupContext, cfg config.Config, owner 
 	}
 	owner.Claim(startCtx, handle)
 	lc.Append(fx.Hook{
-		OnStart: func(ctx context.Context) error {
-			if err := owner.Ping(ctx); err != nil {
-				owner.Close()
-				return err
-			}
-			return nil
-		},
-		OnStop: func(context.Context) error {
-			owner.Close()
-			return nil
-		},
+		OnStart: owner.Ping,
+		OnStop:  func(context.Context) error { return owner.Close() },
 	})
 	return handle.pool, nil
 }

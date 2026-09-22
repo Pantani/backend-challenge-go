@@ -198,10 +198,11 @@ func serveStalledPostgres(t *testing.T, listener net.Listener, accepted chan<- s
 }
 
 type poolSpy struct {
-	pingErr error
-	ping    func(context.Context) error
-	pings   atomic.Int32
-	closes  atomic.Int32
+	pingErr  error
+	closeErr error
+	ping     func(context.Context) error
+	pings    atomic.Int32
+	closes   atomic.Int32
 }
 
 func (s *poolSpy) open(context.Context, postgresadapter.Config) (poolHandle, error) {
@@ -214,7 +215,10 @@ func (s *poolSpy) open(context.Context, postgresadapter.Config) (poolHandle, err
 			}
 			return s.pingErr
 		},
-		close: func() { s.closes.Add(1) },
+		close: func() error {
+			s.closes.Add(1)
+			return s.closeErr
+		},
 	}, nil
 }
 
@@ -222,6 +226,7 @@ type failedPoolConsumer struct{}
 
 type lifecycleAppStub struct {
 	start func(context.Context) error
+	stop  func(context.Context) error
 	stops atomic.Int32
 }
 
@@ -229,8 +234,11 @@ func (*lifecycleAppStub) Err() error { return nil }
 
 func (a *lifecycleAppStub) Start(ctx context.Context) error { return a.start(ctx) }
 
-func (a *lifecycleAppStub) Stop(context.Context) error {
+func (a *lifecycleAppStub) Stop(ctx context.Context) error {
 	a.stops.Add(1)
+	if a.stop != nil {
+		return a.stop(ctx)
+	}
 	return nil
 }
 
@@ -299,40 +307,6 @@ func TestPoolOwnershipClosesExactlyOnce(t *testing.T) {
 		assert.EqualValues(t, 1, spy.closes.Load())
 	})
 
-	t.Run("watchdog wins after underlying start success", func(t *testing.T) {
-		spy := &poolSpy{}
-		owner := &poolOwner{}
-		ctx, cancel := context.WithCancel(context.Background())
-		handle, err := spy.open(ctx, postgresadapter.Config{})
-		require.NoError(t, err)
-		closeStarted := make(chan struct{})
-		releaseClose := make(chan struct{})
-		handle.close = func() {
-			close(closeStarted)
-			<-releaseClose
-			spy.closes.Add(1)
-		}
-		owner.Claim(ctx, handle)
-		underlying := &lifecycleAppStub{start: func(context.Context) error {
-			cancel()
-			<-closeStarted
-			return nil
-		}}
-		app := newApplication(underlying, owner, time.Second)
-		result := make(chan error, 1)
-		go func() { result <- app.Start(ctx) }()
-
-		select {
-		case err := <-result:
-			require.Fail(t, "Start returned while watchdog close was in flight", "error: %v", err)
-		case <-time.After(20 * time.Millisecond):
-		}
-		close(releaseClose)
-		assert.ErrorIs(t, <-result, context.Canceled)
-		assert.EqualValues(t, 1, spy.closes.Load())
-		assert.EqualValues(t, 1, underlying.stops.Load())
-	})
-
 	t.Run("successful full start transfers ownership to stop", func(t *testing.T) {
 		spy := &poolSpy{}
 		ctx, cancel := context.WithCancel(context.Background())
@@ -346,6 +320,88 @@ func TestPoolOwnershipClosesExactlyOnce(t *testing.T) {
 		assert.EqualValues(t, 1, spy.pings.Load())
 		assert.EqualValues(t, 1, spy.closes.Load())
 	})
+}
+
+func TestApplicationStopsBeforeWatchdogClose(t *testing.T) {
+	spy := &poolSpy{}
+	owner := &poolOwner{}
+	ctx, cancel := context.WithCancel(context.Background())
+	handle, err := spy.open(ctx, postgresadapter.Config{})
+	require.NoError(t, err)
+	closeStarted, stopCalled := make(chan struct{}), make(chan struct{})
+	emergencyRelease := make(chan struct{})
+	handle.close = func() error {
+		close(closeStarted)
+		select {
+		case <-stopCalled:
+		case <-emergencyRelease:
+		}
+		spy.closes.Add(1)
+		return nil
+	}
+	owner.Claim(ctx, handle)
+	underlying := &lifecycleAppStub{start: func(context.Context) error {
+		cancel()
+		<-closeStarted
+		return nil
+	}, stop: func(context.Context) error {
+		close(stopCalled)
+		return nil
+	}}
+	app := newApplication(underlying, owner, time.Second)
+	result := make(chan error, 1)
+	go func() { result <- app.Start(ctx) }()
+
+	select {
+	case err := <-result:
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		close(emergencyRelease)
+		require.Fail(t, "Start did not stop runtime before waiting for watchdog close")
+	}
+	assert.EqualValues(t, 1, spy.closes.Load())
+	assert.EqualValues(t, 1, underlying.stops.Load())
+}
+
+func TestApplicationStartErrorJoinsCleanupFailures(t *testing.T) {
+	startErr, stopErr, closeErr := errors.New("start failed"), errors.New("stop failed"), errors.New("close failed")
+	spy := &poolSpy{closeErr: closeErr}
+	owner := &poolOwner{}
+	handle, err := spy.open(context.Background(), postgresadapter.Config{})
+	require.NoError(t, err)
+	stopCalled := make(chan struct{})
+	emergencyRelease := make(chan struct{})
+	originalClose := handle.close
+	handle.close = func() error {
+		select {
+		case <-stopCalled:
+		case <-emergencyRelease:
+		}
+		return originalClose()
+	}
+	owner.Claim(context.Background(), handle)
+	underlying := &lifecycleAppStub{
+		start: func(context.Context) error { return startErr },
+		stop: func(context.Context) error {
+			close(stopCalled)
+			return stopErr
+		},
+	}
+	app := newApplication(underlying, owner, time.Second)
+	result := make(chan error, 1)
+	go func() { result <- app.Start(context.Background()) }()
+
+	select {
+	case err := <-result:
+		assert.ErrorIs(t, err, startErr)
+		assert.ErrorIs(t, err, stopErr)
+		assert.ErrorIs(t, err, closeErr)
+	case <-time.After(time.Second):
+		close(emergencyRelease)
+		require.Fail(t, "Start error did not stop runtime before waiting for close")
+	}
+	assert.EqualValues(t, 1, spy.closes.Load())
+	assert.EqualValues(t, 1, underlying.stops.Load())
 }
 
 func newAppWithPoolSpy(ctx context.Context, t *testing.T, spy *poolSpy) *Application {
