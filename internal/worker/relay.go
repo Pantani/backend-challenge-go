@@ -100,11 +100,12 @@ func subtractElapsed(remaining, elapsed time.Duration) time.Duration {
 	return remaining - elapsed
 }
 
-// maxRounds bounds how many claim rounds one tick runs. Each round claims at
-// most one record per wallet, so rounds drain wallets with several events.
+// maxRounds bounds how many acquisition rounds one tick runs. Each round
+// processes up to BatchSize singular claims, so repeated rounds drain wallets.
 const maxRounds = 20
 
-// Tick publishes claim rounds until nothing is due, then refreshes the lag.
+// Tick publishes singular-acquisition rounds until nothing is due, then
+// refreshes the lag.
 func (r *Relay) Tick(ctx context.Context) {
 	for range maxRounds {
 		if !r.round(ctx) || ctx.Err() != nil {

@@ -328,7 +328,7 @@ func TestRelayPublishesWithinPublishTimeDetachedFromShutdown(t *testing.T) {
 		assert.NoError(t, pctx.Err(), "the publication in flight is not aborted")
 	}}
 	newRelay(store, pub, &testutil.SyncBuffer{}).Tick(ctx)
-	assert.Equal(t, []uuid.UUID{first}, seen, "the round stops between publications; the rest expires with its lease")
+	assert.Equal(t, []uuid.UUID{first}, seen, "the round stops before another singular acquisition")
 	assert.Equal(t, []uuid.UUID{first}, store.published)
 }
 

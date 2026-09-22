@@ -183,21 +183,35 @@ type markFailedResult struct {
 func (s *gatedFailureStore) MarkFailed(
 	ctx context.Context, eventID, claimID uuid.UUID, next time.Time, cause string,
 ) (bool, error) {
-	select {
-	case s.entered <- struct{}{}:
-	case <-ctx.Done():
-		return false, ctx.Err()
-	}
-	select {
-	case <-s.release.ch:
-	case <-ctx.Done():
-		return false, ctx.Err()
+	if err := s.waitForRelease(ctx); err != nil {
+		return false, err
 	}
 	s.delegated.Store(true)
 	contextLive := ctx.Err() == nil
 	ok, err := s.OutboxStore.MarkFailed(ctx, eventID, claimID, next, cause)
-	s.result <- markFailedResult{ok: ok, err: err, contextLive: contextLive}
+	s.recordResult(ctx, markFailedResult{ok: ok, err: err, contextLive: contextLive})
 	return ok, err
+}
+
+func (s *gatedFailureStore) waitForRelease(ctx context.Context) error {
+	select {
+	case s.entered <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-s.release.ch:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return nil
+}
+
+func (s *gatedFailureStore) recordResult(ctx context.Context, result markFailedResult) {
+	select {
+	case s.result <- result:
+	case <-ctx.Done():
+	}
 }
 
 type blockingPublisher struct{}
@@ -252,16 +266,39 @@ func waitForRelaySignal(t *testing.T, signal <-chan struct{}, message string) {
 	}
 }
 
-func registerRelayCleanup(t *testing.T, store *gatedFailureStore, done <-chan struct{}) {
+func registerRelayCleanup(
+	t *testing.T, cancel context.CancelFunc, store *gatedFailureStore, done <-chan struct{},
+) {
 	t.Helper()
 	t.Cleanup(func() {
-		store.release.release()
-		select {
-		case <-done:
-		case <-time.After(time.Second):
-			t.Error("first relay did not stop during cleanup")
-		}
+		assert.NoError(t, stopGatedRelay(cancel, store, done))
 	})
+}
+
+func stopGatedRelay(cancel context.CancelFunc, store *gatedFailureStore, done <-chan struct{}) error {
+	cancel()
+	store.release.release()
+	select {
+	case <-done:
+		return nil
+	case <-time.After(time.Second):
+		return errors.New("first relay did not stop within cleanup timeout")
+	}
+}
+
+func TestStopGatedRelayCancelsBeforeGateAndJoinsWithoutResultDrain(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	store := &gatedFailureStore{release: newReleaseGate(), result: make(chan markFailedResult, 1)}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		<-store.release.ch
+		store.result <- markFailedResult{err: ctx.Err()}
+	}()
+
+	require.NoError(t, stopGatedRelay(cancel, store, done))
+	result := <-store.result
+	assert.ErrorIs(t, result.err, context.Canceled, "the parent is canceled before the gate opens")
 }
 
 func waitForClaimExpiration(t *testing.T, eventID uuid.UUID) {
@@ -1224,12 +1261,13 @@ func TestRelayDeadlineFencesStaleFailureAndProgressesAnotherPartition(t *testing
 		result: make(chan markFailedResult, 1),
 	}
 	firstMetrics := &relayCounters{}
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
 	firstDone := make(chan struct{})
 	go func() {
 		defer close(firstDone)
-		relayForDeadlineTest(firstStore, blockingPublisher{}, firstMetrics, 1).Tick(context.Background())
+		relayForDeadlineTest(firstStore, blockingPublisher{}, firstMetrics, 1).Tick(firstCtx)
 	}()
-	registerRelayCleanup(t, firstStore, firstDone)
+	registerRelayCleanup(t, cancelFirst, firstStore, firstDone)
 	waitForRelaySignal(t, firstStore.entered, "first relay did not reach durable finalization")
 	waitForClaimExpiration(t, slowID)
 
@@ -1237,11 +1275,10 @@ func TestRelayDeadlineFencesStaleFailureAndProgressesAnotherPartition(t *testing
 	secondPublisher := &partitionPublisher{failID: slowID}
 	secondMetrics := &relayCounters{}
 	relayForDeadlineTest(secondStore, secondPublisher, secondMetrics, 2).Tick(context.Background())
-	firstStore.release.release()
-	waitForRelaySignal(t, firstDone, "first relay did not finish after finalization was released")
+	require.NoError(t, stopGatedRelay(cancelFirst, firstStore, firstDone))
 
 	firstClaims, secondClaims := firstObserved.snapshotClaims(), secondStore.snapshotClaims()
-	require.NotEmpty(t, firstClaims)
+	require.Len(t, firstClaims, 1, "the canceled stale relay cannot claim another event")
 	require.Len(t, secondClaims, 2)
 	assert.Equal(t, slowID, firstClaims[0].eventID)
 	assert.Equal(t, slowID, secondClaims[0].eventID)
