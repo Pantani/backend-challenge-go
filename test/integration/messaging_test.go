@@ -906,7 +906,12 @@ func TestTransientFailuresAreRetriedThenRedrivenToTheDLQ(t *testing.T) {
 	// Once PostgreSQL is back, replaying the DLQ message processes it once.
 	dead := drain(t, api, q.DLQ)
 	require.Len(t, dead, 1)
-	sendRaw(t, api, q, uuid.NewString(), dead[0], w.ID().String())
+	var replay sqsadapter.Envelope
+	require.NoError(t, json.Unmarshal([]byte(dead[0]), &replay))
+	replay.MessageID = uuid.NewString()
+	replayBody, err := sqsadapter.EncodeMessage(replay)
+	require.NoError(t, err)
+	sendRaw(t, api, q, replay.MessageID, replayBody, w.ID().String())
 	consumerFor(api, q, s.wagers).PollOnce(context.Background())
 	assert.Equal(t, "99.00", s.balance(t, w))
 }
