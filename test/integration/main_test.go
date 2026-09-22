@@ -37,15 +37,22 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	var err error
 	env, err = testenv.Start(ctx)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "start containers:", err)
+		cancel()
 		os.Exit(1)
 	}
 	code := runWithDatabase(ctx, m)
-	env.Stop(ctx)
+	cleanup, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
+	if err := env.Stop(cleanup); err != nil {
+		fmt.Fprintln(os.Stderr, "cleanup:", err)
+		code = 1
+	}
+	cleanupCancel()
+	cancel()
 	os.Exit(code)
 }
 

@@ -42,6 +42,7 @@ type Wallet struct {
 type Client struct {
 	Base  string
 	Token func(client string) (string, error)
+	HTTP  http.Client
 }
 
 // Do sends a request and returns transport errors instead of failing, so it
@@ -51,7 +52,11 @@ func (c Client) Do(ctx context.Context, method, path, client, body string, heade
 	if err != nil {
 		return Response{}, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	httpClient := c.HTTP
+	if httpClient.Timeout <= 0 {
+		httpClient.Timeout = 10 * time.Second
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return Response{}, err
 	}
@@ -84,7 +89,7 @@ func (c Client) request(ctx context.Context, method, path, client, body string, 
 // Call is Do on the test goroutine: transport errors fail the test.
 func (c Client) Call(t *testing.T, method, path, client, body string, headers map[string]string) Response {
 	t.Helper()
-	res, err := c.Do(context.Background(), method, path, client, body, headers)
+	res, err := c.Do(t.Context(), method, path, client, body, headers)
 	require.NoError(t, err)
 	return res
 }

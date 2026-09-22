@@ -18,7 +18,9 @@ import (
 
 func openWallet(t *testing.T, amount string) testenv.Wallet {
 	t.Helper()
-	return instances[0].client().OpenWallet(t, amount)
+	w := instances[0].client().OpenWallet(t, amount)
+	t.Cleanup(func() { reconcileWallet(t, w) })
+	return w
 }
 
 func submit(t *testing.T, inst *instance, w testenv.Wallet, ext, kind, amount, ref string) testenv.Response {
@@ -42,7 +44,9 @@ func balance(t *testing.T, w testenv.Wallet) string {
 
 func debits(t *testing.T, w testenv.Wallet) int {
 	t.Helper()
-	n, err := testenv.CountDebits(context.Background(), pool, w.ID)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	n, err := testenv.CountDebits(ctx, pool, w.ID)
 	require.NoError(t, err)
 	return n
 }
@@ -113,7 +117,9 @@ func TestDistinctWalletsInParallelAcrossInstances(t *testing.T) {
 func sendMessage(t *testing.T, messageID string, w testenv.Wallet, ext, kind, amount string) {
 	t.Helper()
 	env := testenv.Envelope(messageID, testenv.SubmitInput(w, "provider-a", ext, kind, amount, ""))
-	require.NoError(t, testenv.SendMessage(context.Background(), sqsClient, queues.Input, env))
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, testenv.SendMessage(ctx, sqsClient, queues.Input, env))
 }
 
 func TestSameOperationThroughHTTPAndSQSAcrossInstances(t *testing.T) {
@@ -125,8 +131,10 @@ func TestSameOperationThroughHTTPAndSQSAcrossInstances(t *testing.T) {
 	require.Contains(t, []int{http.StatusCreated, http.StatusOK}, res.Status)
 
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancel()
 		var done int
-		err := pool.QueryRow(context.Background(), `SELECT count(*) FROM inbox_messages
+		err := pool.QueryRow(ctx, `SELECT count(*) FROM inbox_messages
 			WHERE message_id IN ($1, $2) AND processed_at IS NOT NULL`, "msg-"+ext, "msg-dup-"+ext).Scan(&done)
 		if !assert.NoError(collect, err) {
 			return
@@ -159,9 +167,9 @@ func TestRefundBeforeBetAcrossInstances(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, other.Status, "provider isolation holds on every instance")
 }
 
-// TestZZCrashAndRestart kills every instance (no graceful shutdown) and
+// TestCrashAndRestart kills every instance (no graceful shutdown) and
 // verifies that idempotency, pending references and balances survive.
-func TestZZCrashAndRestart(t *testing.T) {
+func TestCrashAndRestart(t *testing.T) {
 	w := openWallet(t, "100.00")
 	bet, refund, lateBet := uuid.NewString(), uuid.NewString(), uuid.NewString()
 	first := submit(t, instances[0], w, bet, "BET", "30.00", "")
@@ -169,10 +177,10 @@ func TestZZCrashAndRestart(t *testing.T) {
 	require.Equal(t, http.StatusAccepted, submit(t, instances[1], w, refund, "REFUND", "20.00", lateBet).Status)
 
 	for _, inst := range instances {
-		inst.kill()
+		require.NoError(t, inst.kill())
 	}
 	for _, inst := range instances {
-		require.NoError(t, inst.start())
+		require.NoError(t, inst.startWith(t.Context()))
 	}
 
 	replay := submit(t, instances[2], w, bet, "BET", "30.00", "")
@@ -190,32 +198,27 @@ func TestZZCrashAndRestart(t *testing.T) {
 	assert.Equal(t, "70.00", balance(t, w))
 }
 
-// TestZZZFinalConsistency reconciles every wallet and checks the outbox.
-func TestZZZFinalConsistency(t *testing.T) {
-	rows, err := pool.Query(context.Background(), `SELECT id FROM wallets`)
+// Each scenario reconciles its own acquired wallets, even with -run or -shuffle.
+func reconcileWallet(t *testing.T, w testenv.Wallet) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	rec, err := instances[0].client().Do(ctx, http.MethodPost, "/wallets/"+w.ID+"/reconciliation", "wallet-service", "", nil)
 	require.NoError(t, err)
-	var ids []string
-	for rows.Next() {
-		var id uuid.UUID
-		require.NoError(t, rows.Scan(&id))
-		ids = append(ids, id.String())
-	}
-	require.NoError(t, rows.Err())
-	for i, id := range ids {
-		rec := call(t, instances[i%3], http.MethodPost, "/wallets/"+id+"/reconciliation", "wallet-service", "", nil)
-		require.Equal(t, http.StatusOK, rec.Status)
-		assert.Equal(t, true, rec.Body["consistent"], id)
-	}
-
-	var negative int
-	require.NoError(t, pool.QueryRow(context.Background(), `SELECT count(*) FROM wallets WHERE balance_minor < 0`).Scan(&negative))
-	assert.Zero(t, negative)
+	require.Equal(t, http.StatusOK, rec.Status)
+	assert.Equal(t, true, rec.Body["consistent"], w.ID)
+	var balance int64
+	require.NoError(t, pool.QueryRow(ctx, `SELECT balance_minor FROM wallets WHERE id = $1`, w.ID).Scan(&balance))
+	assert.GreaterOrEqual(t, balance, int64(0))
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
-		var pending int
-		err := pool.QueryRow(context.Background(), `SELECT count(*) FROM outbox_events WHERE published_at IS NULL`).Scan(&pending)
+		var total, pending int
+		err := pool.QueryRow(ctx, `SELECT count(*), count(*) FILTER (WHERE published_at IS NULL)
+			FROM outbox_events WHERE aggregate_id = $1 OR aggregate_id IN
+			(SELECT id FROM wager_transactions WHERE wallet_id = $1)`, w.ID).Scan(&total, &pending)
 		if !assert.NoError(collect, err) {
 			return
 		}
+		assert.Positive(collect, total, "the scenario must produce outbox events")
 		assert.Zero(collect, pending)
-	}, 30*time.Second, 200*time.Millisecond, "every committed event was published by some instance")
+	}, 30*time.Second, 200*time.Millisecond, "every event of this wallet was published")
 }
