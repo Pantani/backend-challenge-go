@@ -139,6 +139,10 @@ awslocal sqs send-message --queue-url http://localhost:4566/000000000000/wager-t
   --message-body '{"messageId":"msg-123","type":"WagerTransactionRequested","occurredAt":"2026-09-08T12:00:00.000Z","data":{"providerId":"provider-a","externalTransactionId":"transaction-124","idempotencyKey":"provider-a:transaction-124","playerId":"0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1","walletId":"'$WALLET'","roundId":"round-987","gameId":"fortune-chimp","kind":"BET","money":{"amount":"25.00","currency":"BRL"}}}'
 ```
 
+For FIFO ordering, `MessageGroupId` must be the lowercase, hyphenated UUID of
+`walletId`. The JSON `walletId` may use uppercase letters, but the group ID
+must use its canonical spelling.
+
 Os códigos HTTP, os corpos de erro e os `failureCode` estão em [`ARCHITECTURE.md`](ARCHITECTURE.md#13-contrato-http).
 
 ## Testes

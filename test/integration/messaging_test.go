@@ -1262,11 +1262,14 @@ func TestOutboxClaimTokenFencesReusedOwner(t *testing.T) {
 
 	expiredID := insertOutboxEvent(t)
 	expiredClaimID := uuid.New()
-	expiredAt := firstNow.Add(4 * time.Minute)
+	expiredAt := firstNow.Add(4 * time.Minute).Truncate(time.Microsecond).Add(123 * time.Nanosecond)
 	expired, ok, err := store.Claim(ctx, owner, expiredClaimID, expiredAt, time.Minute)
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.Equal(t, expiredID, expired.EventID)
+	var originalLockedUntil time.Time
+	require.NoError(t, pool.QueryRow(ctx, `SELECT locked_until FROM outbox_events WHERE event_id = $1`, expiredID).
+		Scan(&originalLockedUntil))
 	attempts, started, err = store.StartAttempt(ctx, expiredID, expiredClaimID, expiredAt.Add(time.Minute), time.Minute)
 	require.NoError(t, err)
 	assert.False(t, started, "an expired claim cannot be revived by starting an attempt")
@@ -1276,7 +1279,7 @@ func TestOutboxClaimTokenFencesReusedOwner(t *testing.T) {
 	require.NoError(t, pool.QueryRow(ctx, `SELECT attempts, locked_until FROM outbox_events WHERE event_id = $1`, expiredID).
 		Scan(&storedAttempts, &lockedUntil))
 	assert.Zero(t, storedAttempts)
-	assert.True(t, lockedUntil.Equal(expiredAt.Add(time.Minute)), "an expired StartAttempt leaves locked_until unchanged")
+	assert.True(t, lockedUntil.Equal(originalLockedUntil), "an expired StartAttempt leaves locked_until unchanged")
 }
 
 // Not parallel: relays claim the whole (shared) outbox.

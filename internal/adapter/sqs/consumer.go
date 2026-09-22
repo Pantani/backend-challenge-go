@@ -12,7 +12,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
-	"github.com/google/uuid"
 
 	"github.com/Pantani/backend-challenge-go/internal/app"
 	"github.com/Pantani/backend-challenge-go/internal/observability"
@@ -237,9 +236,10 @@ func (c *Consumer) decode(m types.Message) (app.InboundMessage, error) {
 }
 
 func validateFIFOIdentity(m types.Message, msg app.InboundMessage) error {
-	group, err := uuid.Parse(groupID(m))
-	if err != nil || group != msg.Command.WalletID {
-		return fmt.Errorf("%w: MessageGroupId must equal walletId", ErrInvalidMessage)
+	// SQS orders by the group string, so every spelling of a wallet UUID must
+	// use the same canonical group even when the JSON walletId is uppercase.
+	if groupID(m) != msg.Command.WalletID.String() {
+		return fmt.Errorf("%w: MessageGroupId must be the canonical walletId", ErrInvalidMessage)
 	}
 	if dedupID(m) != msg.MessageID {
 		return fmt.Errorf("%w: MessageDeduplicationId must equal messageId", ErrInvalidMessage)

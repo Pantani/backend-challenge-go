@@ -637,7 +637,7 @@ func TestConsumerRejectsInvalidFIFOIdentity(t *testing.T) {
 	}
 }
 
-func TestConsumerAcceptsUppercaseWalletGroupID(t *testing.T) {
+func TestConsumerRejectsNonCanonicalWalletGroupID(t *testing.T) {
 	t.Parallel()
 	walletID := strings.ToUpper(testWalletA)
 	proc := &fakeProcessor{}
@@ -645,7 +645,20 @@ func TestConsumerAcceptsUppercaseWalletGroupID(t *testing.T) {
 
 	f.c.PollOnce(context.Background())
 
+	assert.Zero(t, proc.calls)
+	require.Len(t, f.api.sent, 1)
+	assert.Equal(t, []string{"rh-uppercase-group"}, f.api.deleted)
+}
+
+func TestConsumerAcceptsUppercaseWalletBodyWithCanonicalGroupID(t *testing.T) {
+	t.Parallel()
+	walletID := strings.ToUpper(testWalletA)
+	proc := &fakeProcessor{}
+	f := newConsumer(t, proc, groupMessage("canonical-group", bodyAt("message-1", "2026-09-22T12:00:00Z", "1.00", walletID), "1", testWalletA))
+
+	f.c.PollOnce(context.Background())
+
 	assert.Equal(t, 1, proc.calls)
 	assert.Empty(t, f.api.sent)
-	assert.Equal(t, []string{"rh-uppercase-group"}, f.api.deleted)
+	assert.Equal(t, []string{"rh-canonical-group"}, f.api.deleted)
 }
