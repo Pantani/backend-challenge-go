@@ -6,6 +6,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"slices"
 	"strconv"
@@ -16,8 +17,11 @@ import (
 
 const (
 	// maxSQSDuration is the longest visibility timeout SQS accepts.
-	maxSQSDuration = 12 * time.Hour
-	maxDuration    = time.Duration(1<<63 - 1)
+	maxSQSDuration        = 12 * time.Hour
+	maxSQSWaitTime        = 20 * time.Second
+	shutdownCleanupBudget = 5 * time.Second
+	httpWriteBudget       = 30 * time.Second
+	maxDuration           = time.Duration(1<<63 - 1)
 )
 
 // Database is the PostgreSQL subset of the configuration, enough for
@@ -80,8 +84,10 @@ type Config struct {
 	LogLevel string
 	// HTTPAddr is the listen address (":0" picks a free port).
 	HTTPAddr string
-	// ShutdownTimeout bounds the whole graceful stop; it must exceed
-	// SQSProcessTimeout so an in-flight message can complete.
+	// StartupTimeout bounds dependency construction and application start.
+	StartupTimeout time.Duration
+	// ShutdownTimeout bounds the whole graceful stop. Its drain phase must
+	// cover each concurrent operation before the final cleanup budget.
 	ShutdownTimeout time.Duration
 	// ReadyTimeout bounds the /health/ready dependency checks and is also
 	// added to the start budget of the application.
@@ -145,8 +151,9 @@ func Load(lookup Lookup) (Config, error) {
 	host, _ := os.Hostname()
 	c := Config{
 		InstanceID: r.str("INSTANCE_ID", host), LogLevel: r.str("LOG_LEVEL", "info"),
-		HTTPAddr: r.str("HTTP_ADDR", ":8080"), ShutdownTimeout: r.dur("SHUTDOWN_TIMEOUT", 30*time.Second),
-		ReadyTimeout: r.dur("READY_TIMEOUT", 2*time.Second), ConflictRetries: r.int("CONFLICT_RETRIES", 5),
+		HTTPAddr: r.str("HTTP_ADDR", ":8080"), StartupTimeout: r.dur("STARTUP_TIMEOUT", 25*time.Second),
+		ShutdownTimeout: r.dur("SHUTDOWN_TIMEOUT", 40*time.Second),
+		ReadyTimeout:    r.dur("READY_TIMEOUT", 2*time.Second), ConflictRetries: r.int("CONFLICT_RETRIES", 5),
 		Database: r.database(), SQS: r.sqs(),
 
 		OIDCIssuer:   r.str("OIDC_ISSUER", "http://localhost:8180/realms/wallet"),
@@ -238,29 +245,31 @@ func check(rules []rule) error {
 }
 
 func (d Database) validate() error {
-	return check([]rule{
+	return errors.Join(check([]rule{
 		{d.DatabaseURL != "", "DATABASE_URL is required"},
-		{d.DBMaxConns > 0, "DB_MAX_CONNS must be positive"},
-		{positiveDurations(d.DBLockTimeout, d.DBStatementTimeout), "DB_LOCK_TIMEOUT and DB_STATEMENT_TIMEOUT must be positive"},
-	})
+		{d.DBMaxConns > 0 && d.DBMaxConns <= math.MaxInt32, "DB_MAX_CONNS must be between 1 and 2147483647"},
+	}), wholeMilliseconds("DB_LOCK_TIMEOUT", d.DBLockTimeout),
+		wholeMilliseconds("DB_STATEMENT_TIMEOUT", d.DBStatementTimeout))
 }
 
 func (s SQS) validate() error {
 	budget, budgetOK := batchBudget(s.SQSMaxMessages, s.SQSProcessTimeout, s.SQSAckTimeout)
-	return check([]rule{
+	return errors.Join(check([]rule{
 		{positive(s.SQSConsumers, s.SQSMaxReceiveCount), "SQS_CONSUMERS and SQS_MAX_RECEIVE_COUNT must be positive"},
 		{between(s.SQSMaxMessages, 1, 10), "SQS_MAX_MESSAGES must be between 1 and 10"},
-		{between(int(s.SQSWaitTime), 0, int(20*time.Second)), "SQS_WAIT_TIME must be between 0s and 20s"},
-		{wholeSeconds(s.SQSWaitTime, s.SQSVisibilityTimeout, s.SQSRetryBase, s.SQSRetryMax),
-			"SQS_WAIT_TIME, SQS_VISIBILITY_TIMEOUT and SQS retry durations must use whole seconds"},
+		{s.SQSWaitTime >= 0 && s.SQSWaitTime <= maxSQSWaitTime, "SQS_WAIT_TIME must be between 0s and 20s"},
 		{positiveDurations(s.SQSVisibilityTimeout, s.SQSProcessTimeout, s.SQSAckTimeout, s.SQSRetryBase, s.SQSRetryMax),
 			"SQS visibility, process, ack and retry durations must be positive"},
 		{budgetOK && s.SQSVisibilityTimeout > budget,
 			"SQS_VISIBILITY_TIMEOUT must exceed the whole receive batch budget: SQS_MAX_MESSAGES * (SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT)"},
 		{s.SQSRetryBase <= s.SQSRetryMax, "SQS_RETRY_BASE must not exceed SQS_RETRY_MAX"},
-		{s.SQSVisibilityTimeout <= maxSQSDuration && s.SQSRetryMax <= maxSQSDuration,
-			"SQS_VISIBILITY_TIMEOUT and SQS_RETRY_MAX must not exceed 12h"},
-	})
+		{s.SQSVisibilityTimeout <= maxSQSDuration, "SQS_VISIBILITY_TIMEOUT must not exceed 12h"},
+		{s.SQSRetryBase <= maxSQSDuration, "SQS_RETRY_BASE must not exceed 12h"},
+		{s.SQSRetryMax <= maxSQSDuration, "SQS_RETRY_MAX must not exceed 12h"},
+	}), wholeSeconds("SQS_WAIT_TIME", s.SQSWaitTime),
+		wholeSeconds("SQS_VISIBILITY_TIMEOUT", s.SQSVisibilityTimeout),
+		wholeSeconds("SQS_RETRY_BASE", s.SQSRetryBase),
+		wholeSeconds("SQS_RETRY_MAX", s.SQSRetryMax))
 }
 
 // batchBudget returns the worst-case serial processing and acknowledgement
@@ -290,14 +299,43 @@ func (c Config) validate() error {
 			"batch sizes and attempts must be positive"},
 		{between(int(c.PendingBaseDelay), 1, int(c.PendingMaxDelay)), "PENDING_BASE_DELAY must be in (0, PENDING_MAX_DELAY]"},
 		{positiveDurations(c.PendingInterval, c.OutboxInterval, c.OutboxLease, c.OutboxRetryBase, c.OutboxRetryMax,
-			c.OutboxPublishTimeout, c.OutboxFinalizeTimeout, c.ShutdownTimeout, c.ReadyTimeout),
+			c.OutboxPublishTimeout, c.OutboxFinalizeTimeout, c.ReadyTimeout),
 			"worker intervals, leases, retries and timeouts must be positive"},
+		{c.StartupTimeout > 0, "STARTUP_TIMEOUT must be positive"},
+		{c.ShutdownTimeout > 0, "SHUTDOWN_TIMEOUT must be positive"},
 		{c.OutboxRetryBase <= c.OutboxRetryMax, "OUTBOX_RETRY_BASE must not exceed OUTBOX_RETRY_MAX"},
 		{outboxBudgetFits(c.OutboxPublishTimeout, c.OutboxFinalizeTimeout, c.OutboxLease),
 			"OUTBOX_PUBLISH_TIMEOUT plus OUTBOX_FINALIZE_TIMEOUT must be lower than OUTBOX_LEASE"},
-		{c.ShutdownTimeout > c.SQSProcessTimeout+c.SQSAckTimeout, "SHUTDOWN_TIMEOUT must exceed SQS_PROCESS_TIMEOUT plus SQS_ACK_TIMEOUT"},
-		{c.ShutdownTimeout > c.OutboxPublishTimeout, "SHUTDOWN_TIMEOUT must exceed OUTBOX_PUBLISH_TIMEOUT"},
-	}))
+	}), c.validateShutdown())
+}
+
+// validateShutdown reserves a final cleanup phase after every independent
+// in-flight operation has drained concurrently.
+func (c Config) validateShutdown() error {
+	drain, ok := shutdownDrain(c.ShutdownTimeout)
+	return check([]rule{
+		{ok && httpWriteBudget < drain,
+			"SHUTDOWN_TIMEOUT must leave more than 30s for HTTP writes before cleanup"},
+		{ok && durationSumLessThan(c.SQSProcessTimeout, c.SQSAckTimeout, drain),
+			"SHUTDOWN_TIMEOUT must cover SQS_PROCESS_TIMEOUT plus SQS_ACK_TIMEOUT before cleanup"},
+		{ok && durationSumLessThan(c.OutboxPublishTimeout, c.OutboxFinalizeTimeout, drain),
+			"SHUTDOWN_TIMEOUT must cover OUTBOX_PUBLISH_TIMEOUT plus OUTBOX_FINALIZE_TIMEOUT before cleanup"},
+		{ok && c.DBStatementTimeout < drain,
+			"SHUTDOWN_TIMEOUT must cover DB_STATEMENT_TIMEOUT before cleanup"},
+	})
+}
+
+func shutdownDrain(timeout time.Duration) (time.Duration, bool) {
+	if timeout <= shutdownCleanupBudget {
+		return 0, false
+	}
+	return timeout - shutdownCleanupBudget, true
+}
+
+// durationSumLessThan compares a serial pair with a limit without adding the
+// durations, which would allow time.Duration overflow to reverse the result.
+func durationSumLessThan(left, right, limit time.Duration) bool {
+	return left >= 0 && right >= 0 && left < limit && right < limit-left
 }
 
 // outboxBudgetFits validates the serial publication and finalization budget
@@ -318,10 +356,24 @@ func positiveDurations(values ...time.Duration) bool {
 	return !slices.ContainsFunc(values, func(d time.Duration) bool { return d <= 0 })
 }
 
-// wholeSeconds protects durations that the SQS API represents as integer
-// seconds from being silently truncated by the adapter.
-func wholeSeconds(values ...time.Duration) bool {
-	return !slices.ContainsFunc(values, func(d time.Duration) bool { return d%time.Second != 0 })
+// wholeSeconds protects a duration serialized to an integer-seconds SQS field
+// from being silently truncated by the adapter.
+func wholeSeconds(name string, value time.Duration) error {
+	if value < 0 || value%time.Second != 0 {
+		return fmt.Errorf("%s must use whole seconds", name)
+	}
+	return nil
+}
+
+func wholeMilliseconds(name string, value time.Duration) error {
+	return wholeUnit(name, value, time.Millisecond, "milliseconds")
+}
+
+func wholeUnit(name string, value, unit time.Duration, label string) error {
+	if value < unit || value%unit != 0 {
+		return fmt.Errorf("%s must be positive whole %s", name, label)
+	}
+	return nil
 }
 
 func between(v, lo, hi int) bool { return v >= lo && v <= hi }

@@ -23,7 +23,8 @@ func TestDefaults(t *testing.T) {
 		{"INSTANCE_ID", c.InstanceID, host},
 		{"LOG_LEVEL", c.LogLevel, "info"},
 		{"HTTP_ADDR", c.HTTPAddr, ":8080"},
-		{"SHUTDOWN_TIMEOUT", c.ShutdownTimeout, 30 * time.Second},
+		{"STARTUP_TIMEOUT", c.StartupTimeout, 25 * time.Second},
+		{"SHUTDOWN_TIMEOUT", c.ShutdownTimeout, 40 * time.Second},
 		{"READY_TIMEOUT", c.ReadyTimeout, 2 * time.Second},
 		{"CONFLICT_RETRIES", c.ConflictRetries, 5},
 		{"DATABASE_URL", c.DatabaseURL, "postgres://wallet:wallet@localhost:5432/wallet?sslmode=disable"},
@@ -66,6 +67,121 @@ func TestDefaults(t *testing.T) {
 	for _, tc := range cases {
 		assert.Equal(t, tc.want, tc.got, tc.name)
 	}
+}
+
+func TestLoadRejectsUnrepresentableAdapterValues(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name, key, value string
+		load             func(config.Lookup) error
+	}{
+		{name: "pool count exceeds int32", key: "DB_MAX_CONNS", value: "2147483648", load: loadDatabase},
+		{name: "lock timeout below one millisecond", key: "DB_LOCK_TIMEOUT", value: "999us", load: loadDatabase},
+		{name: "lock timeout has fractional milliseconds", key: "DB_LOCK_TIMEOUT", value: "1500us", load: loadDatabase},
+		{name: "statement timeout below one millisecond", key: "DB_STATEMENT_TIMEOUT", value: "999us", load: loadDatabase},
+		{name: "statement timeout has fractional milliseconds", key: "DB_STATEMENT_TIMEOUT", value: "1500us", load: loadDatabase},
+		{name: "wait time has fractional seconds", key: "SQS_WAIT_TIME", value: "1500ms", load: loadSQS},
+		{name: "visibility has fractional seconds", key: "SQS_VISIBILITY_TIMEOUT", value: "300500ms", load: loadSQS},
+		{name: "retry base has fractional seconds", key: "SQS_RETRY_BASE", value: "1500ms", load: loadSQS},
+		{name: "retry max has fractional seconds", key: "SQS_RETRY_MAX", value: "60500ms", load: loadSQS},
+		{name: "wait time exceeds API maximum", key: "SQS_WAIT_TIME", value: "21s", load: loadSQS},
+		{name: "visibility exceeds API maximum", key: "SQS_VISIBILITY_TIMEOUT", value: "43201s", load: loadSQS},
+		{name: "retry base exceeds API maximum", key: "SQS_RETRY_BASE", value: "43201s", load: loadSQS},
+		{name: "retry max exceeds API maximum", key: "SQS_RETRY_MAX", value: "43201s", load: loadSQS},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := tt.load(config.MapLookup(map[string]string{tt.key: tt.value}))
+			require.ErrorContains(t, err, tt.key)
+		})
+	}
+}
+
+func TestLoadStartupTimeout(t *testing.T) {
+	t.Parallel()
+	c, err := config.Load(config.MapLookup(map[string]string{"STARTUP_TIMEOUT": "1ms"}))
+	require.NoError(t, err, "short positive budgets remain valid cancellation paths")
+	assert.Equal(t, time.Millisecond, c.StartupTimeout)
+
+	for _, value := range []string{"0s", "-1s"} {
+		_, err := config.Load(config.MapLookup(map[string]string{"STARTUP_TIMEOUT": value}))
+		require.ErrorContains(t, err, "STARTUP_TIMEOUT")
+	}
+}
+
+func TestLoadRejectsOverflowingDurationRelationships(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		values map[string]string
+	}{
+		{
+			name: "SQS drain addition overflows",
+			values: map[string]string{
+				"SQS_MAX_MESSAGES": "1", "SQS_PROCESS_TIMEOUT": "2562047h47m16.854775807s",
+				"SQS_ACK_TIMEOUT": "1ns", "SHUTDOWN_TIMEOUT": "2562047h47m16.854775807s",
+			},
+		},
+		{
+			name: "outbox drain addition overflows",
+			values: map[string]string{
+				"OUTBOX_PUBLISH_TIMEOUT": "2562047h47m16.854775806s", "OUTBOX_FINALIZE_TIMEOUT": "2ns",
+				"OUTBOX_LEASE": "2562047h47m16.854775807s", "SHUTDOWN_TIMEOUT": "2562047h47m16.854775807s",
+			},
+		},
+		{
+			name: "statement timeout exceeds drain near maximum duration",
+			values: map[string]string{
+				"DB_STATEMENT_TIMEOUT": "2562047h47m16.854s", "SHUTDOWN_TIMEOUT": "2562047h47m16.854775807s",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := config.Load(config.MapLookup(tt.values))
+			require.ErrorContains(t, err, "SHUTDOWN_TIMEOUT")
+		})
+	}
+}
+
+func TestShutdownDrainCoversConcurrentOperations(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		values map[string]string
+	}{
+		{name: "HTTP write", values: map[string]string{"SHUTDOWN_TIMEOUT": "35s"}},
+		{name: "SQS process and acknowledgement", values: map[string]string{
+			"SHUTDOWN_TIMEOUT": "40s", "SQS_PROCESS_TIMEOUT": "30s", "SQS_ACK_TIMEOUT": "5s",
+			"SQS_MAX_MESSAGES": "1", "SQS_VISIBILITY_TIMEOUT": "36s",
+		}},
+		{name: "outbox publish and finalize", values: map[string]string{
+			"SHUTDOWN_TIMEOUT": "40s", "OUTBOX_PUBLISH_TIMEOUT": "30s", "OUTBOX_FINALIZE_TIMEOUT": "5s",
+			"OUTBOX_LEASE": "36s",
+		}},
+		{name: "database statement", values: map[string]string{
+			"SHUTDOWN_TIMEOUT": "40s", "DB_STATEMENT_TIMEOUT": "35s",
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := config.Load(config.MapLookup(tt.values))
+			require.ErrorContains(t, err, "SHUTDOWN_TIMEOUT")
+		})
+	}
+}
+
+func loadDatabase(lookup config.Lookup) error {
+	_, err := config.LoadDatabase(lookup)
+	return err
+}
+
+func loadSQS(lookup config.Lookup) error {
+	_, err := config.LoadSQS(lookup)
+	return err
 }
 
 func TestRejectsVisibilityShorterThanWholeBatch(t *testing.T) {
