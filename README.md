@@ -23,10 +23,10 @@ docker compose up --build
 
 O compose sobe, nesta ordem:
 
-1. `postgres`, `localstack` (SQS) e `keycloak` (realm `wallet` importado de `deploy/keycloak/realm-wallet.json`);
-2. `migrate`: executa `wallet migrate up`;
-3. `provision-queues` (em paralelo com `migrate`): executa `wallet provision-queues`, que cria `wager-transactions.fifo`, `wager-transactions-dlq.fifo` (com redrive `maxReceiveCount=5`) e `wallet-events.fifo` (destino da outbox);
-4. `app-1`, `app-2` e `app-3`: três processos independentes do mesmo serviço, em `localhost:8080`, `:8081` e `:8082`.
+1. `postgres` (que, com o volume vazio, executa `deploy/postgres/init/01-runtime-user.sql` e cria o login de runtime), `localstack` (SQS) e `keycloak` (realm `wallet` importado de `deploy/keycloak/realm-wallet.json`);
+2. `migrate`: executa `wallet migrate up` como o dono do schema (`wallet`);
+3. `provision-queues` (em paralelo com `migrate`): executa `wallet provision-queues`, que cria `wager-transactions.fifo`, `wager-transactions-dlq.fifo` (redrive com `maxReceiveCount` = `SQS_MAX_RECEIVE_COUNT` + 20, ou seja, 25 no padrão; ver [Filas](#filas)) e `wallet-events.fifo` (destino da outbox);
+4. `app-1`, `app-2` e `app-3`: três processos independentes do mesmo serviço, em `localhost:8080`, `:8081` e `:8082`, conectados como `wallet_service` (menor privilégio).
 
 `make up`, `make down` (para os containers e preserva os volumes), `make clean` (remove também os volumes) e `make logs` são atalhos.
 
@@ -42,16 +42,23 @@ wallet migrate version     # versão atual
 
 Com o compose: `make migrate-up` / `make migrate-down`. Fora do Docker: `go run ./cmd/wallet migrate up`, com `DATABASE_URL` apontando para o banco. Os comandos `migrate` e `provision-queues` validam apenas as variáveis que usam (banco e SQS, respectivamente); só `serve` exige a configuração completa.
 
-The challenge currently uses one initial migration containing the complete
-schema. Reverting it removes the entire schema, so use `migrate down` only with
-a disposable database. After the schema is released to production, keep this
-initial migration unchanged and add versioned migrations for later changes.
+Há uma única migration inicial (`000001_init`) com o schema completo. Revertê-la remove o schema inteiro, então `migrate down` só deve ser usado num banco descartável. Depois de ir para produção, ela fica imutável e mudanças futuras entram em novas migrations versionadas.
+
+#### Papéis do banco
+
+- As migrations rodam como o dono do schema (`wallet`). O padrão de `DATABASE_URL` é esse usuário, por conveniência para o `migrate` local.
+- A `000001` cria o grupo `NOLOGIN` `wallet_app`, com `SELECT, INSERT` em `ledger_entries` e `SELECT, INSERT, UPDATE` em `wallets`, `wager_transactions`, `inbox_messages` e `outbox_events`.
+- O login `wallet_service` (membro de `wallet_app`, senha só local) é criado por `deploy/postgres/init/01-runtime-user.sql`, no compose e nos testcontainers. `app-1..3` conectam com ele; só o serviço `migrate` usa o dono. O `.env.example` também aponta para `wallet_service`.
+- O script de init só roda com o volume vazio: num volume antigo, recrie com `docker compose down -v` (`make clean`).
+- Em produção, o migrador precisa de `CREATEROLE` (ou um DBA cria `wallet_app` antes), e a senha do login vem de um cofre de segredos.
 
 O binário devolve `0` em sucesso, `2` para comando ou argumentos inválidos (imprime o uso) e `1` para qualquer outra falha; erros vão para `stderr`, os logs JSON para `stdout`.
 
 ### Filas
 
 `wallet provision-queues` cria as filas de forma idempotente (`make provision-queues`). Rodar de novo depois de mudar `SQS_MAX_RECEIVE_COUNT` ou `SQS_VISIBILITY_TIMEOUT` reconcilia as filas existentes. No compose isso roda automaticamente.
+
+Quem manda para a DLQ um erro transitório é o próprio consumidor, ao atingir `SQS_MAX_RECEIVE_COUNT`, com o atributo `failureReason`. O redrive da fila é provisionado com `maxReceiveCount` = `SQS_MAX_RECEIVE_COUNT` + 20 (`sqs.RedriveMaxReceiveCount`) porque, num FIFO, as mensagens atrás de uma cabeça em retry no mesmo `MessageGroupId` são recebidas (e liberadas) junto com ela, e o contador delas sobe sem que tenham sido tentadas. A folga garante que elas nunca sejam levadas pelo broker por falhas alheias. O custo: uma seguidora que esperou atrás de uma cabeça com falha começa com contador alto, então, se ela própria falhar de forma transitória, pode ir para a DLQ antes (com o seu próprio `failureReason`).
 
 ## Variáveis de ambiente
 
@@ -61,23 +68,24 @@ Todas têm padrão local, exceto `AWS_ENDPOINT_URL`, que vazio significa a AWS r
 | --- | --- | --- |
 | `INSTANCE_ID` | hostname | identifica o processo (dono dos leases da outbox e atributo `instance` dos logs) |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` ou `error` |
-| `DATABASE_URL` | `postgres://wallet:wallet@localhost:5432/wallet?sslmode=disable` | PostgreSQL |
-| `DB_MAX_CONNS` | `20` | pool limit, from 1 through the adapter's `int32` maximum (`2147483647`) |
-| `DB_LOCK_TIMEOUT` / `DB_STATEMENT_TIMEOUT` | `5s` / `10s` | positive timeouts with exact millisecond precision; smaller or fractional-millisecond values are rejected |
+| `DATABASE_URL` | `postgres://wallet:wallet@localhost:5432/wallet?sslmode=disable` | PostgreSQL. O padrão é o dono (para o `migrate`); o serviço deve usar `wallet_service` (ver [Papéis do banco](#papéis-do-banco)) |
+| `DB_MAX_CONNS` | `20` | máximo de conexões do pool |
+| `DB_LOCK_TIMEOUT` / `DB_STATEMENT_TIMEOUT` | `5s` / `10s` | `lock_timeout` e `statement_timeout` de cada conexão |
 | `OIDC_ISSUER` | `http://localhost:8180/realms/wallet` | `iss` esperado nos tokens |
 | `OIDC_JWKS_URL` | `…/protocol/openid-connect/certs` | onde buscar as chaves (no compose, `http://keycloak:8080/…`) |
 | `OIDC_AUDIENCE` | `wallet-api` | `aud` exigido |
 | `AWS_ENDPOINT_URL`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | vazio (AWS real; o `.env.example` aponta para o LocalStack), `us-east-1` | cliente SQS |
 | `SQS_INPUT_QUEUE`, `SQS_DLQ`, `SQS_EVENTS_QUEUE` | nomes acima | filas |
 | `SQS_SENDER_PROVIDERS` | `000000000000=*` | vínculo `SenderId` do SQS → provedores permitidos (`id=provider-a\|provider-b;outroId=*`) |
-| `SQS_CONSUMERS`, `SQS_MAX_MESSAGES`, `SQS_WAIT_TIME`, `SQS_VISIBILITY_TIMEOUT`, `SQS_PROCESS_TIMEOUT`, `SQS_ACK_TIMEOUT`, `SQS_RETRY_BASE/MAX`, `SQS_MAX_RECEIVE_COUNT` | `2`, `10`, `10s`, `5m`, `20s`, `5s`, `2s/60s`, `5` | consumer; broker durations use whole seconds, wait is 0–20s, visibility/retries are at most 12h, and visibility covers the worst-case serial budget of the whole batch |
+| `SQS_CONSUMERS`, `SQS_MAX_MESSAGES`, `SQS_WAIT_TIME`, `SQS_VISIBILITY_TIMEOUT`, `SQS_PROCESS_TIMEOUT`, `SQS_ACK_TIMEOUT`, `SQS_RETRY_BASE/MAX` | `2`, `10`, `10s`, `5m`, `20s`, `5s`, `2s/60s` | consumidor: goroutines, tamanho do lote, long polling, visibilidade, prazo por mensagem, prazo do delete/retry/cópia para a DLQ e backoff de retry |
+| `SQS_MAX_RECEIVE_COUNT` | `5` | limite do próprio consumidor: um erro transitório nesse recebimento vai para a DLQ com `failureReason`. O redrive da fila fica em `SQS_MAX_RECEIVE_COUNT` + 20, só como rede de segurança |
 | `PENDING_INTERVAL`, `PENDING_BASE_DELAY`, `PENDING_MAX_DELAY`, `PENDING_MAX_ATTEMPTS`, `PENDING_BATCH` | `1s`, `1s`, `60s`, `10`, `50` | referências pendentes |
-| `OUTBOX_INTERVAL`, `OUTBOX_BATCH`, `OUTBOX_LEASE`, `OUTBOX_RETRY_BASE/MAX`, `OUTBOX_PUBLISH_TIMEOUT`, `OUTBOX_FINALIZE_TIMEOUT`, `OUTBOX_MAX_ATTEMPTS` | `500ms`, `50`, `30s`, `1s/60s`, `10s`, `5s`, `20` | outbox publisher; attempt accounting and its terminal mutation share the total finalization budget |
+| `OUTBOX_INTERVAL`, `OUTBOX_BATCH`, `OUTBOX_LEASE`, `OUTBOX_RETRY_BASE/MAX`, `OUTBOX_PUBLISH_TIMEOUT`, `OUTBOX_FINALIZE_TIMEOUT`, `OUTBOX_MAX_ATTEMPTS` | `500ms`, `50`, `30s`, `1s/60s`, `10s`, `5s`, `20` | relay da outbox; `OUTBOX_FINALIZE_TIMEOUT` cobre as escritas no banco em volta da publicação |
 | `CONFLICT_RETRIES` | `5` | novas tentativas de uma transação SQL que perdeu uma disputa |
-| `STARTUP_TIMEOUT` | `25s` | positive startup budget; deliberately short positive values remain valid for cancellation testing |
-| `SHUTDOWN_TIMEOUT` | `61s` | total stop budget; HTTP drains before workers, and the final 5s are reserved for cleanup |
+| `STARTUP_TIMEOUT` | `25s` | prazo para construir e iniciar a aplicação |
+| `SHUTDOWN_TIMEOUT` | `61s` | prazo total do encerramento gracioso (consumidores param de buscar, HTTP drena, workers terminam, pool fecha) |
 
-Configuration is validated at startup: invalid values, an unknown `LOG_LEVEL`, non-positive intervals and timeouts, `DB_MAX_CONNS` outside the adapter's positive `int32` range, PostgreSQL timeouts that cannot be represented exactly in milliseconds, `SQS_MAX_MESSAGES` outside 1–10, `SQS_WAIT_TIME` outside 0–20s, fractional `SQS_WAIT_TIME`, `SQS_VISIBILITY_TIMEOUT`, or SQS retry durations, `SQS_VISIBILITY_TIMEOUT` or either SQS retry bound above 12h, `*_RETRY_BASE > *_RETRY_MAX`, `PENDING_BASE_DELAY` outside `(0, PENDING_MAX_DELAY]`, `SQS_VISIBILITY_TIMEOUT <= SQS_MAX_MESSAGES * (SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT)`, and `OUTBOX_PUBLISH_TIMEOUT + OUTBOX_FINALIZE_TIMEOUT >= OUTBOX_LEASE`. Fractional adapter values are rejected rather than rounded so the validated budget is exactly the budget sent to PostgreSQL or SQS. Duration relationships reject overflow. The shutdown drain reserves 5s for cleanup and must exceed the serial sum of the HTTP 30s write bound and the longest SQS processing plus acknowledgement, outbox publication plus finalization, or database statement operation. Outbox lease validation applies to one singular claim immediately before publication; it is not multiplied by `OUTBOX_BATCH`. Startup also fails when PostgreSQL, SQS, or the queues are unavailable.
+A configuração é validada no início (`internal/config`) e todos os erros são reportados juntos: parse, `LOG_LEVEL`, valores não positivos, limites do SQS (`SQS_MAX_MESSAGES` 1–10, `SQS_WAIT_TIME` 0–20 s, visibilidade e `SQS_RETRY_MAX` ≤ 12 h), bases de backoff ≤ máximos e `SQS_SENDER_PROVIDERS`. Duas relações evitam processamento duplicado: `SQS_VISIBILITY_TIMEOUT > SQS_MAX_MESSAGES × (SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT)` e `OUTBOX_PUBLISH_TIMEOUT + OUTBOX_FINALIZE_TIMEOUT < OUTBOX_LEASE`.
 
 ## Autenticação
 
@@ -135,9 +143,7 @@ awslocal sqs send-message --queue-url http://localhost:4566/000000000000/wager-t
   --message-body '{"messageId":"msg-123","type":"WagerTransactionRequested","occurredAt":"2026-09-08T12:00:00.000Z","data":{"providerId":"provider-a","externalTransactionId":"transaction-124","idempotencyKey":"provider-a:transaction-124","playerId":"0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1","walletId":"'$WALLET'","roundId":"round-987","gameId":"fortune-chimp","kind":"BET","money":{"amount":"25.00","currency":"BRL"}}}'
 ```
 
-For FIFO ordering, `MessageGroupId` must be the lowercase, hyphenated UUID of
-`walletId`. The JSON `walletId` may use uppercase letters, but the group ID
-must use its canonical spelling.
+Para a ordem FIFO, `MessageGroupId` precisa ser o UUID canônico (minúsculo, com hífens) do `walletId`, e `MessageDeduplicationId` precisa ser igual ao `messageId`. O `walletId` do JSON pode ter maiúsculas, mas o grupo usa a grafia canônica; caso contrário a mensagem vai para a DLQ.
 
 Os códigos HTTP, os corpos de erro e os `failureCode` estão em [`ARCHITECTURE.md`](ARCHITECTURE.md#13-contrato-http).
 
@@ -147,11 +153,11 @@ Os códigos HTTP, os corpos de erro e os `failureCode` estão em [`ARCHITECTURE.
 go test ./...          # unitários (sem Docker)
 go test -race ./...
 make vet               # go vet, também com as tags integration e e2e
-make lint              # gofmt/goimports, gocyclo ≤ 6, gocognit ≤ 8 (código e testes)
+make lint              # gofmt/goimports, gocyclo ≤ 15, gocognit ≤ 20 (código e testes)
 make                   # vet + lint + testes unitários com -race
 ```
 
-O CI (`.github/workflows/ci.yml`) roda tidy, gofmt, vet com todas as tags, build, testes unitários com `-race`, `golangci-lint` v2 fixado e `govulncheck` em todo push/PR. A cobertura autoritativa, que precisa de Docker, roda num job à parte disparado manualmente (`workflow_dispatch`) ou toda noite; a política de custo mantém esse job fora de pushes e PRs.
+O CI (`.github/workflows/ci.yml`) roda tidy, gofmt, vet com todas as tags, build, testes unitários com `-race`, `golangci-lint` v2 fixado e `govulncheck` em todo push/PR. Os testes com Docker (`make coverage` e `make test-e2e`) rodam num job à parte, disparado manualmente (`workflow_dispatch`) ou toda noite.
 
 ### Integração e e2e
 
@@ -162,7 +168,8 @@ As dependências dos testes sobem sozinhas via **testcontainers** (é preciso Do
 # concorrência (50 apostas iguais, 80+80 sobre 100, carteiras independentes, reversões concorrentes),
 # lock timeout, inbox/reentrega após crash, DLQ/redrive, outbox com publishers concorrentes e
 # recuperação, autenticação real (inválida, adulterada, expirada), isolamento entre provedores,
-# composição Fx (start/stop, liberação dos workers, falhas de dependência) e CLI.
+# papel de runtime sem privilégio sobre o ledger, composição Fx (start/stop, ordem de
+# encerramento, falhas de dependência) e CLI.
 make test-integration   # go test -race -count=1 -tags integration ./test/integration/...
 
 # O binário compilado roda como 3 processos independentes: duplicidade e disputa entre instâncias,
@@ -170,11 +177,11 @@ make test-integration   # go test -race -count=1 -tags integration ./test/integr
 # (idempotência e pendências preservadas) e reconciliação de todas as carteiras ao final.
 make test-e2e           # go test -count=1 -timeout 15m -tags e2e ./test/e2e/...
 
-# Cobertura combinada unidade + integração + e2e, com mínimo de 90,0% por pacote.
+# Cobertura de unidade + integração (com -race) de cmd/ e internal/; imprime o total.
 make coverage
 ```
 
-`make coverage` é o gate autoritativo: combina as três suítes (o e2e roda o binário real sem `-race`), instrumenta todos os pacotes com código não-teste em `cmd/`, `internal/` e `test/testenv`, e falha se algum pacote estiver ausente, tiver saída de cobertura inválida ou ficar abaixo de 90,0% de statements. O relatório combinado fica em `coverage/coverage.out` e os percentuais por pacote em `coverage/packages.txt`. Só os testes unitários (`go test ./...`) já cobrem 100% de `app`, `config`, `domain/*`, `observability` e `worker`; o restante dos adaptadores, `bootstrap` e `cli` depende dos containers.
+`make coverage` grava o perfil em `coverage.out` e imprime o percentual total. Não há gate por pacote, e o e2e fica de fora (roda o binário compilado, sem instrumentação).
 
 ### Simulações de falha cobertas
 
@@ -183,7 +190,12 @@ make coverage
 | Consumidor morre depois do commit e antes do `DeleteMessage` | `TestConsumerCrashAfterCommitIsRedeliveredAndDeduplicated` |
 | Publisher morre entre publicar e confirmar na outbox | `TestCrashBetweenPublishAndConfirmIsRecovered` |
 | Commit feito, publicação nunca feita (outbox pendente) | `TestTwoPublishersShareTheOutbox` |
-| PostgreSQL indisponível no consumo (retry + redrive para a DLQ) | `TestTransientFailuresAreRetriedThenRedrivenToTheDLQ` |
+| PostgreSQL indisponível no consumo (retry e, no limite, DLQ com `failureReason`) | `TestTransientFailuresAreRetriedThenDeadLetteredWithTheirReason` |
+| Mensagem atrás de uma cabeça com falha no mesmo grupo não vai para a DLQ | `TestFollowerOfAFailingHeadIsNotDeadLettered` |
+| Redrive da fila como rede de segurança | `TestQueueRedriveRemainsASafetyNet` |
 | Lock de carteira preso (lock timeout → retry/503) | `TestLockTimeoutIsTransient` |
-| Encerramento abrupto de todas as instâncias | `TestZZCrashAndRestart` (e2e) |
-| `SIGTERM`: para de buscar trabalho, conclui ou libera o em andamento | `TestConsumerReleasesUnstartedMessagesOnShutdown`, `TestApplicationStopsWorkersOnShutdown` |
+| Encerramento abrupto de todas as instâncias | `TestCrashAndRestart` (e2e) |
+| `SIGTERM`: para de buscar trabalho, conclui ou libera o em andamento | `TestConsumerReleasesUnstartedMessagesOnShutdown`, `TestApplicationStopsWorkersOnShutdown`, `TestFxStopsServerThenWorkersThenPool` |
+| Runtime tentando reescrever o ledger ou desligar seus triggers | `TestRuntimeRoleCannotRewriteOrUnguardTheLedger` |
+| Lançamento de ledger que não confere com a sua transação | `TestLedgerEntryMustMatchItsTransaction` |
+| Provedor reutilizando chave e `externalTransactionId` de outro | `TestProviderIsolationOnReplays` |
