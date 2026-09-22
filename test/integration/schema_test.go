@@ -19,6 +19,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -29,11 +30,18 @@ import (
 	"github.com/Pantani/backend-challenge-go/test/testenv"
 )
 
-// execStatements preserves both statement and deferred commit errors.
+// execStatements runs the statements in one transaction as the schema owner,
+// so the assertions reach the triggers and constraints that guard even the
+// owner. It preserves both statement and deferred commit errors.
 func execStatements(t *testing.T, statements ...string) error {
 	t.Helper()
+	return execStatementsOn(t, ownerPool, statements...)
+}
+
+func execStatementsOn(t *testing.T, db *pgxpool.Pool, statements ...string) error {
+	t.Helper()
 	ctx := context.Background()
-	tx, err := pool.Begin(ctx)
+	tx, err := db.Begin(ctx)
 	require.NoError(t, err)
 	defer func() { _ = tx.Rollback(ctx) }()
 	for _, s := range statements {
@@ -57,7 +65,12 @@ func sqlState(err error) (string, error) {
 
 func rejectedState(t *testing.T, statements ...string) string {
 	t.Helper()
-	err := execStatements(t, statements...)
+	return rejectedStateOn(t, ownerPool, statements...)
+}
+
+func rejectedStateOn(t *testing.T, db *pgxpool.Pool, statements ...string) string {
+	t.Helper()
+	err := execStatementsOn(t, db, statements...)
 	require.Error(t, err, "SQL must fail")
 	state, unclassified := sqlState(err)
 	require.NoError(t, unclassified, "original SQL error: %v", err)
@@ -300,7 +313,59 @@ func TestLedgerIsAppendOnly(t *testing.T) {
 	assert.Equal(t, "23514", rejectedState(t, insertLedgerEntry(id, tx.String(), "DEBIT", 100, 10000, 9800, "BRL")), "balance math")
 	assert.Equal(t, "23514", rejectedState(t, insertLedgerEntry(id, uuid.NewString(), "DEBIT", 100, 5000, 4900, "BRL")), "chain from the last entry")
 	assert.Equal(t, "23514", rejectedState(t, insertLedgerEntry(id, tx.String(), "DEBIT", 100, 10000, 9900, "USD")), "currency must match the wallet")
-	assert.Equal(t, "23505", rejectedState(t, insertLedgerEntry(id, tx.String(), "DEBIT", 100, 10000, 9900, "BRL")), "(walletId, transactionId) unique")
+	assert.Equal(t, "23505", rejectedState(t, insertLedgerEntry(id, tx.String(), "DEBIT", 100, 10000, 9900, "BRL")), "one entry per transaction")
+}
+
+// The runtime login owns nothing and is no superuser: privileges alone refuse
+// ledger rewrites, and the triggers cannot be switched off.
+func TestRuntimeRoleCannotRewriteOrUnguardTheLedger(t *testing.T) {
+	t.Parallel()
+	w, _ := seededWallet(t)
+	id := w.String()
+	var user string
+	var superuser, member, owner bool
+	require.NoError(t, pool.QueryRow(context.Background(), `SELECT current_user, rolsuper, pg_has_role(current_user, 'wallet_app', 'MEMBER'),
+		pg_has_role(current_user, (SELECT tableowner FROM pg_tables WHERE tablename = 'ledger_entries'), 'MEMBER')
+		FROM pg_roles WHERE rolname = current_user`).Scan(&user, &superuser, &member, &owner))
+	assert.Equal(t, testenv.RuntimeUser, user)
+	assert.False(t, superuser)
+	assert.True(t, member, "privileges come from the wallet_app group")
+	assert.False(t, owner, "the runtime login does not own the schema")
+
+	denied := map[string]string{
+		"update ledger":              `UPDATE ledger_entries SET amount_minor = 1 WHERE wallet_id = '` + id + `'`,
+		"delete ledger":              `DELETE FROM ledger_entries WHERE wallet_id = '` + id + `'`,
+		"truncate ledger":            `TRUNCATE ledger_entries CASCADE`,
+		"disable ledger trigger":     `ALTER TABLE ledger_entries DISABLE TRIGGER ledger_entries_immutable`,
+		"disable all ledger trigger": `ALTER TABLE ledger_entries DISABLE TRIGGER ALL`,
+		"skip triggers (replica)":    `SET session_replication_role = replica`,
+		"delete wallet":              `DELETE FROM wallets WHERE id = '` + id + `'`,
+		"drop ledger":                `DROP TABLE ledger_entries`,
+	}
+	for name, statement := range denied {
+		assert.Equal(t, "42501", rejectedStateOn(t, pool, statement), name)
+	}
+	var entries int
+	require.NoError(t, pool.QueryRow(context.Background(), `SELECT count(*) FROM ledger_entries WHERE wallet_id = $1`, w).Scan(&entries))
+	assert.Equal(t, 1, entries, "the ledger is untouched")
+}
+
+// A ledger entry references its own transaction's wallet, currency and amount.
+func TestLedgerEntryMustMatchItsTransaction(t *testing.T) {
+	t.Parallel()
+	a, _ := seededWallet(t)
+	b, _ := seededWallet(t)
+	win := uuid.NewString()
+	require.NoError(t, execStatements(t, insertTransaction(txRow{ID: win, WalletID: a.String(), Kind: "WIN", Status: "PROCESSED",
+		Amount: 500, Provider: "p", Result: ptr(10500)})))
+	cases := map[string]string{
+		"another wallet":      insertLedgerEntry(b.String(), win, "CREDIT", 500, 10000, 10500, "BRL"),
+		"another amount":      insertLedgerEntry(a.String(), win, "CREDIT", 400, 10000, 10400, "BRL"),
+		"unknown transaction": insertLedgerEntry(a.String(), uuid.NewString(), "CREDIT", 500, 10000, 10500, "BRL"),
+	}
+	for name, statement := range cases {
+		assert.Equal(t, "23503", rejectedStateOn(t, pool, statement), name)
+	}
 }
 
 func TestLedgerEntryWithoutWalletUpdateFailsAtCommit(t *testing.T) {
@@ -491,7 +556,7 @@ func TestMigrationStatementIsBounded(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 3*time.Second, config.ConnectTimeout)
 	var running int
-	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+	require.NoError(t, ownerPool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
 		WHERE datname = $1 AND state = 'active' AND query LIKE '%pg_sleep%'`, config.Database).Scan(&running))
 	require.Zero(t, running, "no timed-out migration is left running in PostgreSQL")
 }

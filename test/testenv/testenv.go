@@ -43,14 +43,23 @@ var Clients = map[string]string{
 	"no-role-client":         "no-role-client-secret",
 }
 
-// Env holds the endpoints of the running dependencies.
+// Runtime login created by deploy/postgres/init (member of wallet_app).
+const (
+	RuntimeUser     = "wallet_service"
+	RuntimePassword = "wallet_service"
+)
+
+// Env holds the endpoints of the running dependencies. DatabaseURL is the
+// least-privilege runtime login the service uses, as in production;
+// OwnerDatabaseURL is the schema owner, for migrations and administration.
 type Env struct {
-	DatabaseURL string
-	SQSEndpoint string
-	KeycloakURL string
-	mu          sync.Mutex
-	containers  []testcontainers.Container
-	root        string
+	DatabaseURL      string
+	OwnerDatabaseURL string
+	SQSEndpoint      string
+	KeycloakURL      string
+	mu               sync.Mutex
+	containers       []testcontainers.Container
+	root             string
 }
 
 func (e *Env) track(c testcontainers.Container) {
@@ -129,6 +138,7 @@ func (e *Env) Stop(ctx context.Context) error {
 func (e *Env) startPostgres(ctx context.Context) error {
 	c, err := tcpostgres.Run(ctx, PostgresImage,
 		tcpostgres.WithDatabase("wallet"), tcpostgres.WithUsername("wallet"), tcpostgres.WithPassword("wallet"),
+		tcpostgres.WithInitScripts(filepath.Join(e.root, "deploy", "postgres", "init", "01-runtime-user.sql")),
 		tcpostgres.BasicWaitStrategies(),
 		testcontainers.WithCmd("postgres", "-c", "max_connections=300"))
 	if c != nil {
@@ -137,8 +147,21 @@ func (e *Env) startPostgres(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("postgres: %w", err)
 	}
-	e.DatabaseURL, err = c.ConnectionString(ctx, "sslmode=disable")
+	if e.OwnerDatabaseURL, err = c.ConnectionString(ctx, "sslmode=disable"); err != nil {
+		return err
+	}
+	e.DatabaseURL, err = WithUser(e.OwnerDatabaseURL, RuntimeUser, RuntimePassword)
 	return err
+}
+
+// WithUser returns databaseURL authenticated as another user.
+func WithUser(databaseURL, user, password string) (string, error) {
+	u, err := url.Parse(databaseURL)
+	if err != nil {
+		return "", err
+	}
+	u.User = url.UserPassword(user, password)
+	return u.String(), nil
 }
 
 func (e *Env) startLocalStack(ctx context.Context) error {
