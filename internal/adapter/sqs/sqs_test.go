@@ -123,7 +123,6 @@ func TestDecodeMessageInvalid(t *testing.T) {
 	t.Parallel()
 	cases := []string{
 		"not json",
-		`{"messageId":"m","type":"Other","data":{}}`,
 		`{"type":"WagerTransactionRequested","data":{}}`,
 		`{"messageId":"m","type":"WagerTransactionRequested","extra":1}`,
 		strings.Replace(body("m", "25.00"), `"25.00"`, `25.00`, 1),
@@ -135,6 +134,20 @@ func TestDecodeMessageInvalid(t *testing.T) {
 		_, err := sqsadapter.DecodeMessage("consumer", c)
 		assert.ErrorIs(t, err, sqsadapter.ErrInvalidMessage, c)
 	}
+	unsupported := strings.Replace(body("m", "1.00"), sqsadapter.MessageType, "Other", 1)
+	_, err := sqsadapter.DecodeMessage("consumer", unsupported)
+	require.ErrorIs(t, err, sqsadapter.ErrInvalidMessage)
+	assert.ErrorContains(t, err, "unsupported type")
+}
+
+func TestConsumerRequestsFIFOIdentityAttributes(t *testing.T) {
+	t.Parallel()
+	f := newConsumer(t, &fakeProcessor{})
+	f.c.PollOnce(context.Background())
+	require.Len(t, f.api.received, 1)
+	requested := f.api.received[0].MessageSystemAttributeNames
+	assert.Contains(t, requested, types.MessageSystemAttributeNameMessageGroupId)
+	assert.Contains(t, requested, types.MessageSystemAttributeNameMessageDeduplicationId)
 }
 
 func TestDecodeMessageRejectsInvalidEnvelopeMetadata(t *testing.T) {

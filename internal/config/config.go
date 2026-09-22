@@ -14,8 +14,11 @@ import (
 	"github.com/Pantani/backend-challenge-go/internal/observability"
 )
 
-// maxSQSDuration is the longest visibility timeout SQS accepts.
-const maxSQSDuration = 12 * time.Hour
+const (
+	// maxSQSDuration is the longest visibility timeout SQS accepts.
+	maxSQSDuration = 12 * time.Hour
+	maxDuration    = time.Duration(1<<63 - 1)
+)
 
 // Database is the PostgreSQL subset of the configuration, enough for
 // `wallet migrate`.
@@ -49,11 +52,10 @@ type SQS struct {
 	SQSMaxMessages int
 	// SQSWaitTime is the long-polling wait (0..20s).
 	SQSWaitTime time.Duration
-	// SQSVisibilityTimeout hides a received message from other consumers;
-	// SQSProcessTimeout bounds the handling of one message and
-	// SQSAckTimeout the broker follow-up (delete, retry visibility, DLQ
-	// copy). Their sum must stay below the visibility timeout so a message is
-	// never handled twice at once.
+	// SQSVisibilityTimeout hides a received batch from other consumers;
+	// SQSProcessTimeout bounds one message and SQSAckTimeout its broker
+	// follow-up. Visibility must exceed their sum multiplied by the maximum
+	// batch size because messages are handled serially.
 	SQSVisibilityTimeout time.Duration
 	SQSProcessTimeout    time.Duration
 	SQSAckTimeout        time.Duration
@@ -194,7 +196,7 @@ func (r *reader) sqs() SQS {
 		SQSEventsQueue:  r.str("SQS_EVENTS_QUEUE", "wallet-events.fifo"),
 		SQSConsumerName: r.str("SQS_CONSUMER_NAME", "wager-transactions-consumer"),
 		SQSConsumers:    r.int("SQS_CONSUMERS", 2), SQSMaxMessages: r.int("SQS_MAX_MESSAGES", 10),
-		SQSWaitTime: r.dur("SQS_WAIT_TIME", 10*time.Second), SQSVisibilityTimeout: r.dur("SQS_VISIBILITY_TIMEOUT", 30*time.Second),
+		SQSWaitTime: r.dur("SQS_WAIT_TIME", 10*time.Second), SQSVisibilityTimeout: r.dur("SQS_VISIBILITY_TIMEOUT", 5*time.Minute),
 		SQSProcessTimeout: r.dur("SQS_PROCESS_TIMEOUT", 20*time.Second), SQSAckTimeout: r.dur("SQS_ACK_TIMEOUT", 5*time.Second),
 		SQSRetryBase: r.dur("SQS_RETRY_BASE", 2*time.Second), SQSRetryMax: r.dur("SQS_RETRY_MAX", 60*time.Second),
 		SQSMaxReceiveCount: r.int("SQS_MAX_RECEIVE_COUNT", 5),
@@ -240,18 +242,35 @@ func (d Database) validate() error {
 }
 
 func (s SQS) validate() error {
+	budget, budgetOK := batchBudget(s.SQSMaxMessages, s.SQSProcessTimeout, s.SQSAckTimeout)
 	return check([]rule{
 		{positive(s.SQSConsumers, s.SQSMaxReceiveCount), "SQS_CONSUMERS and SQS_MAX_RECEIVE_COUNT must be positive"},
 		{between(s.SQSMaxMessages, 1, 10), "SQS_MAX_MESSAGES must be between 1 and 10"},
 		{between(int(s.SQSWaitTime), 0, int(20*time.Second)), "SQS_WAIT_TIME must be between 0s and 20s"},
 		{positiveDurations(s.SQSVisibilityTimeout, s.SQSProcessTimeout, s.SQSAckTimeout, s.SQSRetryBase, s.SQSRetryMax),
 			"SQS visibility, process, ack and retry durations must be positive"},
-		{s.SQSProcessTimeout+s.SQSAckTimeout < s.SQSVisibilityTimeout,
-			"SQS_PROCESS_TIMEOUT plus SQS_ACK_TIMEOUT must be lower than SQS_VISIBILITY_TIMEOUT"},
+		{budgetOK && s.SQSVisibilityTimeout > budget,
+			"SQS_VISIBILITY_TIMEOUT must exceed the whole receive batch budget: SQS_MAX_MESSAGES * (SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT)"},
 		{s.SQSRetryBase <= s.SQSRetryMax, "SQS_RETRY_BASE must not exceed SQS_RETRY_MAX"},
 		{s.SQSVisibilityTimeout <= maxSQSDuration && s.SQSRetryMax <= maxSQSDuration,
 			"SQS_VISIBILITY_TIMEOUT and SQS_RETRY_MAX must not exceed 12h"},
 	})
+}
+
+// batchBudget returns the worst-case serial processing and acknowledgement
+// time for one receive without allowing time.Duration arithmetic to wrap.
+func batchBudget(maxMessages int, process, ack time.Duration) (time.Duration, bool) {
+	if maxMessages <= 0 || process <= 0 || ack <= 0 {
+		return 0, false
+	}
+	if process > maxDuration-ack {
+		return 0, false
+	}
+	perMessage := process + ack
+	if perMessage > maxDuration/time.Duration(maxMessages) {
+		return 0, false
+	}
+	return time.Duration(maxMessages) * perMessage, true
 }
 
 // validate enforces relationships between settings.

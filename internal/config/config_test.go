@@ -42,7 +42,7 @@ func TestDefaults(t *testing.T) {
 		{"SQS_CONSUMERS", c.SQSConsumers, 2},
 		{"SQS_MAX_MESSAGES", c.SQSMaxMessages, 10},
 		{"SQS_WAIT_TIME", c.SQSWaitTime, 10 * time.Second},
-		{"SQS_VISIBILITY_TIMEOUT", c.SQSVisibilityTimeout, 30 * time.Second},
+		{"SQS_VISIBILITY_TIMEOUT", c.SQSVisibilityTimeout, 5 * time.Minute},
 		{"SQS_PROCESS_TIMEOUT", c.SQSProcessTimeout, 20 * time.Second},
 		{"SQS_ACK_TIMEOUT", c.SQSAckTimeout, 5 * time.Second},
 		{"SQS_RETRY_BASE", c.SQSRetryBase, 2 * time.Second},
@@ -64,6 +64,51 @@ func TestDefaults(t *testing.T) {
 	}
 	for _, tc := range cases {
 		assert.Equal(t, tc.want, tc.got, tc.name)
+	}
+}
+
+func TestRejectsVisibilityShorterThanWholeBatch(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		visibility string
+	}{
+		{name: "shorter", visibility: "30s"},
+		{name: "equal", visibility: "250s"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := config.Load(config.MapLookup(map[string]string{
+				"SQS_MAX_MESSAGES":       "10",
+				"SQS_PROCESS_TIMEOUT":    "20s",
+				"SQS_ACK_TIMEOUT":        "5s",
+				"SQS_VISIBILITY_TIMEOUT": tt.visibility,
+			}))
+			require.ErrorContains(t, err, "whole receive batch")
+		})
+	}
+}
+
+func TestRejectsWholeBatchBudgetOverflow(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name, process, ack string
+	}{
+		{name: "addition", process: "2562047h47m16.854775807s", ack: "1ns"},
+		{name: "multiplication", process: "1000000h", ack: "1s"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := config.Load(config.MapLookup(map[string]string{
+				"SQS_MAX_MESSAGES":       "10",
+				"SQS_PROCESS_TIMEOUT":    tt.process,
+				"SQS_ACK_TIMEOUT":        tt.ack,
+				"SQS_VISIBILITY_TIMEOUT": "12h",
+			}))
+			require.ErrorContains(t, err, "whole receive batch")
+		})
 	}
 }
 

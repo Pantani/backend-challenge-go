@@ -19,6 +19,7 @@ var errInvalidSend = errors.New("fake sqs: invalid SendMessage input")
 type fakeAPI struct {
 	mu         sync.Mutex
 	receive    func(ctx context.Context) (*sqs.ReceiveMessageOutput, error)
+	received   []*sqs.ReceiveMessageInput
 	errs       map[string]error
 	deleted    []string
 	visibility map[string]int32
@@ -81,11 +82,12 @@ func (f *fakeAPI) GetQueueAttributes(ctx context.Context, in *sqs.GetQueueAttrib
 	}}, nil
 }
 
-func (f *fakeAPI) ReceiveMessage(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+func (f *fakeAPI) ReceiveMessage(ctx context.Context, in *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	f.mu.Lock()
+	f.received = append(f.received, in)
 	receive := f.receive
 	f.mu.Unlock()
 	return receive(ctx)

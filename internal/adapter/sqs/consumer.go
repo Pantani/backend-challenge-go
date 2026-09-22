@@ -74,8 +74,8 @@ type ConsumerConfig struct {
 	WaitTime time.Duration
 	// VisibilityTimeout overrides the queue attribute for every receive. It
 	// must agree with the provisioned queue value (SQS_VISIBILITY_TIMEOUT)
-	// and exceed ProcessTimeout + AckTimeout so a message is never processed
-	// twice concurrently.
+	// and exceed MaxMessages * (ProcessTimeout + AckTimeout), because this
+	// consumer handles a received batch serially.
 	VisibilityTimeout time.Duration
 	// ProcessTimeout bounds one message; it must stay below the visibility
 	// timeout so a message is never processed twice concurrently.
@@ -157,9 +157,10 @@ func (c *Consumer) PollOnce(ctx context.Context) {
 	c.process(ctx, out.Messages)
 }
 
-// process handles a batch in order. A batch can carry several messages of
-// the same MessageGroupId (the in-order tail of a wallet): once a message is
-// left in the queue, the rest of its group is released instead of processed,
+// process handles a batch in order. The receive visibility protects the
+// worst-case budget of the complete batch. A batch can carry several messages
+// of the same MessageGroupId (the in-order tail of a wallet): once a message
+// is left in the queue, the rest of its group is released instead of processed,
 // so the group is redelivered in order after its head.
 func (c *Consumer) process(ctx context.Context, msgs []types.Message) {
 	blocked := map[string]bool{}

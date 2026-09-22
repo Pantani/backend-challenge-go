@@ -158,7 +158,7 @@ func command(ctx context.Context, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, binary, args...)
 	cmd.WaitDelay = time.Second
 	cmd.Env = os.Environ()
-	for k, v := range env.Vars(map[string]string{"LOG_LEVEL": "info", "SQS_VISIBILITY_TIMEOUT": "10s", "SQS_PROCESS_TIMEOUT": "8s", "SQS_ACK_TIMEOUT": "1s"}) {
+	for k, v := range env.Vars(map[string]string{"LOG_LEVEL": "info", "SQS_VISIBILITY_TIMEOUT": "2m", "SQS_PROCESS_TIMEOUT": "8s", "SQS_ACK_TIMEOUT": "1s"}) {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
 	if dir := os.Getenv("E2E_GOCOVERDIR"); dir != "" {

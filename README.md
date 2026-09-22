@@ -64,13 +64,13 @@ Todas têm padrão local, exceto `AWS_ENDPOINT_URL`, que vazio significa a AWS r
 | `AWS_ENDPOINT_URL`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | vazio (AWS real; o `.env.example` aponta para o LocalStack), `us-east-1` | cliente SQS |
 | `SQS_INPUT_QUEUE`, `SQS_DLQ`, `SQS_EVENTS_QUEUE` | nomes acima | filas |
 | `SQS_SENDER_PROVIDERS` | `000000000000=*` | vínculo `SenderId` do SQS → provedores permitidos (`id=provider-a\|provider-b;outroId=*`) |
-| `SQS_CONSUMERS`, `SQS_WAIT_TIME`, `SQS_VISIBILITY_TIMEOUT`, `SQS_PROCESS_TIMEOUT`, `SQS_ACK_TIMEOUT`, `SQS_RETRY_BASE/MAX`, `SQS_MAX_RECEIVE_COUNT` | `2`, `10s`, `30s`, `20s`, `5s`, `2s/60s`, `5` | consumidor |
+| `SQS_CONSUMERS`, `SQS_MAX_MESSAGES`, `SQS_WAIT_TIME`, `SQS_VISIBILITY_TIMEOUT`, `SQS_PROCESS_TIMEOUT`, `SQS_ACK_TIMEOUT`, `SQS_RETRY_BASE/MAX`, `SQS_MAX_RECEIVE_COUNT` | `2`, `10`, `10s`, `5m`, `20s`, `5s`, `2s/60s`, `5` | consumer; visibility covers the worst-case serial budget of the whole batch |
 | `PENDING_INTERVAL`, `PENDING_BASE_DELAY`, `PENDING_MAX_DELAY`, `PENDING_MAX_ATTEMPTS`, `PENDING_BATCH` | `1s`, `1s`, `60s`, `10`, `50` | referências pendentes |
 | `OUTBOX_INTERVAL`, `OUTBOX_BATCH`, `OUTBOX_LEASE`, `OUTBOX_RETRY_BASE/MAX`, `OUTBOX_PUBLISH_TIMEOUT`, `OUTBOX_MAX_ATTEMPTS` | `500ms`, `50`, `30s`, `1s/60s`, `10s`, `20` | publisher da outbox |
 | `CONFLICT_RETRIES` | `5` | novas tentativas de uma transação SQL que perdeu uma disputa |
 | `SHUTDOWN_TIMEOUT` | `30s` | prazo do encerramento (maior que `SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT` e que `OUTBOX_PUBLISH_TIMEOUT`) |
 
-A configuração é validada na inicialização: valores inválidos, `LOG_LEVEL` desconhecido, intervalos e timeouts não positivos, `SQS_MAX_MESSAGES` fora de 1–10, `SQS_WAIT_TIME` acima de 20 s, `SQS_VISIBILITY_TIMEOUT` e `SQS_RETRY_MAX` acima de 12 h (limite do SQS), `*_RETRY_BASE > *_RETRY_MAX`, `PENDING_BASE_DELAY` fora de `(0, PENDING_MAX_DELAY]`, `SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT >= SQS_VISIBILITY_TIMEOUT`, `OUTBOX_PUBLISH_TIMEOUT >= OUTBOX_LEASE` e `SHUTDOWN_TIMEOUT` menor ou igual a `SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT` ou a `OUTBOX_PUBLISH_TIMEOUT`. O start também falha se PostgreSQL, SQS ou as filas estiverem indisponíveis.
+Configuration is validated at startup: invalid values, an unknown `LOG_LEVEL`, non-positive intervals and timeouts, `SQS_MAX_MESSAGES` outside 1–10, `SQS_WAIT_TIME` above 20s, `SQS_VISIBILITY_TIMEOUT` or `SQS_RETRY_MAX` above the SQS 12h limit, `*_RETRY_BASE > *_RETRY_MAX`, `PENDING_BASE_DELAY` outside `(0, PENDING_MAX_DELAY]`, `SQS_VISIBILITY_TIMEOUT <= SQS_MAX_MESSAGES * (SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT)`, `OUTBOX_PUBLISH_TIMEOUT >= OUTBOX_LEASE`, and a `SHUTDOWN_TIMEOUT` no greater than either `SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT` or `OUTBOX_PUBLISH_TIMEOUT`. The batch calculation rejects overflow. Startup also fails when PostgreSQL, SQS, or the queues are unavailable.
 
 ## Autenticação
 

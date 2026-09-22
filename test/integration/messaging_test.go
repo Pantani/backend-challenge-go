@@ -237,6 +237,108 @@ func consumerFor(api sqsadapter.API, q sqsadapter.Queues, svc sqsadapter.Process
 	}, svc, observability.NewLogger(io.Discard, "error", "c"), testutil.NewMetrics())
 }
 
+type slowBatchProcessor struct {
+	headStarted chan struct{}
+	tailStarted chan struct{}
+	headDelay   time.Duration
+	calls       int
+}
+
+func (p *slowBatchProcessor) ConsumeMessage(ctx context.Context, _ app.InboundMessage) (app.ConsumeResult, error) {
+	p.calls++
+	if p.calls == 1 {
+		close(p.headStarted)
+		if err := sleepContext(ctx, p.headDelay); err != nil {
+			return app.ConsumeResult{}, err
+		}
+	} else {
+		close(p.tailStarted)
+	}
+	return app.ConsumeResult{Duplicate: true}, nil
+}
+
+func sleepContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+type concurrentDeliveryProbe struct {
+	called chan struct{}
+	once   sync.Once
+}
+
+func (p *concurrentDeliveryProbe) ConsumeMessage(context.Context, app.InboundMessage) (app.ConsumeResult, error) {
+	p.once.Do(func() { close(p.called) })
+	return app.ConsumeResult{Duplicate: true}, nil
+}
+
+func waitClosed(t *testing.T, ch <-chan struct{}, timeout time.Duration, message string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(timeout):
+		t.Fatal(message)
+	}
+}
+
+func TestVisibilityProtectsSlowBatchFromSecondConsumer(t *testing.T) {
+	t.Parallel()
+	s := newServices(t, defaultPolicy)
+	api, q, _ := provisionQueues(t, 5)
+	_, err := api.SetQueueAttributes(context.Background(), &awssqs.SetQueueAttributesInput{
+		QueueUrl: aws.String(q.Input), Attributes: map[string]string{string(types.QueueAttributeNameVisibilityTimeout): "3"},
+	})
+	require.NoError(t, err)
+	w := s.openWallet(t, "100.00")
+	for i := range 2 {
+		messageID := fmt.Sprintf("%sslow-batch-%d", s.prefix, i)
+		sendMessage(t, api, q, messageID, s.input(w, "provider-a", fmt.Sprintf("slow-batch-%d", i), "BET", "1.00", ""))
+	}
+
+	first := &slowBatchProcessor{
+		headStarted: make(chan struct{}), tailStarted: make(chan struct{}), headDelay: 750 * time.Millisecond,
+	}
+	consumerConfig := sqsadapter.ConsumerConfig{
+		Name: "slow-batch", QueueURL: q.Input, DLQURL: q.DLQ, MaxMessages: 2, WaitTime: time.Second,
+		VisibilityTimeout: 3 * time.Second, ProcessTimeout: time.Second, AckTimeout: 100 * time.Millisecond,
+		RetryBase: time.Second, RetryMax: time.Second, Senders: localSenders,
+	}
+	logger := observability.NewLogger(io.Discard, "error", "slow-batch")
+	consumerA := sqsadapter.NewConsumer(api, consumerConfig, first, logger, testutil.NewMetrics())
+	firstDone := make(chan struct{})
+	go func() {
+		consumerA.PollOnce(context.Background())
+		close(firstDone)
+	}()
+
+	waitClosed(t, first.headStarted, 3*time.Second, "first consumer did not start the batch head")
+
+	probe := &concurrentDeliveryProbe{called: make(chan struct{})}
+	consumerB := sqsadapter.NewConsumer(api, consumerConfig, probe, logger, testutil.NewMetrics())
+	secondDone := make(chan struct{})
+	go func() {
+		consumerB.PollOnce(context.Background())
+		close(secondDone)
+	}()
+
+	select {
+	case <-probe.called:
+		t.Fatal("second consumer received the batch tail before the first consumer reached it")
+	case <-first.tailStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("first consumer did not receive both messages in one batch")
+	}
+	waitClosed(t, firstDone, 3*time.Second, "first consumer did not finish the batch")
+	waitClosed(t, secondDone, 3*time.Second, "second consumer did not finish polling")
+	assert.Equal(t, 2, first.calls)
+}
+
 func sendMessage(t *testing.T, api sqsadapter.API, q sqsadapter.Queues, messageID string, in app.SubmitInput) {
 	t.Helper()
 	require.NoError(t, testenv.SendMessage(context.Background(), api, q.Input, testenv.Envelope(messageID, in)))
