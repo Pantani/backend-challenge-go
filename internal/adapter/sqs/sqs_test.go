@@ -13,15 +13,19 @@ import (
 	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"github.com/google/uuid"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/goleak"
 
 	sqsadapter "github.com/Pantani/backend-challenge-go/internal/adapter/sqs"
 	"github.com/Pantani/backend-challenge-go/internal/app"
+	"github.com/Pantani/backend-challenge-go/internal/contract"
 	"github.com/Pantani/backend-challenge-go/internal/domain/wager"
 	"github.com/Pantani/backend-challenge-go/internal/observability"
+	"github.com/Pantani/backend-challenge-go/internal/testutil"
 )
+
+func TestMain(m *testing.M) { goleak.VerifyTestMain(m) }
 
 var errBoom = errors.New("boom")
 
@@ -56,6 +60,48 @@ func TestDecodeMessage(t *testing.T) {
 	assert.Equal(t, httpEquivalent.PayloadHash, msg.Command.PayloadHash, "HTTP and SQS share the payload hash")
 }
 
+func TestEncodeMessageRoundTrip(t *testing.T) {
+	t.Parallel()
+	env := sqsadapter.Envelope{
+		MessageID: "msg-rt", Type: sqsadapter.MessageType, OccurredAt: "2026-09-08T12:00:00Z",
+		Data: sqsadapter.MessageData{IdempotencyKey: "provider-a:t-1", Operation: contract.Operation{
+			ProviderID: "provider-a", ExternalTransactionID: "t-1", PlayerID: "0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1",
+			WalletID: "0192f291-27dd-7d3f-8071-5f8685deef37", RoundID: "round-987", GameID: "fortune-chimp", Kind: "REFUND",
+			Money: contract.Money{Amount: "25.00", Currency: "BRL"}, ReferenceExternalTransactionID: "bet-1",
+		}},
+	}
+	encoded, err := sqsadapter.EncodeMessage(env)
+	require.NoError(t, err)
+	msg, err := sqsadapter.DecodeMessage("consumer", encoded)
+	require.NoError(t, err)
+	assert.Equal(t, "msg-rt", msg.MessageID)
+	assert.Equal(t, "provider-a:t-1", msg.Command.IdempotencyKey)
+	assert.Equal(t, wager.KindRefund, msg.Command.Kind)
+	assert.Equal(t, "bet-1", msg.Command.ReferenceExternalID)
+	assert.Equal(t, "25.00 BRL", msg.Command.Amount.String())
+
+	fromLiteral, err := sqsadapter.DecodeMessage("consumer", body("msg-rt", "25.00"))
+	require.NoError(t, err)
+	assert.NotEqual(t, fromLiteral.Hash, msg.Hash, "a different operation hashes differently")
+	assert.Equal(t, "msg-rt", fromLiteral.MessageID)
+}
+
+func TestConsumerAckTimeoutBoundsTheDelete(t *testing.T) {
+	t.Parallel()
+	cfg := consumerConfig()
+	cfg.AckTimeout = 250 * time.Millisecond
+	f := newConsumerWith(t, cfg, &fakeProcessor{results: []error{nil}}, message("a", body("m-a", "1.00"), "1"))
+	f.c.PollOnce(context.Background())
+	require.Equal(t, []string{"rh-a"}, f.api.deleted)
+	assert.Greater(t, f.api.budgets["rh-a"], time.Duration(0))
+	assert.LessOrEqual(t, f.api.budgets["rh-a"], cfg.AckTimeout, "the configured budget replaces DefaultAckTimeout")
+
+	d := newConsumer(t, &fakeProcessor{results: []error{nil}}, message("b", body("m-b", "1.00"), "1"))
+	d.c.PollOnce(context.Background())
+	assert.Greater(t, d.api.budgets["rh-b"], cfg.AckTimeout, "the default budget is used when none is configured")
+	assert.LessOrEqual(t, d.api.budgets["rh-b"], sqsadapter.DefaultAckTimeout)
+}
+
 func TestDecodeMessageInvalid(t *testing.T) {
 	t.Parallel()
 	cases := []string{
@@ -74,16 +120,26 @@ func TestDecodeMessageInvalid(t *testing.T) {
 	}
 }
 
+// fakeProcessor returns its results in order (nil once they run out). hook,
+// when set, runs before each call with the processing context and may
+// override the result.
 type fakeProcessor struct {
 	results []error
 	dup     bool
 	calls   int
+	hook    func(ctx context.Context) error
 }
 
-func (p *fakeProcessor) ConsumeMessage(context.Context, app.InboundMessage) (app.ConsumeResult, error) {
+func (p *fakeProcessor) ConsumeMessage(ctx context.Context, _ app.InboundMessage) (app.ConsumeResult, error) {
 	p.calls++
-	err := p.results[0]
-	p.results = p.results[1:]
+	var err error
+	if len(p.results) > 0 {
+		err = p.results[0]
+		p.results = p.results[1:]
+	}
+	if p.hook != nil {
+		err = p.hook(ctx)
+	}
 	res := app.ConsumeResult{Duplicate: p.dup}
 	if !p.dup {
 		res.Result.Transaction = sampleTx()
@@ -123,17 +179,27 @@ type consumerFixture struct {
 	c    *sqsadapter.Consumer
 }
 
-func newConsumer(t *testing.T, proc *fakeProcessor, msgs ...types.Message) *consumerFixture {
-	t.Helper()
-	f := &consumerFixture{api: newFakeAPI(), proc: proc, logs: &bytes.Buffer{}}
-	f.api.receive = func(context.Context) (*awssqs.ReceiveMessageOutput, error) {
-		return &awssqs.ReceiveMessageOutput{Messages: msgs}, nil
-	}
-	f.c = sqsadapter.NewConsumer(f.api, sqsadapter.ConsumerConfig{
+// consumerConfig is the standard test configuration.
+func consumerConfig() sqsadapter.ConsumerConfig {
+	return sqsadapter.ConsumerConfig{
 		Name: "consumer", QueueURL: "http://sqs/in", DLQURL: "http://sqs/dlq", MaxMessages: 10, WaitTime: time.Second,
 		VisibilityTimeout: 30 * time.Second, ProcessTimeout: time.Second, RetryBase: 2 * time.Second, RetryMax: 10 * time.Second,
 		Senders: sqsadapter.SenderPolicy{"AIDA-PROVIDER-A": {"provider-a"}},
-	}, proc, observability.NewLogger(f.logs, "debug", "t"), observability.NewMetrics(prometheus.NewRegistry()))
+	}
+}
+
+func newConsumer(t *testing.T, proc *fakeProcessor, msgs ...types.Message) *consumerFixture {
+	t.Helper()
+	return newConsumerWith(t, consumerConfig(), proc, msgs...)
+}
+
+func newConsumerWith(t *testing.T, cfg sqsadapter.ConsumerConfig, proc *fakeProcessor, msgs ...types.Message) *consumerFixture {
+	t.Helper()
+	f := &consumerFixture{api: newFakeAPI(), proc: proc, logs: &bytes.Buffer{}}
+	f.api.setReceive(func(context.Context) (*awssqs.ReceiveMessageOutput, error) {
+		return &awssqs.ReceiveMessageOutput{Messages: msgs}, nil
+	})
+	f.c = sqsadapter.NewConsumer(f.api, cfg, proc, observability.NewLogger(f.logs, "debug", "t"), testutil.NewMetrics())
 	return f
 }
 
@@ -195,10 +261,10 @@ func TestConsumerReleasesUnstartedMessagesOnShutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	proc := &fakeProcessor{results: []error{nil}}
 	f := newConsumer(t, proc, message("a", body("m-a", "1.00"), "1"), message("b", body("m-b", "1.00"), "1"))
-	f.api.receive = func(context.Context) (*awssqs.ReceiveMessageOutput, error) {
+	f.api.setReceive(func(context.Context) (*awssqs.ReceiveMessageOutput, error) {
 		cancel() // SIGTERM arrives while the batch is being handled
 		return &awssqs.ReceiveMessageOutput{Messages: []types.Message{message("a", body("m-a", "1.00"), "1")}}, nil
-	}
+	})
 	f.c.Run(ctx)
 	assert.Zero(t, proc.calls)
 	assert.Equal(t, map[string]int32{"rh-a": 0}, f.api.visibility)
@@ -209,13 +275,13 @@ func TestConsumerReceiveFailures(t *testing.T) {
 	f := newConsumer(t, &fakeProcessor{})
 	ctx, cancel := context.WithCancel(context.Background())
 	calls := 0
-	f.api.receive = func(context.Context) (*awssqs.ReceiveMessageOutput, error) {
+	f.api.setReceive(func(context.Context) (*awssqs.ReceiveMessageOutput, error) {
 		calls++
 		if calls == 2 {
 			cancel()
 		}
 		return nil, errBoom
-	}
+	})
 	f.c.Run(ctx)
 	assert.Equal(t, 2, calls)
 	assert.Contains(t, f.logs.String(), "sqs receive failed")
@@ -223,13 +289,26 @@ func TestConsumerReceiveFailures(t *testing.T) {
 
 func TestConsumerSleepCompletes(t *testing.T) {
 	t.Parallel()
-	f := newConsumer(t, &fakeProcessor{})
-	f.api.receive = func(context.Context) (*awssqs.ReceiveMessageOutput, error) { return nil, errBoom }
-	c := sqsadapter.NewConsumer(f.api, sqsadapter.ConsumerConfig{RetryBase: time.Millisecond}, f.proc,
-		observability.NewLogger(f.logs, "info", "t"), observability.NewMetrics(prometheus.NewRegistry()))
+	f := newConsumerWith(t, sqsadapter.ConsumerConfig{RetryBase: time.Millisecond}, &fakeProcessor{})
+	f.api.setReceive(func(context.Context) (*awssqs.ReceiveMessageOutput, error) { return nil, errBoom })
 	start := time.Now()
-	c.PollOnce(context.Background())
+	f.c.PollOnce(context.Background())
 	assert.GreaterOrEqual(t, time.Since(start), time.Millisecond)
+}
+
+func TestConsumerPausesOnEmptyReceiveWithoutLongPolling(t *testing.T) {
+	t.Parallel()
+	cfg := consumerConfig()
+	cfg.WaitTime, cfg.RetryBase = 0, 20*time.Millisecond
+	f := newConsumerWith(t, cfg, &fakeProcessor{})
+	start := time.Now()
+	f.c.PollOnce(context.Background())
+	assert.GreaterOrEqual(t, time.Since(start), 20*time.Millisecond, "an idle consumer does not spin")
+
+	polling := newConsumer(t, &fakeProcessor{})
+	start = time.Now()
+	polling.c.PollOnce(context.Background())
+	assert.Less(t, time.Since(start), 20*time.Millisecond, "long polling already paces the loop")
 }
 
 func TestLongFailureReasonIsTruncated(t *testing.T) {
@@ -238,6 +317,75 @@ func TestLongFailureReasonIsTruncated(t *testing.T) {
 	f.c.PollOnce(context.Background())
 	require.Len(t, f.api.sent, 1)
 	assert.Len(t, aws.ToString(f.api.sent[0].MessageAttributes["failureReason"].StringValue), 256)
+
+	// A multi-byte rune straddling the limit is dropped whole.
+	reason := strings.Repeat("x", 255) + "é" + strings.Repeat("y", 300)
+	u := newConsumer(t, &fakeProcessor{results: []error{errors.New(reason)}}, message("a", body("m", "1.00"), "1"))
+	u.c.PollOnce(context.Background())
+	require.Len(t, u.api.sent, 1, "the DLQ copy is valid UTF-8")
+	assert.Equal(t, strings.Repeat("x", 255), aws.ToString(u.api.sent[0].MessageAttributes["failureReason"].StringValue))
+}
+
+func TestConsumerAppliesBackoffAfterProcessTimeout(t *testing.T) {
+	t.Parallel()
+	cfg := consumerConfig()
+	cfg.ProcessTimeout = 10 * time.Millisecond
+	proc := &fakeProcessor{hook: func(ctx context.Context) error {
+		<-ctx.Done() // the use case blocks until its budget expires
+		return fmt.Errorf("%w: %w", app.ErrUnavailable, ctx.Err())
+	}}
+	f := newConsumerWith(t, cfg, proc, message("a", body("m-a", "1.00"), "3"))
+	f.c.PollOnce(context.Background())
+	assert.Equal(t, map[string]int32{"rh-a": 8}, f.api.visibility, "the retry has its own budget")
+	assert.Empty(t, f.api.deleted)
+}
+
+func TestConsumerAckBudgetSurvivesShutdown(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	proc := &fakeProcessor{hook: func(procCtx context.Context) error {
+		cancel() // SIGTERM while message a is in flight
+		assert.NoError(t, procCtx.Err(), "the processing context is detached from the shutdown signal")
+		return nil
+	}}
+	f := newConsumer(t, proc, message("a", body("m-a", "1.00"), "1"), message("b", body("m-b", "1.00"), "1"))
+	f.c.PollOnce(ctx)
+	assert.Equal(t, 1, proc.calls, "the in-flight message completes, the next one is not started")
+	assert.Equal(t, []string{"rh-a"}, f.api.deleted)
+	assert.Equal(t, map[string]int32{"rh-b": 0}, f.api.visibility)
+}
+
+func TestConsumerBackoffCapAndReceiveCountParsing(t *testing.T) {
+	t.Parallel()
+	cfg := consumerConfig()
+	cfg.RetryMax = 24 * time.Hour
+	f := newConsumerWith(t, cfg, &fakeProcessor{results: []error{app.ErrUnavailable, app.ErrUnavailable, app.ErrUnavailable}},
+		message("a", body("m-a", "1.00"), "40"), message("b", body("m-b", "1.00"), "garbage"), message("c", body("m-c", "1.00"), ""))
+	f.c.PollOnce(context.Background())
+	assert.Equal(t, map[string]int32{"rh-a": 24 * 3600, "rh-b": 2, "rh-c": 2}, f.api.visibility,
+		"the shift is capped and an unreadable count is the first receive")
+}
+
+func TestConsumerReleasesGroupTailWhenDLQSendFails(t *testing.T) {
+	t.Parallel()
+	proc := &fakeProcessor{results: []error{app.ErrIdempotencyConflict, nil}}
+	f := newConsumer(t, proc,
+		groupMessage("a1", body("m-a1", "1.00"), "1", "wallet-a"), groupMessage("a2", body("m-a2", "1.00"), "1", "wallet-a"))
+	f.api.errs["send"] = errBoom
+	f.c.PollOnce(context.Background())
+	assert.Equal(t, 1, proc.calls, "a2 waits for a1 to leave the queue")
+	assert.Empty(t, f.api.deleted)
+	assert.Equal(t, map[string]int32{"rh-a2": 0}, f.api.visibility)
+}
+
+func TestDeadLetterKeepsMessageGroup(t *testing.T) {
+	t.Parallel()
+	f := newConsumer(t, &fakeProcessor{}, groupMessage("a", "garbage", "1", "wallet-a"), groupMessage("b", "garbage", "1", ""))
+	f.c.PollOnce(context.Background())
+	require.Len(t, f.api.sent, 2)
+	assert.Equal(t, "wallet-a", aws.ToString(f.api.sent[0].MessageGroupId))
+	assert.Equal(t, "dead-letters", aws.ToString(f.api.sent[1].MessageGroupId))
 }
 
 func TestPublisher(t *testing.T) {
@@ -312,11 +460,9 @@ func TestNewClientConfigError(t *testing.T) {
 func TestConsumerRejectsSendersActingForOtherProviders(t *testing.T) {
 	t.Parallel()
 	proc := &fakeProcessor{}
-	f := newConsumer(t, proc, message("a", body("m-a", "1.00"), "1"))
-	f.c = sqsadapter.NewConsumer(f.api, sqsadapter.ConsumerConfig{
-		Name: "consumer", QueueURL: "http://sqs/in", DLQURL: "http://sqs/dlq", ProcessTimeout: time.Second,
-		Senders: sqsadapter.SenderPolicy{"AIDA-PROVIDER-A": {"provider-b"}},
-	}, proc, observability.NewLogger(f.logs, "debug", "t"), observability.NewMetrics(prometheus.NewRegistry()))
+	cfg := consumerConfig()
+	cfg.Senders = sqsadapter.SenderPolicy{"AIDA-PROVIDER-A": {"provider-b"}}
+	f := newConsumerWith(t, cfg, proc, message("a", body("m-a", "1.00"), "1"))
 	f.c.PollOnce(context.Background())
 	assert.Zero(t, proc.calls, "the operation never reaches the use case")
 	require.Len(t, f.api.sent, 1)
@@ -336,6 +482,12 @@ func TestSenderPolicy(t *testing.T) {
 		_, err := sqsadapter.ParseSenderPolicy(bad)
 		assert.ErrorIs(t, err, sqsadapter.ErrInvalidSenderPolicy, bad)
 	}
+
+	merged, err := sqsadapter.ParseSenderPolicy("AIDA1=provider-a;AIDA1=provider-b;ROLE2=*|provider-c")
+	require.NoError(t, err)
+	require.NoError(t, merged.Authorize("AIDA1", "provider-a"), "a repeated sender merges its providers")
+	require.NoError(t, merged.Authorize("AIDA1", "provider-b"))
+	require.NoError(t, merged.Authorize("ROLE2", "provider-z"), "* alongside an explicit list still allows everything")
 }
 
 func TestConsumerKeepsGroupOrderAfterARetry(t *testing.T) {

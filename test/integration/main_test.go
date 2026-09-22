@@ -5,27 +5,24 @@
 package integration_test
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"os"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 
 	"github.com/Pantani/backend-challenge-go/internal/adapter/postgres"
 	sqsadapter "github.com/Pantani/backend-challenge-go/internal/adapter/sqs"
 	"github.com/Pantani/backend-challenge-go/internal/app"
-	"github.com/Pantani/backend-challenge-go/internal/domain/money"
 	"github.com/Pantani/backend-challenge-go/internal/domain/wallet"
 	"github.com/Pantani/backend-challenge-go/internal/observability"
+	"github.com/Pantani/backend-challenge-go/internal/testutil"
 	"github.com/Pantani/backend-challenge-go/test/testenv"
 )
 
@@ -63,63 +60,43 @@ func runWithDatabase(ctx context.Context, m *testing.M) int {
 	return m.Run()
 }
 
-// syncBuffer is a log sink safe for concurrent writers.
-type syncBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (s *syncBuffer) Write(p []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.buf.Write(p)
-}
-
-func (s *syncBuffer) String() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.buf.String()
-}
-
 // services wires the use cases on the real database.
 type services struct {
 	wagers  *app.WagerService
 	wallets *app.WalletService
 	metrics *observability.Metrics
-	logs    *syncBuffer
+	logs    *testutil.SyncBuffer
 	// prefix keeps external ids unique across tests sharing the database.
 	prefix string
 }
 
 func newServices(t *testing.T, policy app.PendingPolicy) services {
 	t.Helper()
-	logs := &syncBuffer{}
+	logs := &testutil.SyncBuffer{}
 	logger := observability.NewLogger(logs, "debug", "it")
-	metrics := observability.NewMetrics(prometheus.NewRegistry())
+	metrics := testutil.NewMetrics()
 	uow, queries := postgres.NewUnitOfWork(pool), postgres.NewQueries(pool)
 	return services{
-		wagers: app.NewWagerService(app.WagerDeps{UoW: uow, Queries: queries, Clock: app.SystemClock{}, IDs: app.UUIDv7{},
-			Metrics: metrics, Logger: logger, Policy: policy, ConflictRetries: 10}),
-		wallets: app.NewWalletService(app.WalletDeps{UoW: uow, Queries: queries, Clock: app.SystemClock{}, IDs: app.UUIDv7{},
-			Metrics: metrics, Logger: logger}),
+		wagers: app.NewWagerService(app.WagerDeps{Deps: app.Deps{UoW: uow, Queries: queries, Clock: app.SystemClock{}, IDs: app.UUIDv7{},
+			Metrics: metrics, Logger: logger}, Policy: policy, ConflictRetries: 10}),
+		wallets: app.NewWalletService(app.WalletDeps{Deps: app.Deps{UoW: uow, Queries: queries, Clock: app.SystemClock{}, IDs: app.UUIDv7{},
+			Metrics: metrics, Logger: logger}}),
 		metrics: metrics, logs: logs, prefix: uuid.NewString()[:8] + "-",
 	}
 }
 
 var defaultPolicy = app.PendingPolicy{BaseDelay: 100 * time.Millisecond, MaxDelay: time.Second, MaxAttempts: 5, BatchSize: 50}
 
-func brl(t *testing.T, amount string) money.Money {
-	t.Helper()
-	m, err := money.Parse(amount, "BRL")
-	require.NoError(t, err)
-	return m
-}
-
 func (s services) openWallet(t *testing.T, amount string) *wallet.Wallet {
 	t.Helper()
-	w, err := s.wallets.Open(context.Background(), app.OpenWalletCommand{PlayerID: uuid.New(), InitialBalance: brl(t, amount)})
+	w, err := s.wallets.Open(context.Background(), app.OpenWalletCommand{PlayerID: uuid.New(), InitialBalance: testutil.BRL(t, amount)})
 	require.NoError(t, err)
 	return w
+}
+
+// ids is the API identity of a domain wallet.
+func ids(w *wallet.Wallet) testenv.Wallet {
+	return testenv.Wallet{ID: w.ID().String(), PlayerID: w.PlayerID().String()}
 }
 
 // input prefixes the external ids so tests never collide.
@@ -127,15 +104,7 @@ func (s services) input(w *wallet.Wallet, provider, ext, kind, amount, ref strin
 	if ref != "" {
 		ref = s.prefix + ref
 	}
-	return submitInput(w, provider, s.prefix+ext, kind, amount, ref)
-}
-
-func submitInput(w *wallet.Wallet, provider, ext, kind, amount, ref string) app.SubmitInput {
-	return app.SubmitInput{
-		ProviderID: provider, ExternalTransactionID: ext, IdempotencyKey: provider + ":" + ext,
-		PlayerID: w.PlayerID().String(), WalletID: w.ID().String(), RoundID: "round-1", GameID: "game-1",
-		Kind: kind, Amount: amount, Currency: "BRL", ReferenceExternalTransactionID: ref,
-	}
+	return testenv.SubmitInput(ids(w), provider, s.prefix+ext, kind, amount, ref)
 }
 
 func (s services) submit(t *testing.T, w *wallet.Wallet, ext, kind, amount, ref string) app.SubmitResult {
@@ -165,9 +134,8 @@ func (s services) requireConsistent(t *testing.T, w *wallet.Wallet) app.Reconcil
 
 func (s services) debits(t *testing.T, w *wallet.Wallet) int {
 	t.Helper()
-	var n int
-	require.NoError(t, pool.QueryRow(context.Background(),
-		`SELECT count(*) FROM ledger_entries WHERE wallet_id = $1 AND direction = 'DEBIT'`, w.ID()).Scan(&n))
+	n, err := testenv.CountDebits(context.Background(), pool, w.ID().String())
+	require.NoError(t, err)
 	return n
 }
 

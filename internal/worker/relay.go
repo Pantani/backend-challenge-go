@@ -10,27 +10,41 @@ import (
 
 // Publisher delivers one outbox record to the broker.
 type Publisher interface {
+	// Publish sends m. It must be idempotent per EventID: a record whose
+	// confirmation was lost is published again with the same EventID, and
+	// the broker (or the downstream consumer) deduplicates it.
 	Publish(ctx context.Context, m app.OutboxMessage) error
 }
 
 // RelayMetrics records relay activity.
 type RelayMetrics interface {
+	// OutboxPublished counts a record confirmed as published.
 	OutboxPublished()
+	// OutboxFailure counts a failed publication attempt.
 	OutboxFailure()
+	// OutboxDeadLettered counts a record abandoned after MaxAttempts.
 	OutboxDeadLettered()
+	// OutboxLag reports the age of the oldest pending record (0 when none).
 	OutboxLag(d time.Duration)
 }
 
 // RelayConfig configures the relay.
 type RelayConfig struct {
 	// Owner identifies this instance in leases.
-	Owner     string
+	Owner string
+	// BatchSize bounds how many records one claim round takes.
 	BatchSize int
 	// Lease is how long a claim is exclusive; a crashed publisher's records
 	// become claimable again after it expires.
-	Lease       time.Duration
-	RetryBase   time.Duration
-	RetryMax    time.Duration
+	Lease time.Duration
+	// RetryBase is the delay after the first failed publication; it doubles
+	// on every failure (app.Backoff) up to RetryMax.
+	RetryBase time.Duration
+	// RetryMax caps the retry delay.
+	RetryMax time.Duration
+	// PublishTime bounds one publication, including the store confirmation.
+	// It applies through Detach, so an in-flight publication completes even
+	// after the relay was told to stop.
 	PublishTime time.Duration
 	// MaxAttempts dead-letters a record after that many failed publications.
 	MaxAttempts int
@@ -68,6 +82,8 @@ func (r *Relay) Tick(ctx context.Context) {
 }
 
 // round claims and publishes one batch, returning how many were claimed.
+// It stops between publications once ctx is done: the publication in flight
+// completes, the remaining claims simply expire with their lease.
 func (r *Relay) round(ctx context.Context) int {
 	msgs, err := r.store.Claim(ctx, r.cfg.Owner, r.clock.Now(), r.cfg.Lease, r.cfg.BatchSize)
 	if err != nil {
@@ -75,13 +91,16 @@ func (r *Relay) round(ctx context.Context) int {
 		return 0
 	}
 	for _, m := range msgs {
+		if ctx.Err() != nil {
+			break
+		}
 		r.publish(ctx, m)
 	}
 	return len(msgs)
 }
 
 func (r *Relay) publish(parent context.Context, m app.OutboxMessage) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), r.cfg.PublishTime)
+	ctx, cancel := Detach(parent, r.cfg.PublishTime)
 	defer cancel()
 	log := r.logger.With("eventId", m.EventID, "eventType", m.EventType, "aggregateId", m.AggregateID)
 	if err := r.publisher.Publish(ctx, m); err != nil {
@@ -120,9 +139,9 @@ func (r *Relay) confirm(ctx context.Context, log *slog.Logger, m app.OutboxMessa
 	r.metrics.OutboxPublished()
 }
 
+// backoff is the delay before the next attempt after attempts failures.
 func (r *Relay) backoff(attempts int) time.Duration {
-	delay := r.cfg.RetryBase << min(max(attempts-1, 0), 16)
-	return min(delay, r.cfg.RetryMax)
+	return app.Backoff(r.cfg.RetryBase, r.cfg.RetryMax, attempts-1)
 }
 
 func (r *Relay) refreshLag(ctx context.Context) {
@@ -135,31 +154,4 @@ func (r *Relay) refreshLag(ctx context.Context) {
 		lag = r.clock.Now().Sub(oldest)
 	}
 	r.metrics.OutboxLag(lag)
-}
-
-// PendingService resolves due pending references.
-type PendingService interface {
-	ResolveDue(ctx context.Context) (int, error)
-}
-
-// PendingResolver periodically resolves PENDING_REFERENCE operations.
-type PendingResolver struct {
-	svc    PendingService
-	logger *slog.Logger
-}
-
-// NewPendingResolver builds the resolver.
-func NewPendingResolver(svc PendingService, logger *slog.Logger) *PendingResolver {
-	return &PendingResolver{svc: svc, logger: logger}
-}
-
-// Tick resolves one batch.
-func (p *PendingResolver) Tick(ctx context.Context) {
-	n, err := p.svc.ResolveDue(ctx)
-	if err != nil && ctx.Err() == nil {
-		p.logger.WarnContext(ctx, "pending reference batch failed", "error", err)
-	}
-	if n > 0 {
-		p.logger.InfoContext(ctx, "pending references resolved", "count", n)
-	}
 }

@@ -6,15 +6,19 @@ import (
 
 // InboundMessage is a decoded broker message carrying an operation.
 type InboundMessage struct {
-	Consumer  string
+	// Consumer names the inbox partition (one per queue consumer).
+	Consumer string
+	// MessageID is the broker message id, unique within Consumer.
 	MessageID string
 	// Hash fingerprints the message content to detect a reused message id.
-	Hash    string
+	Hash string
+	// Command is the validated operation carried by the message.
 	Command SubmitCommand
 }
 
 // ConsumeResult is the outcome of a consumed message.
 type ConsumeResult struct {
+	// Result is the submission outcome; it is empty for a Duplicate.
 	Result SubmitResult
 	// Duplicate reports a redelivery already handled by the inbox.
 	Duplicate bool
@@ -23,19 +27,15 @@ type ConsumeResult struct {
 // ConsumeMessage records the message in the inbox and processes its
 // operation in the same SQL transaction, so the inbox completion, the
 // operation state, the balance, the ledger and the outbox records commit (or
-// roll back) together. A redelivery of a committed message is a duplicate.
+// roll back) together. A redelivery of a committed message is a duplicate
+// and is not observed again.
 func (s *WagerService) ConsumeMessage(ctx context.Context, msg InboundMessage) (ConsumeResult, error) {
 	start := s.Clock.Now()
-	var out ConsumeResult
-	err := retryConflicts(s.ConflictRetries, s.onConflict("consume"), func() error {
-		return s.UoW.Do(ctx, func(ctx context.Context, r Repositories) error {
-			var err error
-			out, err = s.consumeInTx(ctx, r, msg)
-			return err
-		})
+	out, err := inTx(ctx, s, "consume", func(ctx context.Context, r Repositories) (ConsumeResult, error) {
+		return s.consumeInTx(ctx, r, msg)
 	})
 	if err == nil && !out.Duplicate {
-		s.Observe(SourceSQS, out.Result, start)
+		s.observe(SourceSQS, out.Result, start)
 	}
 	return out, err
 }
@@ -49,7 +49,7 @@ func (s *WagerService) consumeInTx(ctx context.Context, r Repositories, msg Inbo
 	if !created {
 		return duplicate(entry, msg)
 	}
-	res, err := s.SubmitInTx(ctx, r, msg.Command)
+	res, err := s.submitInTx(ctx, r, msg.Command, now)
 	if err != nil {
 		return ConsumeResult{}, err
 	}

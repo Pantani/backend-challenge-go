@@ -4,167 +4,166 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/Pantani/backend-challenge-go/internal/app"
-	"github.com/Pantani/backend-challenge-go/internal/domain/event"
+	"github.com/Pantani/backend-challenge-go/internal/contract"
 	"github.com/Pantani/backend-challenge-go/internal/domain/money"
 	"github.com/Pantani/backend-challenge-go/internal/domain/wager"
 	"github.com/Pantani/backend-challenge-go/internal/domain/wallet"
 )
 
-// moneyDTO is the external money contract: amount is always a JSON string,
-// so a JSON number (a float on most clients) is rejected by the decoder.
-type moneyDTO struct {
-	Amount   string `json:"amount"`
-	Currency string `json:"currency"`
-}
-
-func toMoneyDTO(m money.Money) *moneyDTO {
+// optionalMoney renders a domain amount, or nothing when it is unset.
+func optionalMoney(m money.Money) *contract.Money {
 	if m.Validate() != nil {
 		return nil
 	}
-	return &moneyDTO{Amount: m.Amount(), Currency: string(m.Currency())}
+	v := contract.NewMoney(m)
+	return &v
 }
 
+// openWalletRequest is the body of POST /wallets.
 type openWalletRequest struct {
-	PlayerID       string   `json:"playerId"`
-	InitialBalance moneyDTO `json:"initialBalance"`
+	PlayerID       string         `json:"playerId"`
+	InitialBalance contract.Money `json:"initialBalance"`
 }
 
+// walletResponse is the wallet resource.
 type walletResponse struct {
-	ID        string    `json:"id"`
-	PlayerID  string    `json:"playerId"`
-	Balance   *moneyDTO `json:"balance"`
-	Version   int64     `json:"version"`
-	CreatedAt string    `json:"createdAt"`
-	UpdatedAt string    `json:"updatedAt"`
+	ID        string          `json:"id"`
+	PlayerID  string          `json:"playerId"`
+	Balance   *contract.Money `json:"balance"`
+	Version   int64           `json:"version"`
+	CreatedAt string          `json:"createdAt"`
+	UpdatedAt string          `json:"updatedAt"`
 }
 
+// newWalletResponse renders a wallet.
 func newWalletResponse(w *wallet.Wallet) walletResponse {
 	return walletResponse{
-		ID: w.ID().String(), PlayerID: w.PlayerID().String(), Balance: toMoneyDTO(w.Balance()),
-		Version: w.Version(), CreatedAt: event.FormatTime(w.CreatedAt()), UpdatedAt: event.FormatTime(w.UpdatedAt()),
+		ID: w.ID().String(), PlayerID: w.PlayerID().String(), Balance: optionalMoney(w.Balance()),
+		Version: w.Version(), CreatedAt: contract.FormatTime(w.CreatedAt()), UpdatedAt: contract.FormatTime(w.UpdatedAt()),
 	}
 }
 
+// ledgerEntryResponse is one ledger line.
 type ledgerEntryResponse struct {
-	ID            string    `json:"id"`
-	TransactionID string    `json:"transactionId"`
-	Direction     string    `json:"direction"`
-	Money         *moneyDTO `json:"money"`
-	BalanceBefore *moneyDTO `json:"balanceBefore"`
-	BalanceAfter  *moneyDTO `json:"balanceAfter"`
-	CreatedAt     string    `json:"createdAt"`
+	ID            string          `json:"id"`
+	TransactionID string          `json:"transactionId"`
+	Direction     string          `json:"direction"`
+	Money         *contract.Money `json:"money"`
+	BalanceBefore *contract.Money `json:"balanceBefore"`
+	BalanceAfter  *contract.Money `json:"balanceAfter"`
+	CreatedAt     string          `json:"createdAt"`
 }
 
+// ledgerResponse is a page of the wallet ledger.
 type ledgerResponse struct {
 	WalletID   string                `json:"walletId"`
 	Items      []ledgerEntryResponse `json:"items"`
 	NextCursor string                `json:"nextCursor,omitempty"`
 }
 
+// newLedgerResponse renders a ledger page.
 func newLedgerResponse(walletID uuid.UUID, page app.LedgerPage) ledgerResponse {
 	items := make([]ledgerEntryResponse, 0, len(page.Entries))
 	for _, e := range page.Entries {
 		items = append(items, ledgerEntryResponse{
 			ID: e.ID().String(), TransactionID: e.TransactionID().String(), Direction: string(e.Direction()),
-			Money: toMoneyDTO(e.Amount()), BalanceBefore: toMoneyDTO(e.BalanceBefore()),
-			BalanceAfter: toMoneyDTO(e.BalanceAfter()), CreatedAt: event.FormatTime(e.CreatedAt()),
+			Money: optionalMoney(e.Amount()), BalanceBefore: optionalMoney(e.BalanceBefore()),
+			BalanceAfter: optionalMoney(e.BalanceAfter()), CreatedAt: contract.FormatTime(e.CreatedAt()),
 		})
 	}
 	return ledgerResponse{WalletID: walletID.String(), Items: items, NextCursor: page.NextCursor}
 }
 
+// reconciliationResponse compares the stored balance with the ledger.
 type reconciliationResponse struct {
-	WalletID          string    `json:"walletId"`
-	StoredBalance     *moneyDTO `json:"storedBalance"`
-	CalculatedBalance *moneyDTO `json:"calculatedBalance"`
-	Difference        *moneyDTO `json:"difference"`
-	Consistent        bool      `json:"consistent"`
-	CheckedEntries    int64     `json:"checkedEntries"`
+	WalletID          string          `json:"walletId"`
+	StoredBalance     *contract.Money `json:"storedBalance"`
+	CalculatedBalance *contract.Money `json:"calculatedBalance"`
+	Difference        *contract.Money `json:"difference"`
+	Consistent        bool            `json:"consistent"`
+	CheckedEntries    int64           `json:"checkedEntries"`
 }
 
+// newReconciliationResponse renders a reconciliation.
 func newReconciliationResponse(r app.Reconciliation) reconciliationResponse {
 	return reconciliationResponse{
-		WalletID: r.WalletID.String(), StoredBalance: toMoneyDTO(r.Stored), CalculatedBalance: toMoneyDTO(r.Calculated),
-		Difference: toMoneyDTO(r.Difference), Consistent: r.Consistent, CheckedEntries: r.CheckedEntries,
+		WalletID: r.WalletID.String(), StoredBalance: optionalMoney(r.Stored), CalculatedBalance: optionalMoney(r.Calculated),
+		Difference: optionalMoney(r.Difference), Consistent: r.Consistent, CheckedEntries: r.CheckedEntries,
 	}
 }
 
+// submitRequest is the body of POST /wagering/transactions: the shared
+// operation shape, with the idempotency key carried in the header.
 type submitRequest struct {
-	ProviderID                     string   `json:"providerId"`
-	ExternalTransactionID          string   `json:"externalTransactionId"`
-	PlayerID                       string   `json:"playerId"`
-	WalletID                       string   `json:"walletId"`
-	RoundID                        string   `json:"roundId"`
-	GameID                         string   `json:"gameId"`
-	Kind                           string   `json:"kind"`
-	Money                          moneyDTO `json:"money"`
-	ReferenceExternalTransactionID string   `json:"referenceExternalTransactionId"`
+	contract.Operation
 }
 
-func (r submitRequest) toInput(idempotencyKey, correlationID string) app.SubmitInput {
-	return app.SubmitInput{
-		ProviderID: r.ProviderID, ExternalTransactionID: r.ExternalTransactionID, IdempotencyKey: idempotencyKey,
-		PlayerID: r.PlayerID, WalletID: r.WalletID, RoundID: r.RoundID, GameID: r.GameID, Kind: r.Kind,
-		Amount: r.Money.Amount, Currency: r.Money.Currency,
-		ReferenceExternalTransactionID: r.ReferenceExternalTransactionID, CorrelationID: correlationID,
+// outcomeDTO is the processing result shared by submit and read responses.
+type outcomeDTO struct {
+	Status        string          `json:"status"`
+	FailureCode   string          `json:"failureCode,omitempty"`
+	Balance       *contract.Money `json:"balance,omitempty"`
+	NextAttemptAt string          `json:"nextAttemptAt,omitempty"`
+}
+
+// newOutcomeDTO renders the state of a transaction.
+func newOutcomeDTO(t *wager.Transaction) outcomeDTO {
+	return outcomeDTO{
+		Status: string(t.Status()), FailureCode: string(t.FailureCode()),
+		Balance: optionalMoney(t.ResultBalance()), NextAttemptAt: optionalTime(t),
 	}
 }
 
+// submitResponse is the body of POST /wagering/transactions.
 type submitResponse struct {
-	TransactionID    string    `json:"transactionId"`
-	Status           string    `json:"status"`
-	Balance          *moneyDTO `json:"balance,omitempty"`
-	FailureCode      string    `json:"failureCode,omitempty"`
-	NextAttemptAt    string    `json:"nextAttemptAt,omitempty"`
-	IdempotentReplay bool      `json:"idempotentReplay"`
+	TransactionID string `json:"transactionId"`
+	outcomeDTO
+	IdempotentReplay bool `json:"idempotentReplay"`
 }
 
+// newSubmitResponse renders a submit result.
 func newSubmitResponse(res app.SubmitResult) submitResponse {
 	t := res.Transaction
-	return submitResponse{
-		TransactionID: t.ID().String(), Status: string(t.Status()), Balance: toMoneyDTO(t.ResultBalance()),
-		FailureCode: string(t.FailureCode()), NextAttemptAt: optionalTime(t), IdempotentReplay: res.Replay,
-	}
+	return submitResponse{TransactionID: t.ID().String(), outcomeDTO: newOutcomeDTO(t), IdempotentReplay: res.Replay}
 }
 
+// optionalTime renders the next attempt of a pending operation.
 func optionalTime(t *wager.Transaction) string {
 	if t.Status() != wager.StatusPendingReference {
 		return ""
 	}
-	return event.FormatTime(t.NextAttemptAt())
+	return contract.FormatTime(t.NextAttemptAt())
 }
 
+// transactionResponse is the transaction resource.
 type transactionResponse struct {
-	TransactionID                  string    `json:"transactionId"`
-	Origin                         string    `json:"origin"`
-	Kind                           string    `json:"kind"`
-	Status                         string    `json:"status"`
-	WalletID                       string    `json:"walletId"`
-	PlayerID                       string    `json:"playerId"`
-	Money                          *moneyDTO `json:"money"`
-	ProviderID                     string    `json:"providerId,omitempty"`
-	ExternalTransactionID          string    `json:"externalTransactionId,omitempty"`
-	RoundID                        string    `json:"roundId,omitempty"`
-	GameID                         string    `json:"gameId,omitempty"`
-	ReferenceExternalTransactionID string    `json:"referenceExternalTransactionId,omitempty"`
-	ReferenceTransactionID         string    `json:"referenceTransactionId,omitempty"`
-	FailureCode                    string    `json:"failureCode,omitempty"`
-	Balance                        *moneyDTO `json:"balance,omitempty"`
-	Attempts                       int       `json:"attempts"`
-	NextAttemptAt                  string    `json:"nextAttemptAt,omitempty"`
-	CreatedAt                      string    `json:"createdAt"`
-	UpdatedAt                      string    `json:"updatedAt"`
+	TransactionID string `json:"transactionId"`
+	Origin        string `json:"origin"`
+	Kind          string `json:"kind"`
+	outcomeDTO
+	WalletID                       string          `json:"walletId"`
+	PlayerID                       string          `json:"playerId"`
+	Money                          *contract.Money `json:"money"`
+	ProviderID                     string          `json:"providerId,omitempty"`
+	ExternalTransactionID          string          `json:"externalTransactionId,omitempty"`
+	RoundID                        string          `json:"roundId,omitempty"`
+	GameID                         string          `json:"gameId,omitempty"`
+	ReferenceExternalTransactionID string          `json:"referenceExternalTransactionId,omitempty"`
+	ReferenceTransactionID         string          `json:"referenceTransactionId,omitempty"`
+	Attempts                       int             `json:"attempts"`
+	CreatedAt                      string          `json:"createdAt"`
+	UpdatedAt                      string          `json:"updatedAt"`
 }
 
+// newTransactionResponse renders a transaction.
 func newTransactionResponse(t *wager.Transaction) transactionResponse {
 	ext := t.External()
 	resp := transactionResponse{
-		TransactionID: t.ID().String(), Origin: string(t.Origin()), Kind: string(t.Kind()), Status: string(t.Status()),
-		WalletID: t.WalletID().String(), PlayerID: t.PlayerID().String(), Money: toMoneyDTO(t.Amount()),
+		TransactionID: t.ID().String(), Origin: string(t.Origin()), Kind: string(t.Kind()), outcomeDTO: newOutcomeDTO(t),
+		WalletID: t.WalletID().String(), PlayerID: t.PlayerID().String(), Money: optionalMoney(t.Amount()),
 		ProviderID: ext.ProviderID, ExternalTransactionID: ext.ExternalID, RoundID: ext.RoundID, GameID: ext.GameID,
-		ReferenceExternalTransactionID: ext.ReferenceExternalID, FailureCode: string(t.FailureCode()),
-		Balance: toMoneyDTO(t.ResultBalance()), Attempts: t.Attempts(), NextAttemptAt: optionalTime(t),
-		CreatedAt: event.FormatTime(t.CreatedAt()), UpdatedAt: event.FormatTime(t.UpdatedAt()),
+		ReferenceExternalTransactionID: ext.ReferenceExternalID, Attempts: t.Attempts(),
+		CreatedAt: contract.FormatTime(t.CreatedAt()), UpdatedAt: contract.FormatTime(t.UpdatedAt()),
 	}
 	if t.ReferenceTxID() != uuid.Nil {
 		resp.ReferenceTransactionID = t.ReferenceTxID().String()
@@ -172,6 +171,7 @@ func newTransactionResponse(t *wager.Transaction) transactionResponse {
 	return resp
 }
 
+// errorResponse is the body of every error.
 type errorResponse struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`

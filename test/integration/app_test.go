@@ -4,10 +4,11 @@ package integration_test
 
 import (
 	"context"
-	"encoding/json"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,15 +16,16 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/fx"
+	"go.uber.org/fx/fxevent"
 
 	sqsadapter "github.com/Pantani/backend-challenge-go/internal/adapter/sqs"
-	"github.com/Pantani/backend-challenge-go/internal/app"
 	"github.com/Pantani/backend-challenge-go/internal/bootstrap"
 	"github.com/Pantani/backend-challenge-go/internal/worker"
+	"github.com/Pantani/backend-challenge-go/test/testenv"
 )
 
 type runningApp struct {
-	base   string
+	http   testenv.Client
 	group  *worker.Group
 	app    *fx.App
 	api    sqsadapter.API
@@ -50,93 +52,66 @@ func startApp(t *testing.T) runningApp {
 	a, addr, group := newApp(t, queueVars(names))
 	require.NoError(t, a.Start(context.Background()))
 	t.Cleanup(func() { _ = a.Stop(context.Background()) })
-	return runningApp{base: "http://" + addr.String(), group: group, app: a, api: api, queues: q}
+	return runningApp{http: client("http://" + addr.String()), group: group, app: a, api: api, queues: q}
 }
 
-type response struct {
-	status int
-	body   map[string]any
-}
-
-func (r runningApp) call(t *testing.T, method, path, client, body string, headers map[string]string) response {
-	t.Helper()
-	req, err := http.NewRequestWithContext(context.Background(), method, r.base+path, strings.NewReader(body))
-	require.NoError(t, err)
-	if client != "" {
-		req.Header.Set("Authorization", "Bearer "+token(t, client))
-	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	require.NoError(t, err)
-	defer resp.Body.Close()
-	out := response{status: resp.StatusCode}
-	_ = json.NewDecoder(resp.Body).Decode(&out.body)
-	return out
-}
-
-func (r runningApp) openWallet(t *testing.T, amount string) string {
-	t.Helper()
-	res := r.call(t, http.MethodPost, "/wallets", "wallet-service",
-		`{"playerId":"`+uuid.NewString()+`","initialBalance":{"amount":"`+amount+`","currency":"BRL"}}`, nil)
-	require.Equal(t, http.StatusCreated, res.status, res.body)
-	return res.body["id"].(string)
+// client drives the API at base, authenticating with Keycloak tokens.
+func client(base string) testenv.Client {
+	return testenv.Client{Base: base, Token: func(c string) (string, error) { return env.Token(context.Background(), c) }}
 }
 
 func (r runningApp) wallet(t *testing.T, id string) map[string]any {
 	t.Helper()
-	res := r.call(t, http.MethodGet, "/wallets/"+id, "wallet-service", "", nil)
-	require.Equal(t, http.StatusOK, res.status)
-	return res.body
+	res := r.http.Call(t, http.MethodGet, "/wallets/"+id, "wallet-service", "", nil)
+	require.Equal(t, http.StatusOK, res.Status)
+	return res.Body
 }
 
-func betBody(provider, ext, walletID, playerID, amount string) string {
-	return `{"providerId":"` + provider + `","externalTransactionId":"` + ext + `","playerId":"` + playerID +
-		`","walletId":"` + walletID + `","roundId":"r-1","gameId":"g-1","kind":"BET","money":{"amount":"` + amount + `","currency":"BRL"}}`
+func betBody(w testenv.Wallet, provider, ext, amount string) string {
+	return testenv.OperationBody(w, provider, ext, "BET", amount, "")
 }
 
 func TestApplicationServesAuthenticatedFlows(t *testing.T) {
 	t.Parallel()
 	r := startApp(t)
-	assert.Equal(t, http.StatusOK, r.call(t, http.MethodGet, "/health/live", "", "", nil).status)
-	assert.Equal(t, http.StatusOK, r.call(t, http.MethodGet, "/health/ready", "", "", nil).status)
+	assert.Equal(t, http.StatusOK, r.http.Call(t, http.MethodGet, "/health/live", "", "", nil).Status)
+	assert.Equal(t, http.StatusOK, r.http.Call(t, http.MethodGet, "/health/ready", "", "", nil).Status)
 
-	walletID := r.openWallet(t, "1000.00")
-	player := r.wallet(t, walletID)["playerId"].(string)
+	w := r.http.OpenWallet(t, "1000.00")
+	walletID := w.ID
 	ext := uuid.NewString()
 	key := map[string]string{"Idempotency-Key": "provider-a:" + ext}
-	bet := r.call(t, http.MethodPost, "/wagering/transactions", "provider-a", betBody("provider-a", ext, walletID, player, "25.00"), key)
-	require.Equal(t, http.StatusCreated, bet.status, bet.body)
-	assert.Equal(t, map[string]any{"amount": "975.00", "currency": "BRL"}, bet.body["balance"])
+	bet := r.http.Call(t, http.MethodPost, "/wagering/transactions", "provider-a", betBody(w, "provider-a", ext, "25.00"), key)
+	require.Equal(t, http.StatusCreated, bet.Status, bet.Body)
+	assert.Equal(t, map[string]any{"amount": "975.00", "currency": "BRL"}, bet.Body["balance"])
 
-	replay := r.call(t, http.MethodPost, "/wagering/transactions", "provider-a", betBody("provider-a", ext, walletID, player, "25.00"), key)
-	assert.Equal(t, http.StatusOK, replay.status)
-	assert.Equal(t, true, replay.body["idempotentReplay"])
-	conflict := r.call(t, http.MethodPost, "/wagering/transactions", "provider-a", betBody("provider-a", ext, walletID, player, "26.00"), key)
-	assert.Equal(t, http.StatusConflict, conflict.status)
+	replay := r.http.Call(t, http.MethodPost, "/wagering/transactions", "provider-a", betBody(w, "provider-a", ext, "25.00"), key)
+	assert.Equal(t, http.StatusOK, replay.Status)
+	assert.Equal(t, true, replay.Body["idempotentReplay"])
+	conflict := r.http.Call(t, http.MethodPost, "/wagering/transactions", "provider-a", betBody(w, "provider-a", ext, "26.00"), key)
+	assert.Equal(t, http.StatusConflict, conflict.Status)
 
-	txID := bet.body["transactionId"].(string)
-	assert.Equal(t, http.StatusOK, r.call(t, http.MethodGet, "/wagering/transactions/"+txID, "provider-a", "", nil).status)
-	assert.Equal(t, http.StatusOK, r.call(t, http.MethodGet, "/providers/provider-a/wagering/transactions/"+ext, "provider-a", "", nil).status)
-	ledger := r.call(t, http.MethodGet, "/wallets/"+walletID+"/ledger?limit=1", "wallet-service", "", nil)
-	assert.Len(t, ledger.body["items"], 1)
-	assert.NotEmpty(t, ledger.body["nextCursor"])
-	rec := r.call(t, http.MethodPost, "/wallets/"+walletID+"/reconciliation", "wallet-service", "", nil)
-	assert.Equal(t, true, rec.body["consistent"])
-	assert.InDelta(t, 2, rec.body["checkedEntries"], 0)
+	txID := bet.Body["transactionId"].(string)
+	assert.Equal(t, http.StatusOK, r.http.Call(t, http.MethodGet, "/wagering/transactions/"+txID, "provider-a", "", nil).Status)
+	assert.Equal(t, http.StatusOK, r.http.Call(t, http.MethodGet, "/providers/provider-a/wagering/transactions/"+ext, "provider-a", "", nil).Status)
+	ledger := r.http.Call(t, http.MethodGet, "/wallets/"+walletID+"/ledger?limit=1", "wallet-service", "", nil)
+	assert.Len(t, ledger.Body["items"], 1)
+	assert.NotEmpty(t, ledger.Body["nextCursor"])
+	rec := r.http.Call(t, http.MethodPost, "/wallets/"+walletID+"/reconciliation", "wallet-service", "", nil)
+	assert.Equal(t, true, rec.Body["consistent"])
+	assert.InDelta(t, 2, rec.Body["checkedEntries"], 0)
 }
 
 func TestProviderIsolationAndNoEffectsWhenUnauthorized(t *testing.T) {
 	t.Parallel()
 	r := startApp(t)
-	walletID := r.openWallet(t, "100.00")
-	player := r.wallet(t, walletID)["playerId"].(string)
+	w := r.http.OpenWallet(t, "100.00")
+	walletID := w.ID
 	ext := uuid.NewString()
 	key := map[string]string{"Idempotency-Key": "provider-a:" + ext}
-	bet := r.call(t, http.MethodPost, "/wagering/transactions", "provider-a", betBody("provider-a", ext, walletID, player, "10.00"), key)
-	require.Equal(t, http.StatusCreated, bet.status)
-	txID := bet.body["transactionId"].(string)
+	bet := r.http.Call(t, http.MethodPost, "/wagering/transactions", "provider-a", betBody(w, "provider-a", ext, "10.00"), key)
+	require.Equal(t, http.StatusCreated, bet.Status)
+	txID := bet.Body["transactionId"].(string)
 
 	cases := []struct {
 		method, path, client, body string
@@ -144,11 +119,11 @@ func TestProviderIsolationAndNoEffectsWhenUnauthorized(t *testing.T) {
 	}{
 		{http.MethodGet, "/wagering/transactions/" + txID, "provider-b", "", http.StatusNotFound},
 		{http.MethodGet, "/providers/provider-a/wagering/transactions/" + ext, "provider-b", "", http.StatusForbidden},
-		{http.MethodPost, "/wagering/transactions", "provider-b", betBody("provider-a", ext, walletID, player, "10.00"), http.StatusForbidden},
-		{http.MethodPost, "/wagering/transactions", "provider-a", betBody("provider-a", uuid.NewString(), walletID, player, "50.00"), http.StatusBadRequest},
-		{http.MethodPost, "/wagering/transactions", "", betBody("provider-a", uuid.NewString(), walletID, player, "50.00"), http.StatusUnauthorized},
-		{http.MethodPost, "/wagering/transactions", "no-role-client", betBody("provider-a", uuid.NewString(), walletID, player, "50.00"), http.StatusForbidden},
-		{http.MethodPost, "/wagering/transactions", "wallet-service", betBody("provider-a", uuid.NewString(), walletID, player, "50.00"), http.StatusForbidden},
+		{http.MethodPost, "/wagering/transactions", "provider-b", betBody(w, "provider-a", ext, "10.00"), http.StatusForbidden},
+		{http.MethodPost, "/wagering/transactions", "provider-a", betBody(w, "provider-a", uuid.NewString(), "50.00"), http.StatusBadRequest},
+		{http.MethodPost, "/wagering/transactions", "", betBody(w, "provider-a", uuid.NewString(), "50.00"), http.StatusUnauthorized},
+		{http.MethodPost, "/wagering/transactions", "no-role-client", betBody(w, "provider-a", uuid.NewString(), "50.00"), http.StatusForbidden},
+		{http.MethodPost, "/wagering/transactions", "wallet-service", betBody(w, "provider-a", uuid.NewString(), "50.00"), http.StatusForbidden},
 		{http.MethodPost, "/wallets", "provider-a", `{"playerId":"` + uuid.NewString() + `","initialBalance":{"amount":"1.00","currency":"BRL"}}`, http.StatusForbidden},
 		{http.MethodPost, "/wallets/" + walletID + "/reconciliation", "provider-a", "", http.StatusForbidden},
 		{http.MethodGet, "/wallets/" + walletID + "/ledger", "provider-b", "", http.StatusForbidden},
@@ -158,11 +133,11 @@ func TestProviderIsolationAndNoEffectsWhenUnauthorized(t *testing.T) {
 		if c.want == http.StatusBadRequest {
 			headers = nil // missing Idempotency-Key
 		}
-		res := r.call(t, c.method, c.path, c.client, c.body, headers)
-		assert.Equal(t, c.want, res.status, "%s %s as %s", c.method, c.path, c.client)
-		assert.NotContains(t, res.body, "transactionId", "no data is exposed")
+		res := r.http.Call(t, c.method, c.path, c.client, c.body, headers)
+		assert.Equal(t, c.want, res.Status, "%s %s as %s", c.method, c.path, c.client)
+		assert.NotContains(t, res.Body, "transactionId", "no data is exposed")
 	}
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, r.base+"/wallets/"+walletID, nil)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, r.http.Base+"/wallets/"+walletID, nil)
 	require.NoError(t, err)
 	req.Header.Set("Authorization", "Bearer forged.token.value")
 	resp, err := http.DefaultClient.Do(req)
@@ -170,21 +145,18 @@ func TestProviderIsolationAndNoEffectsWhenUnauthorized(t *testing.T) {
 	_ = resp.Body.Close()
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 
-	w := r.wallet(t, walletID)
-	assert.Equal(t, map[string]any{"amount": "90.00", "currency": "BRL"}, w["balance"], "no financial effect")
-	assert.InDelta(t, 2, w["version"], 0)
+	got := r.wallet(t, walletID)
+	assert.Equal(t, map[string]any{"amount": "90.00", "currency": "BRL"}, got["balance"], "no financial effect")
+	assert.InDelta(t, 2, got["version"], 0)
 }
 
 func TestApplicationConsumesSQSAndPublishesEvents(t *testing.T) {
 	t.Parallel()
 	r := startApp(t)
-	walletID := r.openWallet(t, "100.00")
-	player := r.wallet(t, walletID)["playerId"].(string)
+	w := r.http.OpenWallet(t, "100.00")
+	walletID := w.ID
 	ext := uuid.NewString()
-	sendMessage(t, r.api, r.queues, "msg-"+ext, app.SubmitInput{
-		ProviderID: "provider-a", ExternalTransactionID: ext, IdempotencyKey: "provider-a:" + ext, PlayerID: player,
-		WalletID: walletID, RoundID: "r-1", GameID: "g-1", Kind: "BET", Amount: "15.00", Currency: "BRL",
-	})
+	sendMessage(t, r.api, r.queues, "msg-"+ext, testenv.SubmitInput(w, "provider-a", ext, "BET", "15.00", ""))
 
 	require.Eventually(t, func() bool {
 		return r.wallet(t, walletID)["balance"].(map[string]any)["amount"] == "85.00"
@@ -239,6 +211,52 @@ func TestApplicationRefusesToStartWithBrokenDependencies(t *testing.T) {
 		cancel()
 		assert.Error(t, err, name)
 	}
+}
+
+// hookRecorder keeps the stop hooks in execution order (by the function
+// that registered them).
+type hookRecorder struct {
+	mu    sync.Mutex
+	stops []string
+}
+
+func (r *hookRecorder) LogEvent(e fxevent.Event) {
+	if h, ok := e.(*fxevent.OnStopExecuting); ok {
+		r.mu.Lock()
+		r.stops = append(r.stops, h.CallerName)
+		r.mu.Unlock()
+	}
+}
+
+func (r *hookRecorder) index(caller string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.IndexFunc(r.stops, func(s string) bool { return strings.HasSuffix(s, caller) })
+}
+
+// TestFxStopsServerThenWorkersThenPool is the regression test for the stop
+// order: the HTTP server closes first, the worker group (consumers, relay,
+// resolver) stops next and the database pool closes last, so no worker
+// runs against a closed pool.
+func TestFxStopsServerThenWorkersThenPool(t *testing.T) {
+	t.Parallel()
+	_, _, names := provisionQueues(t, 3)
+	cfg, err := env.Config(queueVars(names))
+	require.NoError(t, err)
+	rec := &hookRecorder{}
+	a := bootstrap.New(cfg, fx.Replace(bootstrap.LogOutput{Writer: io.Discard}),
+		fx.WithLogger(func() fxevent.Logger { return rec }))
+	require.NoError(t, a.Start(context.Background()))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	require.NoError(t, a.Stop(ctx))
+
+	server, workers, pool := rec.index("bootstrap.startServer"), rec.index("bootstrap.startWorkers"), rec.index("bootstrap.newPool")
+	require.GreaterOrEqual(t, server, 0, rec.stops)
+	require.GreaterOrEqual(t, workers, 0, rec.stops)
+	require.GreaterOrEqual(t, pool, 0, rec.stops)
+	assert.Less(t, server, workers, "no new inputs before the workers stop: %v", rec.stops)
+	assert.Less(t, workers, pool, "workers stop before the pool closes: %v", rec.stops)
 }
 
 func TestFxGraphIsValid(t *testing.T) {

@@ -32,6 +32,8 @@ func NewMigrator(databaseURL string) (*Migrator, error) {
 	return &Migrator{m: m}, nil
 }
 
+// toPgx5URL rewrites a postgres:// or postgresql:// URL to the pgx5:// scheme
+// golang-migrate registers for its pgx v5 driver; other URLs pass through.
 func toPgx5URL(url string) string {
 	for _, prefix := range []string{"postgres://", "postgresql://"} {
 		if strings.HasPrefix(url, prefix) {
@@ -44,9 +46,13 @@ func toPgx5URL(url string) string {
 // Up applies every pending migration.
 func (m *Migrator) Up() error { return ignoreNoChange(m.m.Up()) }
 
-// Down reverts up to the given number of migrations; reverting past the
-// first migration is a no-op.
+// Down reverts up to the given number of migrations, which must be at least
+// one; reverting past the first migration stops at version 0 without error,
+// and a database with no migration applied is a no-op.
 func (m *Migrator) Down(steps int) error {
+	if steps < 1 {
+		return fmt.Errorf("migrate down: steps must be >= 1, got %d", steps)
+	}
 	v, _, err := m.Version()
 	if err != nil || v == 0 {
 		return err
@@ -69,6 +75,9 @@ func (m *Migrator) Close() error {
 	return errors.Join(srcErr, dbErr)
 }
 
+// ignoreNoChange treats "nothing to apply" (ErrNoChange) and "fewer steps
+// left than requested" (ErrShortLimit) as success: the schema is at the
+// version the caller wanted or as close to it as it can get.
 func ignoreNoChange(err error) error {
 	var short migrate.ErrShortLimit
 	if errors.Is(err, migrate.ErrNoChange) || errors.As(err, &short) {

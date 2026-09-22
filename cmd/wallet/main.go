@@ -1,4 +1,5 @@
-// Command wallet runs the wager wallet service. See package cli for commands.
+// Command wallet runs the wager wallet service. See package cli for the
+// commands and exit codes.
 package main
 
 import (
@@ -9,5 +10,5 @@ import (
 )
 
 func main() {
-	os.Exit(cli.Run(context.Background(), os.Args[1:], os.LookupEnv, os.Stdout))
+	os.Exit(cli.Run(context.Background(), os.Args[1:], os.LookupEnv, os.Stdout, os.Stderr))
 }

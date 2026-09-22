@@ -14,24 +14,38 @@ import (
 
 // outcome is everything that must be committed atomically for one decision.
 type outcome struct {
-	tx          *wager.Transaction
+	tx *wager.Transaction
+	// wallet is nil when the outcome carries no balance change.
 	wallet      *wallet.Wallet
 	prevVersion int64
 	entry       *wallet.LedgerEntry
 	records     []event.Record
 	causation   string
-	now         time.Time
+	// now is the single instant of the operation: transitions, ledger
+	// entries and events all carry it.
+	now time.Time
+}
+
+// settle decides the operation and persists the result inside the caller's
+// unit of work. now is the instant the operation was created (or retried),
+// so every row and event of the attempt carries the same timestamp.
+func (s *WagerService) settle(ctx context.Context, r Repositories, w *wallet.Wallet, tx *wager.Transaction, causation string, now time.Time, isNew bool) error {
+	out, err := s.conclude(ctx, r, w, tx, causation, now)
+	if err != nil {
+		return err
+	}
+	return s.persist(ctx, r, out, isNew)
 }
 
 // conclude loads the reference, applies the pure business rules and performs
 // the resulting transition in memory. Nothing is written yet.
-func (s *WagerService) conclude(ctx context.Context, r Repositories, w *wallet.Wallet, tx *wager.Transaction, causation string) (*outcome, error) {
+func (s *WagerService) conclude(ctx context.Context, r Repositories, w *wallet.Wallet, tx *wager.Transaction, causation string, now time.Time) (*outcome, error) {
 	ref, reversed, err := loadReference(ctx, r.Transactions(), tx)
 	if err != nil {
 		return nil, err
 	}
 	d := wager.Decide(wager.DecisionInput{Wallet: w, Transaction: tx, Reference: ref, ReferenceReversed: reversed})
-	out := &outcome{tx: tx, wallet: w, prevVersion: w.Version(), causation: causation, now: s.Clock.Now()}
+	out := &outcome{tx: tx, wallet: w, prevVersion: w.Version(), causation: causation, now: now}
 	switch d.Action {
 	case wager.ActionProcess:
 		err = s.applyProcess(out, ref, d)
@@ -59,8 +73,13 @@ func loadReference(ctx context.Context, repo TransactionRepository, tx *wager.Tr
 	return ref, reversed, err
 }
 
+// newMeta builds the tracing metadata of one event with a fresh event id.
+func newMeta(ids IDGenerator, correlation, causation string, at time.Time) event.Meta {
+	return event.Meta{EventID: ids.New(), CorrelationID: correlation, CausationID: causation, OccurredAt: at}
+}
+
 func (s *WagerService) meta(out *outcome) event.Meta {
-	return event.Meta{EventID: s.IDs.New(), CorrelationID: out.tx.CorrelationID(), CausationID: out.causation, OccurredAt: out.now}
+	return newMeta(s.IDs, out.tx.CorrelationID(), out.causation, out.now)
 }
 
 func (s *WagerService) applyProcess(out *outcome, ref *wager.Transaction, d wager.Decision) error {
@@ -130,42 +149,4 @@ func expiredCode(ref *wager.Transaction) wager.FailureCode {
 		return wager.CodeReferenceNotFound
 	}
 	return wager.CodeReferenceNotProcessed
-}
-
-// persist writes the transaction, the balance change, its ledger entry and
-// the outbox records. The caller's unit of work commits them atomically.
-func (s *WagerService) persist(ctx context.Context, r Repositories, out *outcome, isNew bool) error {
-	return sequence(
-		func() error { return saveTransaction(ctx, r.Transactions(), out.tx, isNew) },
-		func() error { return saveMovement(ctx, r, out) },
-		func() error { return r.Outbox().Append(ctx, out.records...) },
-		func() error { return wakeDependents(ctx, r.Transactions(), out) },
-	)
-}
-
-// wakeDependents makes operations waiting for this one due immediately once
-// it reached a terminal state.
-func wakeDependents(ctx context.Context, repo TransactionRepository, out *outcome) error {
-	if !out.tx.Status().Terminal() {
-		return nil
-	}
-	ext := out.tx.External()
-	return repo.WakeDependents(ctx, ext.ProviderID, ext.ExternalID, out.now)
-}
-
-func saveTransaction(ctx context.Context, repo TransactionRepository, tx *wager.Transaction, isNew bool) error {
-	if isNew {
-		return repo.Create(ctx, tx)
-	}
-	return repo.Save(ctx, tx)
-}
-
-func saveMovement(ctx context.Context, r Repositories, out *outcome) error {
-	if out.entry == nil {
-		return nil
-	}
-	return sequence(
-		func() error { return r.Wallets().Save(ctx, out.wallet, out.prevVersion) },
-		func() error { return r.Ledger().Append(ctx, *out.entry) },
-	)
 }

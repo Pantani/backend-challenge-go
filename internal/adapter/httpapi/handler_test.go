@@ -13,9 +13,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/goleak"
 
 	"github.com/Pantani/backend-challenge-go/internal/adapter/auth"
 	"github.com/Pantani/backend-challenge-go/internal/adapter/httpapi"
@@ -24,7 +24,10 @@ import (
 	"github.com/Pantani/backend-challenge-go/internal/domain/wager"
 	"github.com/Pantani/backend-challenge-go/internal/domain/wallet"
 	"github.com/Pantani/backend-challenge-go/internal/observability"
+	"github.com/Pantani/backend-challenge-go/internal/testutil"
 )
+
+func TestMain(m *testing.M) { goleak.VerifyTestMain(m) }
 
 var now = time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
 
@@ -80,20 +83,25 @@ var principals = tokens{
 	"no-roles":   {ClientID: "nobody"},
 }
 
+// fixture builds one server per test so its logs accumulate across calls.
 type fixture struct {
 	wallets fakeWallets
 	wagers  fakeWagers
 	checks  []httpapi.HealthCheck
 	logs    *bytes.Buffer
+	handler http.Handler
 }
 
 func (f *fixture) server() http.Handler {
-	f.logs = &bytes.Buffer{}
-	return httpapi.NewHandler(httpapi.Deps{
-		Wallets: f.wallets, Wagers: f.wagers, Verifier: principals, Checks: f.checks,
-		Metrics: observability.NewMetrics(prometheus.NewRegistry()), MetricsHandler: http.NotFoundHandler(),
-		Logger: observability.NewLogger(f.logs, "debug", "test"), ReadyTimeout: time.Second,
-	})
+	if f.handler == nil {
+		f.logs = &bytes.Buffer{}
+		f.handler = httpapi.NewHandler(httpapi.Deps{
+			Wallets: f.wallets, Wagers: f.wagers, Verifier: principals, Checks: f.checks,
+			Metrics: testutil.NewMetrics(), MetricsHandler: http.NotFoundHandler(),
+			Logger: observability.NewLogger(f.logs, "debug", "test"), ReadyTimeout: time.Second,
+		})
+	}
+	return f.handler
 }
 
 type call struct {
@@ -113,21 +121,18 @@ func (f *fixture) do(t *testing.T, c call) (*httptest.ResponseRecorder, map[stri
 	}
 	rec := httptest.NewRecorder()
 	f.server().ServeHTTP(rec, req)
+	if c.path != "/metrics" {
+		assert.Equal(t, "application/json", rec.Header().Get("Content-Type"), "every response is JSON")
+		assert.NotEmpty(t, rec.Header().Get("X-Correlation-Id"), "every response carries a correlation id")
+	}
 	var body map[string]any
 	_ = json.Unmarshal(rec.Body.Bytes(), &body)
 	return rec, body
 }
 
-func brl(t *testing.T, amount string) money.Money {
-	t.Helper()
-	m, err := money.Parse(amount, "BRL")
-	require.NoError(t, err)
-	return m
-}
-
 func sampleWallet(t *testing.T) *wallet.Wallet {
 	t.Helper()
-	w, err := wallet.Rehydrate(wallet.Snapshot{ID: uuid.New(), PlayerID: uuid.New(), Balance: brl(t, "1000.00"), Version: 1, CreatedAt: now, UpdatedAt: now})
+	w, err := wallet.Rehydrate(wallet.Snapshot{ID: uuid.New(), PlayerID: uuid.New(), Balance: testutil.BRL(t, "1000.00"), Version: 1, CreatedAt: now, UpdatedAt: now})
 	require.NoError(t, err)
 	return w
 }
@@ -136,7 +141,7 @@ func sampleTx(t *testing.T, provider string, status wager.Status) *wager.Transac
 	t.Helper()
 	s := wager.Snapshot{
 		ID: uuid.New(), Origin: wager.OriginExternal, Kind: wager.KindRefund, Status: status, WalletID: uuid.New(),
-		PlayerID: uuid.New(), Amount: brl(t, "25.00"), ResultBalance: brl(t, "975.00"), ReferenceTxID: uuid.New(),
+		PlayerID: uuid.New(), Amount: testutil.BRL(t, "25.00"), ResultBalance: testutil.BRL(t, "975.00"), ReferenceTxID: uuid.New(),
 		External: wager.External{ProviderID: provider, ExternalID: "t-1", IdempotencyKey: "k", PayloadHash: "h",
 			RoundID: "r", GameID: "g", ReferenceExternalID: "t-0"},
 		NextAttemptAt: now, CreatedAt: now, UpdatedAt: now,
@@ -165,10 +170,28 @@ func TestHealth(t *testing.T) {
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, "ready", body["status"])
 
-	f.checks = append(f.checks, httpapi.HealthCheck{Name: "sqs", Check: func(context.Context) error { return errors.New("down") }})
-	rec, body = f.do(t, call{method: http.MethodGet, path: "/health/ready"})
+	down := &fixture{checks: append(f.checks, httpapi.HealthCheck{Name: "sqs", Check: func(context.Context) error { return errors.New("down") }})}
+	rec, body = down.do(t, call{method: http.MethodGet, path: "/health/ready"})
 	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
 	assert.Equal(t, map[string]any{"postgres": "ok", "sqs": "unavailable"}, body["checks"])
+}
+
+func TestReadinessChecksRunConcurrently(t *testing.T) {
+	t.Parallel()
+	slow := func(ctx context.Context) error {
+		select {
+		case <-time.After(400 * time.Millisecond):
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	f := &fixture{checks: []httpapi.HealthCheck{{Name: "a", Check: slow}, {Name: "b", Check: slow}, {Name: "c", Check: slow}}}
+	start := time.Now()
+	rec, body := f.do(t, call{method: http.MethodGet, path: "/health/ready"})
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "ready", body["status"])
+	assert.Less(t, time.Since(start), 900*time.Millisecond, "checks overlap instead of running in sequence")
 }
 
 func TestAuthentication(t *testing.T) {
@@ -231,11 +254,61 @@ func TestPanicRecovery(t *testing.T) {
 func TestCorrelationID(t *testing.T) {
 	t.Parallel()
 	f := &fixture{}
-	rec, _ := f.do(t, call{method: http.MethodGet, path: "/health/live", headers: map[string]string{"X-Correlation-Id": "abc"}})
-	assert.Equal(t, "abc", rec.Header().Get("X-Correlation-Id"))
-	rec, _ = f.do(t, call{method: http.MethodGet, path: "/health/live", headers: map[string]string{"X-Correlation-Id": strings.Repeat("x", 200)}})
-	assert.Len(t, rec.Header().Get("X-Correlation-Id"), 36)
-	assert.Contains(t, f.logs.String(), `"correlationId"`)
+	for _, ok := range []string{"abc", "req_1:2.3-x", strings.Repeat("x", 128)} {
+		rec, _ := f.do(t, call{method: http.MethodGet, path: "/health/live", headers: map[string]string{"X-Correlation-Id": ok}})
+		assert.Equal(t, ok, rec.Header().Get("X-Correlation-Id"))
+	}
+	for _, bad := range []string{strings.Repeat("x", 129), "with space", "new\nline", "ünïcode", "a/b"} {
+		rec, _ := f.do(t, call{method: http.MethodGet, path: "/health/live", headers: map[string]string{"X-Correlation-Id": bad}})
+		got := rec.Header().Get("X-Correlation-Id")
+		assert.NotEqual(t, bad, got)
+		assert.Len(t, got, 36, "replaced by a generated UUID")
+	}
+	assert.Contains(t, f.logs.String(), `"correlationId":"abc"`, "the access log carries the client id")
+}
+
+func TestUnmatchedRoutesAreJSON(t *testing.T) {
+	t.Parallel()
+	f := &fixture{}
+	rec, body := f.do(t, call{method: http.MethodGet, path: "/nope", headers: map[string]string{"X-Correlation-Id": "c-404"}})
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+	assert.Equal(t, httpapi.CodeNotFound, body["code"])
+	assert.Equal(t, "c-404", rec.Header().Get("X-Correlation-Id"))
+
+	rec, body = f.do(t, call{method: http.MethodDelete, path: "/wallets", token: "admin"})
+	assert.Equal(t, http.StatusMethodNotAllowed, rec.Code)
+	assert.Equal(t, httpapi.CodeMethodNotAllowed, body["code"])
+	assert.Equal(t, "POST", rec.Header().Get("Allow"))
+
+	rec, body = f.do(t, call{method: http.MethodPut, path: "/wallets/" + uuid.NewString()})
+	assert.Equal(t, http.StatusMethodNotAllowed, rec.Code)
+	assert.Equal(t, httpapi.CodeMethodNotAllowed, body["code"])
+	assert.Equal(t, "GET, HEAD", rec.Header().Get("Allow"))
+
+	assert.Contains(t, f.logs.String(), `"route":"unmatched"`, "unmatched requests are logged under one label")
+	assert.Contains(t, f.logs.String(), `"correlationId":"c-404"`)
+}
+
+func TestPathCleaningRedirectsAreObserved(t *testing.T) {
+	t.Parallel()
+	f := &fixture{}
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/health/../health/live", nil)
+	req.Header.Set("X-Correlation-Id", "c-redirect")
+	rec := httptest.NewRecorder()
+	f.server().ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusTemporaryRedirect, rec.Code)
+	assert.Equal(t, "/health/live", rec.Header().Get("Location"))
+	assert.Equal(t, "c-redirect", rec.Header().Get("X-Correlation-Id"), "the mux redirect goes through the middleware")
+	assert.Contains(t, f.logs.String(), `"route":"redirect"`)
+}
+
+func TestPanicAbortHandlerIsRethrown(t *testing.T) {
+	t.Parallel()
+	f := &fixture{wallets: fakeWallets{get: func(uuid.UUID) (*wallet.Wallet, error) { panic(http.ErrAbortHandler) }}}
+	assert.PanicsWithValue(t, http.ErrAbortHandler, func() {
+		f.do(t, call{method: http.MethodGet, path: "/wallets/" + uuid.NewString(), token: "admin"})
+	})
+	assert.NotContains(t, f.logs.String(), "panic serving request")
 }
 
 func TestMetricsRoute(t *testing.T) {

@@ -14,36 +14,64 @@ import (
 // string so that both transports go through exactly the same validation and
 // normalization before the payload hash is computed.
 type SubmitInput struct {
-	ProviderID                     string
-	ExternalTransactionID          string
-	IdempotencyKey                 string
-	PlayerID                       string
-	WalletID                       string
-	RoundID                        string
-	GameID                         string
-	Kind                           string
-	Amount                         string
-	Currency                       string
+	// ProviderID is the authenticated provider submitting the operation.
+	ProviderID string
+	// ExternalTransactionID is the provider's identifier of the operation.
+	ExternalTransactionID string
+	// IdempotencyKey deduplicates retries of the same operation.
+	IdempotencyKey string
+	// PlayerID is the player's UUID, in any case.
+	PlayerID string
+	// WalletID is the wallet's UUID, in any case.
+	WalletID string
+	// RoundID is the game round the operation belongs to.
+	RoundID string
+	// GameID is the game producing the operation.
+	GameID string
+	// Kind is the external operation kind (BET, WIN, LOSS, REFUND, ROLLBACK).
+	Kind string
+	// Amount is the decimal amount in the canonical two-decimal form.
+	Amount string
+	// Currency is the ISO 4217 code.
+	Currency string
+	// ReferenceExternalTransactionID is the reversed operation (REFUND,
+	// ROLLBACK) or the settled bet (WIN, LOSS); it may be empty for WIN/LOSS.
 	ReferenceExternalTransactionID string
-	CorrelationID                  string
-	CausationID                    string
+	// CorrelationID traces the operation across services.
+	CorrelationID string
+	// CausationID is the identifier of the message that caused the operation.
+	CausationID string
 }
 
 // SubmitCommand is a validated operation.
 type SubmitCommand struct {
-	ProviderID          string
-	ExternalID          string
-	IdempotencyKey      string
-	PlayerID            uuid.UUID
-	WalletID            uuid.UUID
-	RoundID             string
-	GameID              string
-	Kind                wager.Kind
-	Amount              money.Money
+	// ProviderID is the authenticated provider.
+	ProviderID string
+	// ExternalID is the provider's identifier of the operation.
+	ExternalID string
+	// IdempotencyKey deduplicates retries, scoped by ProviderID.
+	IdempotencyKey string
+	// PlayerID is the normalized player identifier.
+	PlayerID uuid.UUID
+	// WalletID is the normalized wallet identifier.
+	WalletID uuid.UUID
+	// RoundID is the game round.
+	RoundID string
+	// GameID is the game.
+	GameID string
+	// Kind is the parsed operation kind.
+	Kind wager.Kind
+	// Amount is the parsed amount and currency.
+	Amount money.Money
+	// ReferenceExternalID is the referenced operation, if any.
 	ReferenceExternalID string
-	PayloadHash         string
-	CorrelationID       string
-	CausationID         string
+	// PayloadHash is the wager.Fingerprint hash of the business fields; it is
+	// compared on idempotent retries to detect a reused key.
+	PayloadHash string
+	// CorrelationID traces the operation across services.
+	CorrelationID string
+	// CausationID is the identifier of the message that caused the operation.
+	CausationID string
 }
 
 // NewSubmitCommand validates and normalizes a raw operation. UUIDs are
@@ -57,11 +85,11 @@ func NewSubmitCommand(in SubmitInput) (SubmitCommand, error) {
 	}
 	kind, err := wager.ParseExternalKind(in.Kind)
 	if err != nil {
-		return SubmitCommand{}, fmt.Errorf("%w: %w", ErrValidation, err)
+		return SubmitCommand{}, invalid(err)
 	}
 	amount, err := money.Parse(in.Amount, in.Currency)
 	if err != nil {
-		return SubmitCommand{}, fmt.Errorf("%w: %w", ErrValidation, err)
+		return SubmitCommand{}, invalid(err)
 	}
 	cmd := SubmitCommand{
 		ProviderID: in.ProviderID, ExternalID: in.ExternalTransactionID, IdempotencyKey: in.IdempotencyKey,
@@ -97,12 +125,16 @@ func (c SubmitCommand) fingerprint() wager.Fingerprint {
 	}
 }
 
+// validationTime is the fixed, non-zero instant used to validate commands:
+// the throwaway transaction is never stored, so no clock is needed.
+var validationTime = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+
 // validate runs the domain constructor on throwaway identifiers so every
 // transport rejects the same invalid inputs before touching the database.
 func (c SubmitCommand) validate() error {
-	_, err := wager.NewExternal(c.params(uuid.Max, SystemClock{}.Now()))
+	_, err := wager.NewExternal(c.params(uuid.Max, validationTime))
 	if err != nil {
-		return fmt.Errorf("%w: %w", ErrValidation, err)
+		return invalid(err)
 	}
 	return nil
 }
@@ -121,17 +153,24 @@ func (c SubmitCommand) params(id uuid.UUID, now time.Time) wager.ExternalParams 
 
 // OpenWalletInput is the raw wallet opening request.
 type OpenWalletInput struct {
-	PlayerID      string
-	Amount        string
-	Currency      string
+	// PlayerID is the owner's UUID, in any case.
+	PlayerID string
+	// Amount is the initial balance in the canonical two-decimal form.
+	Amount string
+	// Currency is the ISO 4217 code of the wallet.
+	Currency string
+	// CorrelationID traces the request across services.
 	CorrelationID string
 }
 
 // OpenWalletCommand is a validated wallet opening.
 type OpenWalletCommand struct {
-	PlayerID       uuid.UUID
+	// PlayerID is the normalized owner identifier.
+	PlayerID uuid.UUID
+	// InitialBalance is credited by the OPENING transaction when positive.
 	InitialBalance money.Money
-	CorrelationID  string
+	// CorrelationID traces the request across services.
+	CorrelationID string
 }
 
 // NewOpenWalletCommand validates a wallet opening request.
@@ -142,7 +181,7 @@ func NewOpenWalletCommand(in OpenWalletInput) (OpenWalletCommand, error) {
 	}
 	balance, err := money.Parse(in.Amount, in.Currency)
 	if err != nil {
-		return OpenWalletCommand{}, fmt.Errorf("%w: %w", ErrValidation, err)
+		return OpenWalletCommand{}, invalid(err)
 	}
 	return OpenWalletCommand{PlayerID: ids[0], InitialBalance: balance, CorrelationID: in.CorrelationID}, nil
 }

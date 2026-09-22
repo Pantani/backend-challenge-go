@@ -3,31 +3,14 @@ package postgres
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/Pantani/backend-challenge-go/internal/app"
-	"github.com/Pantani/backend-challenge-go/internal/domain/event"
 )
-
-type outboxRepo struct{ db dbtx }
-
-// Append stores the event snapshots; they become visible to publishers only
-// when the surrounding transaction commits.
-func (r outboxRepo) Append(ctx context.Context, records ...event.Record) error {
-	for _, rec := range records {
-		_, err := r.db.Exec(ctx, `INSERT INTO outbox_events
-			(event_id, aggregate_type, aggregate_id, partition_key, event_type, payload, occurred_at, next_attempt_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $7)`,
-			rec.EventID, rec.AggregateType, rec.AggregateID, rec.PartitionKey, rec.EventType, string(rec.Payload), rec.OccurredAt)
-		if err != nil {
-			return mapError(err)
-		}
-	}
-	return nil
-}
 
 type inboxRepo struct{ db dbtx }
 
@@ -50,8 +33,18 @@ func (r inboxRepo) Register(ctx context.Context, consumer, messageID, hash strin
 	return entry, false, mapError(err)
 }
 
+// Complete marks the registered message as processed, linking the resulting
+// transaction (uuid.Nil when the message produced none). Completing a
+// message that was never registered is a consumer bug and is reported as an
+// error rather than silently ignored.
 func (r inboxRepo) Complete(ctx context.Context, consumer, messageID string, transactionID uuid.UUID, now time.Time) error {
-	_, err := r.db.Exec(ctx, `UPDATE inbox_messages SET processed_at = $4, transaction_id = $3
+	tag, err := r.db.Exec(ctx, `UPDATE inbox_messages SET processed_at = $4, transaction_id = $3
 		WHERE consumer_name = $1 AND message_id = $2`, consumer, messageID, nullUUID(transactionID), now)
-	return mapError(err)
+	if err != nil {
+		return mapError(err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("inbox: message %s/%s not registered", consumer, messageID)
+	}
+	return nil
 }

@@ -4,39 +4,22 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 
 	"github.com/Pantani/backend-challenge-go/internal/app"
-	"github.com/Pantani/backend-challenge-go/internal/domain/money"
 	"github.com/Pantani/backend-challenge-go/internal/domain/wallet"
 	"github.com/Pantani/backend-challenge-go/internal/observability"
+	"github.com/Pantani/backend-challenge-go/internal/testutil"
 )
 
 var t0 = time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
-
-type fakeClock struct {
-	mu  sync.Mutex
-	now time.Time
-}
-
-func (c *fakeClock) Now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.now
-}
-
-func (c *fakeClock) Advance(d time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.now = c.now.Add(d)
-}
 
 // fakeIDs returns random UUIDs, or uuid.Nil on the configured call numbers.
 type fakeIDs struct {
@@ -55,40 +38,68 @@ func (f *fakeIDs) New() uuid.UUID {
 func (f *fakeIDs) failNextID(n int64) { f.nilAt.Store(f.calls.Load() + n) }
 
 type harness struct {
-	store   *memStore
-	clock   *fakeClock
-	ids     *fakeIDs
-	metrics *observability.Metrics
-	logs    *bytes.Buffer
-	wagers  *app.WagerService
-	wallets *app.WalletService
+	store    *memStore
+	clock    *testutil.FakeClock
+	ids      *fakeIDs
+	registry *prometheus.Registry
+	metrics  *observability.Metrics
+	logs     *bytes.Buffer
+	wagers   *app.WagerService
+	wallets  *app.WalletService
 }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	h := &harness{store: newMemStore(), clock: &fakeClock{now: t0}, ids: &fakeIDs{}, logs: &bytes.Buffer{}}
-	h.metrics = observability.NewMetrics(prometheus.NewRegistry())
+	h := &harness{store: newMemStore(), clock: testutil.NewFakeClock(t0), ids: &fakeIDs{}, logs: &bytes.Buffer{}, registry: prometheus.NewRegistry()}
+	h.metrics = observability.NewMetrics(h.registry)
 	logger := slog.New(slog.NewJSONHandler(h.logs, nil))
+	deps := app.Deps{UoW: h.store, Queries: h.store, Clock: h.clock, IDs: h.ids, Metrics: h.metrics, Logger: logger}
 	h.wagers = app.NewWagerService(app.WagerDeps{
-		UoW: h.store, Queries: h.store, Clock: h.clock, IDs: h.ids, Metrics: h.metrics, Logger: logger,
+		Deps:   deps,
 		Policy: app.PendingPolicy{BaseDelay: time.Second, MaxDelay: time.Minute, MaxAttempts: 3, BatchSize: 10}, ConflictRetries: 2,
 	})
-	h.wallets = app.NewWalletService(app.WalletDeps{
-		UoW: h.store, Queries: h.store, Clock: h.clock, IDs: h.ids, Metrics: h.metrics, Logger: logger,
-	})
+	h.wallets = app.NewWalletService(app.WalletDeps{Deps: deps})
 	return h
 }
 
-func brl(t *testing.T, amount string) money.Money {
+// counter returns the value of a counter series, summing the samples whose
+// labels contain every pair of labels (the family may have more labels).
+// The child collectors of observability.Metrics are unexported, so the
+// registry is gathered instead of calling testutil.ToFloat64 on them.
+func (h *harness) counter(t *testing.T, name string, labels map[string]string) float64 {
 	t.Helper()
-	m, err := money.Parse(amount, "BRL")
+	families, err := h.registry.Gather()
 	require.NoError(t, err)
-	return m
+	total := 0.0
+	for _, f := range families {
+		if f.GetName() != name {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			if hasLabels(m, labels) {
+				total += m.GetCounter().GetValue() + float64(m.GetHistogram().GetSampleCount())
+			}
+		}
+	}
+	return total
+}
+
+func hasLabels(m *dto.Metric, want map[string]string) bool {
+	got := map[string]string{}
+	for _, p := range m.GetLabel() {
+		got[p.GetName()] = p.GetValue()
+	}
+	for k, v := range want {
+		if got[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 func (h *harness) openWallet(t *testing.T, amount string) *wallet.Wallet {
 	t.Helper()
-	w, err := h.wallets.Open(context.Background(), app.OpenWalletCommand{PlayerID: uuid.New(), InitialBalance: brl(t, amount), CorrelationID: "open"})
+	w, err := h.wallets.Open(context.Background(), app.OpenWalletCommand{PlayerID: uuid.New(), InitialBalance: testutil.BRL(t, amount), CorrelationID: "open"})
 	require.NoError(t, err)
 	return w
 }

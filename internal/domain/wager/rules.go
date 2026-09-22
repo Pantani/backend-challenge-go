@@ -18,9 +18,13 @@ const (
 
 // Decision tells the application how to conclude an operation.
 type Decision struct {
-	Action    Action
-	Code      FailureCode
-	Moves     bool
+	// Action is what to do: process, reject or wait for the reference.
+	Action Action
+	// Code is the rejection reason; set only when Action is ActionReject.
+	Code FailureCode
+	// Moves reports whether processing changes the balance (false for LOSS).
+	Moves bool
+	// Direction is the wallet movement; meaningful only when Moves is true.
 	Direction wallet.Direction
 }
 
@@ -38,6 +42,10 @@ func reject(code FailureCode) Decision { return Decision{Action: ActionReject, C
 
 // Decide applies the business rules of the five external kinds. It is pure:
 // it never mutates the wallet or the transaction.
+//
+// Preconditions: Wallet and Transaction are non-nil, the transaction is an
+// external kind (never OPENING) in a non-terminal status, and Reference, when
+// present, is the operation named by ReferenceExternalID.
 func Decide(in DecisionInput) Decision {
 	if code := checkOwnership(in.Wallet, in.Transaction); code != "" {
 		return reject(code)
@@ -114,33 +122,59 @@ func reversible(kind, target Kind) bool {
 	return slices.Contains(referenceTargets[kind], target)
 }
 
+// rollbackDirection maps the kind being rolled back to the movement that
+// undoes it. It must cover every target listed for ROLLBACK in
+// referenceTargets; anything else fails closed.
+var rollbackDirection = map[Kind]wallet.Direction{
+	KindBet: wallet.Credit, KindWin: wallet.Debit, KindRefund: wallet.Debit,
+}
+
 // directionOf returns the wallet movement of a kind. ROLLBACK moves opposite
-// to the operation it undoes; LOSS does not move money.
+// to the operation it undoes. ok is false when no direction is known, which
+// includes LOSS (never moves money) and a ROLLBACK of an unmapped target.
 func directionOf(kind Kind, ref *Transaction) (wallet.Direction, bool) {
 	switch kind {
 	case KindBet:
 		return wallet.Debit, true
-	case KindWin, KindRefund, KindOpening:
+	case KindWin, KindRefund:
 		return wallet.Credit, true
 	case KindRollback:
-		d, _ := directionOf(ref.Kind(), nil)
-		return d.Opposite(), true
+		if ref == nil {
+			return "", false
+		}
+		d, ok := rollbackDirection[ref.Kind()]
+		return d, ok
 	}
 	return "", false
 }
 
 func decideMovement(w *wallet.Wallet, t *Transaction, ref *Transaction) Decision {
-	dir, moves := directionOf(t.Kind(), ref)
-	if !moves {
+	if t.Kind() == KindLoss {
 		return Decision{Action: ActionProcess}
 	}
-	if dir == wallet.Debit && !w.CanDebit(t.Amount()) {
-		return reject(insufficientFundsCode(t.Kind()))
+	dir, ok := directionOf(t.Kind(), ref)
+	if !ok {
+		return reject(CodeReferenceKindInvalid)
 	}
-	if _, err := w.Balance().Add(t.Amount()); dir == wallet.Credit && err != nil {
-		return reject(CodeBalanceLimitExceeded)
+	if code := checkLimits(w, t, dir); code != "" {
+		return reject(code)
 	}
 	return Decision{Action: ActionProcess, Moves: true, Direction: dir}
+}
+
+// checkLimits verifies the balance can absorb the movement: debits need
+// funds, credits must not overflow the balance.
+func checkLimits(w *wallet.Wallet, t *Transaction, dir wallet.Direction) FailureCode {
+	if dir == wallet.Debit {
+		if !w.CanDebit(t.Amount()) {
+			return insufficientFundsCode(t.Kind())
+		}
+		return ""
+	}
+	if _, err := w.Balance().Add(t.Amount()); err != nil {
+		return CodeBalanceLimitExceeded
+	}
+	return ""
 }
 
 // insufficientFundsCode keeps reversal shortfalls distinguishable from bets.

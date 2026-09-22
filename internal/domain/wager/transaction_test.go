@@ -13,6 +13,7 @@ import (
 
 	"github.com/Pantani/backend-challenge-go/internal/domain/money"
 	"github.com/Pantani/backend-challenge-go/internal/domain/wager"
+	"github.com/Pantani/backend-challenge-go/internal/testutil"
 )
 
 func TestParseExternalKind(t *testing.T) {
@@ -30,14 +31,24 @@ func TestParseExternalKind(t *testing.T) {
 
 func TestKindPredicates(t *testing.T) {
 	t.Parallel()
-	assert.True(t, wager.KindOpening.Valid())
-	assert.False(t, wager.Kind("X").Valid())
-	assert.True(t, wager.KindRefund.RequiresReference())
-	assert.True(t, wager.KindRollback.IsReversal())
-	assert.False(t, wager.KindWin.RequiresReference())
-	assert.True(t, wager.KindWin.AcceptsReference())
-	assert.False(t, wager.KindBet.AcceptsReference())
-	assert.True(t, wager.KindLoss.RequiresZeroAmount())
+	type preds struct{ external, requiresRef, acceptsRef, reversal, zero bool }
+	matrix := map[wager.Kind]preds{
+		wager.KindOpening:  {},
+		wager.KindBet:      {external: true},
+		wager.KindWin:      {external: true, acceptsRef: true},
+		wager.KindLoss:     {external: true, zero: true},
+		wager.KindRefund:   {external: true, requiresRef: true, acceptsRef: true, reversal: true},
+		wager.KindRollback: {external: true, requiresRef: true, acceptsRef: true, reversal: true},
+	}
+	for k, want := range matrix {
+		got := preds{k.External(), k.RequiresReference(), k.AcceptsReference(), k.IsReversal(), k.RequiresZeroAmount()}
+		assert.True(t, k.Valid(), k)
+		assert.Equal(t, want, got, k)
+	}
+	unknown := wager.Kind("X")
+	assert.False(t, unknown.Valid())
+	assert.False(t, unknown.External())
+	assert.False(t, unknown.AcceptsReference())
 }
 
 func TestStatusPredicates(t *testing.T) {
@@ -60,22 +71,28 @@ func TestZeroValuePolicy(t *testing.T) {
 		kind   wager.Kind
 		amount string
 		ref    string
-		ok     bool
+		want   error
 	}{
-		{wager.KindBet, "1.00", "", true},
-		{wager.KindBet, "0.00", "", false},
-		{wager.KindWin, "1.00", "", true},
-		{wager.KindWin, "0.00", "", false},
-		{wager.KindLoss, "0.00", "", true},
-		{wager.KindLoss, "1.00", "", false},
-		{wager.KindRefund, "1.00", "bet-1", true},
-		{wager.KindRefund, "0.00", "bet-1", false},
-		{wager.KindRollback, "1.00", "bet-1", true},
-		{wager.KindRollback, "0.00", "bet-1", false},
+		{wager.KindBet, "1.00", "", nil},
+		{wager.KindBet, "0.00", "", wager.ErrInvalidTransaction},
+		{wager.KindWin, "1.00", "", nil},
+		{wager.KindWin, "1.00", "bet-1", nil},
+		{wager.KindWin, "0.00", "", wager.ErrInvalidTransaction},
+		{wager.KindLoss, "0.00", "", nil},
+		{wager.KindLoss, "0.00", "bet-1", wager.ErrInvalidTransaction},
+		{wager.KindLoss, "1.00", "", wager.ErrInvalidTransaction},
+		{wager.KindRefund, "1.00", "bet-1", nil},
+		{wager.KindRefund, "0.00", "bet-1", wager.ErrInvalidTransaction},
+		{wager.KindRollback, "1.00", "bet-1", nil},
+		{wager.KindRollback, "0.00", "bet-1", wager.ErrInvalidTransaction},
 	}
 	for _, tc := range cases {
 		_, err := wager.NewExternal(f.params(t, tc.kind, tc.amount, tc.ref))
-		assert.Equal(t, tc.ok, err == nil, "%s %s: %v", tc.kind, tc.amount, err)
+		if tc.want == nil {
+			assert.NoError(t, err, "%s %s %q", tc.kind, tc.amount, tc.ref)
+			continue
+		}
+		assert.ErrorIs(t, err, tc.want, "%s %s %q", tc.kind, tc.amount, tc.ref)
 	}
 }
 
@@ -108,37 +125,50 @@ func TestNewExternalValidation(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t, "100.00")
 	long := strings.Repeat("x", 129)
-	mutations := map[string]func(p *wager.ExternalParams){
-		"opening kind":          func(p *wager.ExternalParams) { p.Kind = wager.KindOpening },
-		"nil id":                func(p *wager.ExternalParams) { p.ID = uuid.Nil },
-		"nil wallet":            func(p *wager.ExternalParams) { p.WalletID = uuid.Nil },
-		"nil player":            func(p *wager.ExternalParams) { p.PlayerID = uuid.Nil },
-		"zero time":             func(p *wager.ExternalParams) { p.Now = time.Time{} },
-		"uninitialized money":   func(p *wager.ExternalParams) { p.Amount = money.Money{} },
-		"empty provider":        func(p *wager.ExternalParams) { p.External.ProviderID = "" },
-		"empty external id":     func(p *wager.ExternalParams) { p.External.ExternalID = "" },
-		"empty key":             func(p *wager.ExternalParams) { p.External.IdempotencyKey = "" },
-		"empty hash":            func(p *wager.ExternalParams) { p.External.PayloadHash = "" },
-		"empty round":           func(p *wager.ExternalParams) { p.External.RoundID = "" },
-		"empty game":            func(p *wager.ExternalParams) { p.External.GameID = "" },
-		"long game":             func(p *wager.ExternalParams) { p.External.GameID = long },
-		"missing reference":     func(p *wager.ExternalParams) { p.Kind = wager.KindRefund },
-		"long reference":        func(p *wager.ExternalParams) { p.Kind, p.External.ReferenceExternalID = wager.KindWin, long },
-		"bet with reference":    func(p *wager.ExternalParams) { p.External.ReferenceExternalID = "x" },
-		"negative amount (neg)": func(p *wager.ExternalParams) { p.Amount = p.Amount.Neg() },
+	invalid := wager.ErrInvalidTransaction
+	mutations := map[string]struct {
+		mutate func(p *wager.ExternalParams)
+		want   error
+	}{
+		"opening kind":        {func(p *wager.ExternalParams) { p.Kind = wager.KindOpening }, wager.ErrInvalidKind},
+		"unknown kind":        {func(p *wager.ExternalParams) { p.Kind = "DEPOSIT" }, wager.ErrInvalidKind},
+		"nil id":              {func(p *wager.ExternalParams) { p.ID = uuid.Nil }, invalid},
+		"nil wallet":          {func(p *wager.ExternalParams) { p.WalletID = uuid.Nil }, invalid},
+		"nil player":          {func(p *wager.ExternalParams) { p.PlayerID = uuid.Nil }, invalid},
+		"zero time":           {func(p *wager.ExternalParams) { p.Now = time.Time{} }, invalid},
+		"uninitialized money": {func(p *wager.ExternalParams) { p.Amount = money.Money{} }, invalid},
+		"empty provider":      {func(p *wager.ExternalParams) { p.External.ProviderID = "" }, invalid},
+		"empty external id":   {func(p *wager.ExternalParams) { p.External.ExternalID = "" }, invalid},
+		"empty key":           {func(p *wager.ExternalParams) { p.External.IdempotencyKey = "" }, invalid},
+		"empty hash":          {func(p *wager.ExternalParams) { p.External.PayloadHash = "" }, invalid},
+		"empty round":         {func(p *wager.ExternalParams) { p.External.RoundID = "" }, invalid},
+		"empty game":          {func(p *wager.ExternalParams) { p.External.GameID = "" }, invalid},
+		"long game":           {func(p *wager.ExternalParams) { p.External.GameID = long }, invalid},
+		"missing reference":   {func(p *wager.ExternalParams) { p.Kind = wager.KindRefund }, invalid},
+		"long reference":      {func(p *wager.ExternalParams) { p.Kind, p.External.ReferenceExternalID = wager.KindWin, long }, invalid},
+		"bet with reference":  {func(p *wager.ExternalParams) { p.External.ReferenceExternalID = "x" }, invalid},
+		"self reference": {func(p *wager.ExternalParams) {
+			p.Kind, p.External.ReferenceExternalID = wager.KindRefund, p.External.ExternalID
+		}, invalid},
+		"negative amount (neg)": {func(p *wager.ExternalParams) { p.Amount = p.Amount.Neg() }, invalid},
 	}
-	for name, mutate := range mutations {
+	for name, tc := range mutations {
 		p := f.params(t, wager.KindBet, "10.00", "")
-		mutate(&p)
+		tc.mutate(&p)
 		_, err := wager.NewExternal(p)
-		assert.Error(t, err, name)
+		assert.ErrorIs(t, err, tc.want, name)
 	}
+
+	p := f.params(t, wager.KindBet, "10.00", "")
+	p.External.GameID = ""
+	_, err := wager.NewExternal(p)
+	assert.ErrorContains(t, err, "gameId", "the error names the offending field")
 }
 
 func TestNewOpening(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t, "0.00")
-	p := wager.OpeningParams{ID: uuid.New(), WalletID: f.walletID, PlayerID: f.playerID, Amount: mny(t, "10.00", "BRL"), Now: now}
+	p := wager.OpeningParams{ID: uuid.New(), WalletID: f.walletID, PlayerID: f.playerID, Amount: testutil.Money(t, "10.00", "BRL"), Now: now}
 	tx, err := wager.NewOpening(p)
 	require.NoError(t, err)
 	assert.Equal(t, wager.KindOpening, tx.Kind())
@@ -146,7 +176,7 @@ func TestNewOpening(t *testing.T) {
 	assert.Equal(t, wager.External{}, tx.External())
 	assert.Equal(t, wager.StatusPending, tx.Status())
 
-	p.Amount = mny(t, "0.00", "BRL")
+	p.Amount = testutil.Money(t, "0.00", "BRL")
 	_, err = wager.NewOpening(p)
 	require.ErrorIs(t, err, wager.ErrInvalidTransaction)
 	p.ID = uuid.Nil
@@ -158,10 +188,10 @@ func TestTransitions(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t, "100.00")
 	later := now.Add(time.Second)
-	bal := mny(t, "75.00", "BRL")
+	bal := testutil.Money(t, "75.00", "BRL")
 	ref := uuid.New()
 
-	processed := f.tx(t, wager.KindBet, "25.00", "")
+	processed := f.tx(t, wager.KindWin, "25.00", "bet-1")
 	require.NoError(t, processed.Process(bal, ref, later))
 	assert.Equal(t, wager.StatusProcessed, processed.Status())
 	assert.Equal(t, bal, processed.ResultBalance())
@@ -177,7 +207,13 @@ func TestTransitions(t *testing.T) {
 	require.NoError(t, failed.Fail(wager.CodeInternalFailure, later))
 	assert.Equal(t, wager.StatusFailed, failed.Status())
 
-	for _, terminal := range []*wager.Transaction{processed, rejected, failed} {
+	assertTerminal(t, bal, processed, rejected, failed)
+}
+
+func assertTerminal(t *testing.T, bal money.Money, txs ...*wager.Transaction) {
+	t.Helper()
+	later := now.Add(time.Second)
+	for _, terminal := range txs {
 		assert.ErrorIs(t, terminal.Process(bal, uuid.Nil, later), wager.ErrInvalidTransition)
 		assert.ErrorIs(t, terminal.Reject(wager.CodeInsufficientFunds, bal, later), wager.ErrInvalidTransition)
 		assert.ErrorIs(t, terminal.Fail(wager.CodeInternalFailure, later), wager.ErrInvalidTransition)
@@ -185,14 +221,55 @@ func TestTransitions(t *testing.T) {
 	}
 }
 
+func TestPendingReferenceToProcessed(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, "100.00")
+	tx := f.tx(t, wager.KindRefund, "25.00", "bet-1")
+	require.NoError(t, tx.AwaitReference(now.Add(time.Second), now))
+	require.Equal(t, wager.StatusPendingReference, tx.Status())
+	ref := uuid.New()
+	require.NoError(t, tx.Process(testutil.Money(t, "125.00", "BRL"), ref, now.Add(time.Second)))
+	assert.Equal(t, wager.StatusProcessed, tx.Status())
+	assert.Equal(t, ref, tx.ReferenceTxID())
+	assert.Equal(t, 1, tx.Attempts(), "attempt count is preserved")
+}
+
+func TestRehydratedTerminalRefusesTransitions(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, "100.00")
+	bal := testutil.Money(t, "75.00", "BRL")
+	var txs []*wager.Transaction
+	for _, status := range []wager.Status{wager.StatusProcessed, wager.StatusRejected, wager.StatusFailed} {
+		tx, err := wager.Rehydrate(wager.Snapshot{
+			ID: uuid.New(), Origin: wager.OriginExternal, Kind: wager.KindBet, Status: status,
+			WalletID: f.walletID, PlayerID: f.playerID, Amount: testutil.Money(t, "1.00", "BRL"), CreatedAt: now, UpdatedAt: now,
+		})
+		require.NoError(t, err)
+		txs = append(txs, tx)
+	}
+	assertTerminal(t, bal, txs...)
+}
+
 func TestTransitionValidation(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t, "100.00")
+	bal := testutil.Money(t, "1.00", "BRL")
 	tx := f.tx(t, wager.KindBet, "25.00", "")
 	assert.ErrorIs(t, tx.Process(money.Money{}, uuid.Nil, now), wager.ErrInvalidTransaction)
-	assert.ErrorIs(t, tx.Reject("", mny(t, "1.00", "BRL"), now), wager.ErrInvalidTransaction)
+	assert.ErrorIs(t, tx.Process(bal, uuid.New(), now), wager.ErrInvalidTransaction, "BET cannot resolve a reference")
+	assert.ErrorIs(t, tx.Reject("", bal, now), wager.ErrInvalidTransaction)
+	assert.ErrorIs(t, tx.Reject(wager.CodeInsufficientFunds, money.Money{}, now), wager.ErrInvalidTransaction)
+	assert.ErrorIs(t, tx.Fail("", now), wager.ErrInvalidTransaction)
 	assert.ErrorIs(t, tx.AwaitReference(now, now), wager.ErrInvalidTransition)
 	assert.Equal(t, wager.StatusPending, tx.Status())
+
+	refund := f.tx(t, wager.KindRefund, "25.00", "bet-1")
+	assert.ErrorIs(t, refund.Process(bal, uuid.Nil, now), wager.ErrInvalidTransaction, "REFUND needs a resolved reference")
+	assert.Equal(t, wager.StatusPending, refund.Status())
+
+	failed := f.tx(t, wager.KindBet, "25.00", "")
+	require.NoError(t, failed.Fail(wager.CodeInternalFailure, now))
+	assert.Error(t, failed.ResultBalance().Validate(), "Fail records no balance")
 }
 
 func TestAwaitReference(t *testing.T) {
@@ -209,7 +286,7 @@ func TestAwaitReference(t *testing.T) {
 	require.NoError(t, tx.AwaitReference(next.Add(time.Second), next))
 	assert.Equal(t, 2, tx.Attempts())
 
-	require.NoError(t, tx.Reject(wager.CodeReferenceNotFound, mny(t, "100.00", "BRL"), next))
+	require.NoError(t, tx.Reject(wager.CodeReferenceNotFound, testutil.Money(t, "100.00", "BRL"), next))
 	assert.Equal(t, wager.StatusRejected, tx.Status())
 }
 
@@ -218,14 +295,23 @@ func TestRehydrate(t *testing.T) {
 	f := newFixture(t, "100.00")
 	s := wager.Snapshot{
 		ID: uuid.New(), Origin: wager.OriginExternal, Kind: wager.KindBet, Status: wager.StatusProcessed,
-		WalletID: f.walletID, PlayerID: f.playerID, Amount: mny(t, "1.00", "BRL"),
-		External: wager.External{ProviderID: "p"}, ResultBalance: mny(t, "99.00", "BRL"),
+		WalletID: f.walletID, PlayerID: f.playerID, Amount: testutil.Money(t, "1.00", "BRL"),
+		External: wager.External{ProviderID: "p"}, ResultBalance: testutil.Money(t, "99.00", "BRL"),
 		Attempts: 3, CorrelationID: "c", CreatedAt: now, UpdatedAt: now,
 	}
 	tx, err := wager.Rehydrate(s)
 	require.NoError(t, err)
 	assert.Equal(t, 3, tx.Attempts())
 	assert.Equal(t, wager.StatusProcessed, tx.Status())
+
+	local := now.In(time.FixedZone("BRT", -3*60*60))
+	s.NextAttemptAt, s.CreatedAt, s.UpdatedAt = local.Add(time.Minute), local, local
+	tx, err = wager.Rehydrate(s)
+	require.NoError(t, err)
+	assert.Equal(t, time.UTC, tx.CreatedAt().Location())
+	assert.Equal(t, time.UTC, tx.UpdatedAt().Location())
+	assert.Equal(t, time.UTC, tx.NextAttemptAt().Location())
+	assert.True(t, tx.NextAttemptAt().Equal(now.Add(time.Minute)), "NextAttemptAt is preserved")
 
 	mutations := map[string]func(s *wager.Snapshot){
 		"nil id":                     func(s *wager.Snapshot) { s.ID = uuid.Nil },
@@ -259,10 +345,29 @@ func TestFingerprint(t *testing.T) {
 	sum := sha256.Sum256([]byte(canonical))
 	assert.Equal(t, hex.EncodeToString(sum[:]), h)
 
-	changed := base
-	changed.Amount = "25.01"
-	assert.NotEqual(t, h, changed.Hash())
-	withRef := base
-	withRef.ReferenceExternalTransactionID = "t-0"
-	assert.NotEqual(t, h, withRef.Hash())
+	variants := map[string]func(f *wager.Fingerprint){
+		"amount":         func(f *wager.Fingerprint) { f.Amount = "25.01" },
+		"reference":      func(f *wager.Fingerprint) { f.ReferenceExternalTransactionID = "t-0" },
+		"kind":           func(f *wager.Fingerprint) { f.Kind = wager.KindWin },
+		"provider":       func(f *wager.Fingerprint) { f.ProviderID = "provider-b" },
+		"case sensitive": func(f *wager.Fingerprint) { f.ProviderID = "Provider-A" },
+		"currency":       func(f *wager.Fingerprint) { f.Currency = "USD" },
+	}
+	for name, mutate := range variants {
+		changed := base
+		mutate(&changed)
+		assert.NotEqual(t, h, changed.Hash(), name)
+	}
+}
+
+func TestFingerprintDoesNotEscapeHTML(t *testing.T) {
+	t.Parallel()
+	f := wager.Fingerprint{
+		ProviderID: "a&b<c>", ExternalTransactionID: "t-1", PlayerID: "p", WalletID: "w",
+		RoundID: "r", GameID: "g", Kind: wager.KindBet, Amount: "25.00", Currency: "BRL",
+	}
+	canonical := `{"externalTransactionId":"t-1","gameId":"g","kind":"BET",` +
+		`"money":{"amount":"25.00","currency":"BRL"},"playerId":"p","providerId":"a&b<c>","roundId":"r","walletId":"w"}`
+	sum := sha256.Sum256([]byte(canonical))
+	assert.Equal(t, hex.EncodeToString(sum[:]), f.Hash())
 }
