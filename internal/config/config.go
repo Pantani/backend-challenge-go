@@ -249,8 +249,9 @@ func (d Database) validate() error {
 	return check([]rule{
 		{d.DatabaseURL != "", "DATABASE_URL is required"},
 		{d.DBMaxConns > 0, "DB_MAX_CONNS must be positive"},
-		{d.DBLockTimeout > 0, "DB_LOCK_TIMEOUT must be positive"},
-		{d.DBStatementTimeout > 0, "DB_STATEMENT_TIMEOUT must be positive"},
+		// PostgreSQL receives these in whole milliseconds, and 0 disables them.
+		{d.DBLockTimeout > 0 && whole(d.DBLockTimeout, time.Millisecond), "DB_LOCK_TIMEOUT must be a positive whole number of milliseconds"},
+		{d.DBStatementTimeout > 0 && whole(d.DBStatementTimeout, time.Millisecond), "DB_STATEMENT_TIMEOUT must be a positive whole number of milliseconds"},
 	})
 }
 
@@ -261,18 +262,24 @@ func (s SQS) validate() error {
 		{s.SQSConsumers > 0, "SQS_CONSUMERS must be positive"},
 		{s.SQSMaxReceiveCount > 0, "SQS_MAX_RECEIVE_COUNT must be positive"},
 		{between(s.SQSMaxMessages, 1, 10), "SQS_MAX_MESSAGES must be between 1 and 10"},
-		{s.SQSWaitTime >= 0 && s.SQSWaitTime <= maxSQSWaitTime, "SQS_WAIT_TIME must be between 0s and 20s"},
-		{s.SQSVisibilityTimeout > 0 && s.SQSVisibilityTimeout <= maxSQSDuration, "SQS_VISIBILITY_TIMEOUT must be positive and at most 12h"},
+		// SQS takes wait, visibility and retry delays in whole seconds.
+		{whole(s.SQSWaitTime, time.Second) && s.SQSWaitTime >= 0 && s.SQSWaitTime <= maxSQSWaitTime, "SQS_WAIT_TIME must be whole seconds between 0s and 20s"},
+		{whole(s.SQSVisibilityTimeout, time.Second) && s.SQSVisibilityTimeout > 0 && s.SQSVisibilityTimeout <= maxSQSDuration, "SQS_VISIBILITY_TIMEOUT must be positive whole seconds, at most 12h"},
 		{s.SQSProcessTimeout > 0, "SQS_PROCESS_TIMEOUT must be positive"},
 		{s.SQSAckTimeout > 0, "SQS_ACK_TIMEOUT must be positive"},
-		{s.SQSRetryBase > 0, "SQS_RETRY_BASE must be positive"},
-		{s.SQSRetryMax > 0 && s.SQSRetryMax <= maxSQSDuration, "SQS_RETRY_MAX must be positive and at most 12h"},
+		{whole(s.SQSRetryBase, time.Second) && s.SQSRetryBase > 0, "SQS_RETRY_BASE must be positive whole seconds"},
+		{whole(s.SQSRetryMax, time.Second) && s.SQSRetryMax > 0 && s.SQSRetryMax <= maxSQSDuration, "SQS_RETRY_MAX must be positive whole seconds, at most 12h"},
 		{s.SQSRetryBase <= s.SQSRetryMax, "SQS_RETRY_BASE must not exceed SQS_RETRY_MAX"},
 		// The consumer handles a received batch serially, so the batch stays
 		// invisible for its whole worst case.
 		{s.SQSVisibilityTimeout > batch,
 			"SQS_VISIBILITY_TIMEOUT must exceed SQS_MAX_MESSAGES * (SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT)"},
 	}), namedSenderPolicyError(senderPolicyErr))
+}
+
+// whole reports whether d is an exact multiple of unit.
+func whole(d, unit time.Duration) bool {
+	return d%unit == 0
 }
 
 func namedSenderPolicyError(err error) error {

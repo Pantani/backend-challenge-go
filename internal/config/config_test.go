@@ -97,6 +97,26 @@ func TestLoadRejectsNonPositiveSQSValuesByEnvironmentName(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsDurationsTheAdaptersWouldTruncate(t *testing.T) {
+	t.Parallel()
+	tests := map[string]string{
+		"SQS_WAIT_TIME":          "1500ms",
+		"SQS_VISIBILITY_TIMEOUT": "300500ms",
+		"SQS_RETRY_BASE":         "500ms",
+		"SQS_RETRY_MAX":          "60500ms",
+		"DB_LOCK_TIMEOUT":        "500us",
+		"DB_STATEMENT_TIMEOUT":   "10000500us",
+	}
+	for key, value := range tests {
+		t.Run(key, func(t *testing.T) {
+			t.Parallel()
+			_, err := config.Load(config.MapLookup(map[string]string{key: value}))
+			require.ErrorContains(t, err, key+" must be")
+			require.ErrorContains(t, err, "whole")
+		})
+	}
+}
+
 func TestLoadRejectsMalformedSQSSenderProviders(t *testing.T) {
 	t.Parallel()
 	for _, value := range []string{"missing-equals", "=provider-a", "sender=", "sender=a | b", "sender=a||b"} {
