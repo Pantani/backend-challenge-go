@@ -255,11 +255,15 @@ func (d Database) validate() error {
 func (s SQS) validate() error {
 	budget, budgetOK := batchBudget(s.SQSMaxMessages, s.SQSProcessTimeout, s.SQSAckTimeout)
 	return errors.Join(check([]rule{
-		{positive(s.SQSConsumers, s.SQSMaxReceiveCount), "SQS_CONSUMERS and SQS_MAX_RECEIVE_COUNT must be positive"},
+		{s.SQSConsumers > 0, "SQS_CONSUMERS must be positive"},
+		{s.SQSMaxReceiveCount > 0, "SQS_MAX_RECEIVE_COUNT must be positive"},
 		{between(s.SQSMaxMessages, 1, 10), "SQS_MAX_MESSAGES must be between 1 and 10"},
 		{s.SQSWaitTime >= 0 && s.SQSWaitTime <= maxSQSWaitTime, "SQS_WAIT_TIME must be between 0s and 20s"},
-		{positiveDurations(s.SQSVisibilityTimeout, s.SQSProcessTimeout, s.SQSAckTimeout, s.SQSRetryBase, s.SQSRetryMax),
-			"SQS visibility, process, ack and retry durations must be positive"},
+		{s.SQSVisibilityTimeout > 0, "SQS_VISIBILITY_TIMEOUT must be positive"},
+		{s.SQSProcessTimeout > 0, "SQS_PROCESS_TIMEOUT must be positive"},
+		{s.SQSAckTimeout > 0, "SQS_ACK_TIMEOUT must be positive"},
+		{s.SQSRetryBase > 0, "SQS_RETRY_BASE must be positive"},
+		{s.SQSRetryMax > 0, "SQS_RETRY_MAX must be positive"},
 		{budgetOK && s.SQSVisibilityTimeout > budget,
 			"SQS_VISIBILITY_TIMEOUT must exceed the whole receive batch budget: SQS_MAX_MESSAGES * (SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT)"},
 		{s.SQSRetryBase <= s.SQSRetryMax, "SQS_RETRY_BASE must not exceed SQS_RETRY_MAX"},

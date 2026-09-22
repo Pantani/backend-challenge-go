@@ -98,6 +98,34 @@ func TestLoadRejectsUnrepresentableAdapterValues(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsNonPositiveSQSValuesByEnvironmentName(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		key      string
+		duration bool
+	}{
+		{key: "SQS_CONSUMERS"},
+		{key: "SQS_VISIBILITY_TIMEOUT", duration: true},
+		{key: "SQS_PROCESS_TIMEOUT", duration: true},
+		{key: "SQS_ACK_TIMEOUT", duration: true},
+		{key: "SQS_RETRY_BASE", duration: true},
+		{key: "SQS_RETRY_MAX", duration: true},
+		{key: "SQS_MAX_RECEIVE_COUNT"},
+	}
+	for _, tt := range tests {
+		for _, value := range []string{"0", "-1"} {
+			if tt.duration {
+				value += "s"
+			}
+			t.Run(tt.key+"="+value, func(t *testing.T) {
+				t.Parallel()
+				_, err := config.LoadSQS(config.MapLookup(map[string]string{tt.key: value}))
+				require.ErrorContains(t, err, tt.key+" must be positive")
+			})
+		}
+	}
+}
+
 func TestLoadStartupTimeout(t *testing.T) {
 	t.Parallel()
 	c, err := config.Load(config.MapLookup(map[string]string{"STARTUP_TIMEOUT": "1ms"}))

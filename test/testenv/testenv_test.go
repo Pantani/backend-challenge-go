@@ -76,6 +76,14 @@ func TestRepoRootFailsOutsideModule(t *testing.T) {
 	require.ErrorContains(t, err, "go.mod not found")
 }
 
+func TestVarsProduceValidLifecycleConfiguration(t *testing.T) {
+	t.Parallel()
+	env := Env{DatabaseURL: "postgres://wallet:wallet@localhost:5432/wallet?sslmode=disable"}
+	cfg, err := env.Config(nil)
+	require.NoError(t, err)
+	require.Equal(t, 40*time.Second, cfg.ShutdownTimeout)
+}
+
 type failingContainer struct {
 	testcontainers.Container
 	err error
