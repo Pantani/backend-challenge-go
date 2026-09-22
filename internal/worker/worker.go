@@ -1,0 +1,88 @@
+// Package worker runs the background loops: the outbox relay and the
+// pending-reference resolver, under a supervisor with observable shutdown.
+package worker
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"sync"
+	"time"
+)
+
+// Group supervises background goroutines. Stop cancels them and waits until
+// every one returned or the deadline expires.
+type Group struct {
+	ctx     context.Context
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
+	logger  *slog.Logger
+	mu      sync.Mutex
+	running map[string]struct{}
+}
+
+// NewGroup creates a group whose goroutines live until Stop.
+func NewGroup(parent context.Context, logger *slog.Logger) *Group {
+	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
+	return &Group{ctx: ctx, cancel: cancel, logger: logger, running: map[string]struct{}{}}
+}
+
+// Go starts fn in a goroutine; fn must return when its context is done.
+func (g *Group) Go(name string, fn func(ctx context.Context)) {
+	g.wg.Add(1)
+	g.setRunning(name, true)
+	g.logger.Info("worker started", "worker", name)
+	go func() {
+		defer g.wg.Done()
+		defer g.logger.Info("worker stopped", "worker", name)
+		defer g.setRunning(name, false)
+		fn(g.ctx)
+	}()
+}
+
+func (g *Group) setRunning(name string, on bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if on {
+		g.running[name] = struct{}{}
+		return
+	}
+	delete(g.running, name)
+}
+
+// Running returns how many workers have not returned yet.
+func (g *Group) Running() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.running)
+}
+
+// Stop cancels the workers and waits for them within ctx.
+func (g *Group) Stop(ctx context.Context) error {
+	g.cancel()
+	done := make(chan struct{})
+	go func() {
+		g.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("%d workers still running: %w", g.Running(), ctx.Err())
+	}
+}
+
+// Loop calls tick immediately and then every interval until ctx is done.
+func Loop(ctx context.Context, interval time.Duration, tick func(ctx context.Context)) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		tick(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
