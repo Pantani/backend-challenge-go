@@ -123,9 +123,12 @@ func prepare(ctx context.Context) error {
 	if out, err := build.CombinedOutput(); err != nil {
 		return fmt.Errorf("build: %w: %s", err, out)
 	}
-	for _, args := range [][]string{{"migrate", "up"}, {"provision-queues"}} {
-		if out, err := command(ctx, args...).CombinedOutput(); err != nil {
-			return fmt.Errorf("%v: %w: %s", args, err, out)
+	// Migrations run as the schema owner; the instances use the runtime login.
+	migrate := command(ctx, "migrate", "up")
+	migrate.Env = append(migrate.Env, "DATABASE_URL="+env.OwnerDatabaseURL)
+	for _, cmd := range []*exec.Cmd{migrate, command(ctx, "provision-queues")} {
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("%v: %w: %s", cmd.Args[1:], err, out)
 		}
 	}
 	return connect(ctx)
