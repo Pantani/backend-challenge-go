@@ -6,13 +6,16 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/fx"
 	"go.uber.org/fx/fxtest"
 
 	sqsadapter "github.com/Pantani/backend-challenge-go/internal/adapter/sqs"
@@ -26,6 +29,20 @@ import (
 type blockingAPI struct{ sqsadapter.API }
 
 func (blockingAPI) ReceiveMessage(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+type blockingQueueAPI struct {
+	sqsadapter.API
+	once sync.Once
+	seen chan struct{}
+}
+
+func (a *blockingQueueAPI) GetQueueUrl( //nolint:revive // name imposed by the AWS SDK interface
+	ctx context.Context, _ *sqs.GetQueueUrlInput, _ ...func(*sqs.Options),
+) (*sqs.GetQueueUrlOutput, error) {
+	a.once.Do(func() { close(a.seen) })
 	<-ctx.Done()
 	return nil, ctx.Err()
 }
@@ -113,4 +130,65 @@ func TestRegistryHasRuntimeCollectors(t *testing.T) {
 	}
 	assert.Contains(t, names, "go_goroutines")
 	assert.Contains(t, names, "process_start_time_seconds")
+}
+
+func TestConstructionUsesStartupContext(t *testing.T) {
+	t.Run("queue resolution", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+		defer cancel()
+		api := &blockingQueueAPI{seen: make(chan struct{})}
+		app := New(ctx, testConfig(t), fx.Replace(fx.Annotate(api, fx.As(new(sqsadapter.API)))))
+
+		assert.ErrorIs(t, app.Err(), context.DeadlineExceeded)
+		assertClosed(t, api.seen)
+	})
+
+	t.Run("database ping", func(t *testing.T) {
+		listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, listener.Close()) })
+		accepted := make(chan struct{})
+		serveStalledPostgres(t, listener, accepted)
+
+		cfg := testConfig(t)
+		cfg.DatabaseURL = "postgres://u:p@" + listener.Addr().String() + "/db?sslmode=disable&connect_timeout=10"
+		ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+		defer cancel()
+		app := New(ctx, cfg, fx.Replace(fx.Annotate(fakeQueueAPI{}, fx.As(new(sqsadapter.API)))))
+		require.NoError(t, app.Err())
+
+		err = app.Start(ctx)
+		assert.ErrorIs(t, err, context.DeadlineExceeded)
+		assertClosed(t, accepted)
+	})
+}
+
+type fakeQueueAPI struct{ sqsadapter.API }
+
+func (fakeQueueAPI) GetQueueUrl( //nolint:revive // name imposed by the AWS SDK interface
+	_ context.Context, _ *sqs.GetQueueUrlInput, _ ...func(*sqs.Options),
+) (*sqs.GetQueueUrlOutput, error) {
+	return &sqs.GetQueueUrlOutput{QueueUrl: aws.String("http://sqs.local/queue")}, nil
+}
+
+func assertClosed(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	default:
+		require.Fail(t, "operation did not reach the blocking dependency")
+	}
+}
+
+func serveStalledPostgres(t *testing.T, listener net.Listener, accepted chan<- struct{}) {
+	t.Helper()
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		close(accepted)
+		_, _ = io.Copy(io.Discard, conn)
+	}()
 }

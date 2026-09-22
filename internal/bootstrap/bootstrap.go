@@ -37,21 +37,23 @@ import (
 	"github.com/Pantani/backend-challenge-go/internal/worker"
 )
 
-const (
-	// queueResolveTimeout bounds the queue URL lookups done while the graph
-	// is constructed.
-	queueResolveTimeout = 10 * time.Second
-	// pingTimeout is the start budget for the database ping and the listen.
-	pingTimeout = 10 * time.Second
-)
-
 // LogOutput is where JSON logs are written.
 type LogOutput struct{ io.Writer }
 
+// startupContext keeps the construction-only context distinct from request
+// contexts in the Fx graph. Constructors may use it while building the graph,
+// but runtime operations must receive their own contexts.
+type startupContext struct{ context.Context }
+
 // Options returns every module of the service for the given configuration.
+// It is intended for graph validation; New supplies the real startup context.
 func Options(cfg config.Config) fx.Option {
+	return options(startupContext{Context: context.Background()}, cfg)
+}
+
+func options(startCtx startupContext, cfg config.Config) fx.Option {
 	return fx.Options(
-		fx.Supply(cfg, LogOutput{os.Stdout}),
+		fx.Supply(cfg, startCtx, LogOutput{os.Stdout}),
 		fx.WithLogger(newFxLogger),
 		ObservabilityModule, PostgresModule, SQSModule, AppModule, AuthModule, WorkerModule, HTTPModule,
 	)
@@ -65,13 +67,13 @@ func newFxLogger(l *slog.Logger) fxevent.Logger {
 	return fl
 }
 
-// New builds the application. The start budget covers the database ping and
-// the listen (pingTimeout) plus the readiness timeout; the stop budget is the
-// configured shutdown timeout. extra options (fx.Replace, fx.Decorate,
-// fx.Populate) let tests adjust the graph.
-func New(cfg config.Config, extra ...fx.Option) *fx.App {
-	return fx.New(Options(cfg), fx.Options(extra...),
-		fx.StartTimeout(pingTimeout+cfg.ReadyTimeout), fx.StopTimeout(cfg.ShutdownTimeout))
+// New builds the application. ctx is the single startup budget for graph
+// construction and lifecycle start hooks; callers cancel it after Start
+// returns. The stop budget is the configured shutdown timeout. extra options
+// (fx.Replace, fx.Decorate, fx.Populate) let tests adjust the graph.
+func New(ctx context.Context, cfg config.Config, extra ...fx.Option) *fx.App {
+	return fx.New(options(startupContext{Context: ctx}, cfg), fx.Options(extra...),
+		fx.StartTimeout(cfg.StartupTimeout), fx.StopTimeout(cfg.ShutdownTimeout))
 }
 
 // ObservabilityModule provides logging and metrics.
@@ -104,8 +106,8 @@ var PostgresModule = fx.Module("postgres",
 )
 
 // newPool validates the database on start and closes the pool last.
-func newPool(lc fx.Lifecycle, cfg config.Config) (*pgxpool.Pool, error) {
-	pool, err := postgres.NewPool(context.Background(), postgres.Config{
+func newPool(lc fx.Lifecycle, startCtx startupContext, cfg config.Config) (*pgxpool.Pool, error) {
+	pool, err := postgres.NewPool(startCtx, postgres.Config{
 		URL: cfg.DatabaseURL, MaxConns: int32(cfg.DBMaxConns),
 		LockTimeout: cfg.DBLockTimeout, StatementTimeout: cfg.DBStatementTimeout,
 	})
@@ -147,15 +149,13 @@ func QueueNames(cfg config.SQS) sqsadapter.QueueNames {
 	return sqsadapter.QueueNames{Input: cfg.SQSInputQueue, DLQ: cfg.SQSDLQ, Events: cfg.SQSEventsQueue}
 }
 
-func newSQSClient(cfg config.Config) (sqsadapter.API, error) {
-	return NewSQSClient(context.Background(), cfg.SQS)
+func newSQSClient(startCtx startupContext, cfg config.Config) (sqsadapter.API, error) {
+	return NewSQSClient(startCtx, cfg.SQS)
 }
 
 // newQueues resolves the queue URLs; missing queues fail the start.
-func newQueues(api sqsadapter.API, cfg config.Config) (sqsadapter.Queues, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), queueResolveTimeout)
-	defer cancel()
-	return sqsadapter.ResolveQueues(ctx, api, QueueNames(cfg.SQS))
+func newQueues(startCtx startupContext, api sqsadapter.API, cfg config.Config) (sqsadapter.Queues, error) {
+	return sqsadapter.ResolveQueues(startCtx, api, QueueNames(cfg.SQS))
 }
 
 func newPublisher(api sqsadapter.API, q sqsadapter.Queues) *sqsadapter.Publisher {
@@ -216,8 +216,8 @@ func (d serviceDeps) deps() app.Deps {
 
 // AuthModule provides the OIDC token verifier.
 var AuthModule = fx.Module("auth",
-	fx.Provide(fx.Annotate(func(cfg config.Config) *auth.Verifier {
-		return auth.NewVerifier(context.Background(), auth.Config{Issuer: cfg.OIDCIssuer, JWKSURL: cfg.OIDCJWKSURL, Audience: cfg.OIDCAudience})
+	fx.Provide(fx.Annotate(func(startCtx startupContext, cfg config.Config) *auth.Verifier {
+		return auth.NewVerifier(startCtx, auth.Config{Issuer: cfg.OIDCIssuer, JWKSURL: cfg.OIDCJWKSURL, Audience: cfg.OIDCAudience})
 	}, fx.As(new(httpapi.TokenVerifier)))),
 )
 

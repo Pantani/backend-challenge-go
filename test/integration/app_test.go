@@ -36,28 +36,29 @@ func queueVars(names sqsadapter.QueueNames) map[string]string {
 	return map[string]string{"SQS_INPUT_QUEUE": names.Input, "SQS_DLQ": names.DLQ, "SQS_EVENTS_QUEUE": names.Events}
 }
 
-func newApp(t *testing.T, overrides map[string]string) (*fx.App, *bootstrap.Addr, *worker.Group) {
+func newApp(t *testing.T, overrides map[string]string) (*fx.App, *bootstrap.Addr, *worker.Group, context.Context, context.CancelFunc) {
 	t.Helper()
 	cfg, err := env.Config(overrides)
 	require.NoError(t, err)
 	var addr *bootstrap.Addr
 	var group *worker.Group
-	a := bootstrap.New(cfg, fx.Replace(bootstrap.LogOutput{Writer: io.Discard}), fx.Populate(&addr, &group))
-	return a, addr, group
+	startCtx, cancelStart := context.WithTimeout(context.Background(), cfg.StartupTimeout)
+	a := bootstrap.New(startCtx, cfg, fx.Replace(bootstrap.LogOutput{Writer: io.Discard}), fx.Populate(&addr, &group))
+	return a, addr, group, startCtx, cancelStart
 }
 
 func startApp(t *testing.T) runningApp {
 	t.Helper()
 	api, q, names := provisionQueues(t, 3)
-	a, addr, group := newApp(t, queueVars(names))
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	a, addr, group, startCtx, cancelStart := newApp(t, queueVars(names))
+	defer cancelStart()
 	t.Cleanup(func() {
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer stopCancel()
 		require.NoError(t, a.Stop(stopCtx))
 	})
-	require.NoError(t, a.Start(ctx))
+	require.NoError(t, a.Start(startCtx))
+	cancelStart()
 	return runningApp{http: client("http://" + addr.String()), group: group, app: a, api: api, queues: q}
 }
 
@@ -193,8 +194,10 @@ func TestApplicationConsumesSQSAndPublishesEvents(t *testing.T) {
 func TestApplicationStopsWorkersOnShutdown(t *testing.T) {
 	t.Parallel()
 	_, _, names := provisionQueues(t, 3)
-	a, addr, group := newApp(t, queueVars(names))
-	require.NoError(t, a.Start(context.Background()))
+	a, addr, group, startCtx, cancelStart := newApp(t, queueVars(names))
+	defer cancelStart()
+	require.NoError(t, a.Start(startCtx))
+	cancelStart()
 	require.Positive(t, group.Running())
 	base := "http://" + addr.String()
 
@@ -226,10 +229,9 @@ func TestApplicationRefusesToStartWithBrokenDependencies(t *testing.T) {
 		for k, v := range overrides {
 			vars[k] = v
 		}
-		a, _, _ := newApp(t, vars)
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		err := a.Start(ctx)
-		cancel()
+		a, _, _, startCtx, cancelStart := newApp(t, vars)
+		err := a.Start(startCtx)
+		cancelStart()
 		assert.Error(t, err, name)
 	}
 }
@@ -265,9 +267,12 @@ func TestFxStopsServerThenWorkersThenPool(t *testing.T) {
 	cfg, err := env.Config(queueVars(names))
 	require.NoError(t, err)
 	rec := &hookRecorder{}
-	a := bootstrap.New(cfg, fx.Replace(bootstrap.LogOutput{Writer: io.Discard}),
+	startCtx, cancelStart := context.WithTimeout(context.Background(), cfg.StartupTimeout)
+	defer cancelStart()
+	a := bootstrap.New(startCtx, cfg, fx.Replace(bootstrap.LogOutput{Writer: io.Discard}),
 		fx.WithLogger(func() fxevent.Logger { return rec }))
-	require.NoError(t, a.Start(context.Background()))
+	require.NoError(t, a.Start(startCtx))
+	cancelStart()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	require.NoError(t, a.Stop(ctx))
@@ -291,6 +296,7 @@ func TestFxGraphIsValid(t *testing.T) {
 func TestApplicationRefusesToStartWithBrokenAWSConfig(t *testing.T) {
 	t.Setenv("AWS_PROFILE", "profile-that-does-not-exist")
 	t.Setenv("AWS_CONFIG_FILE", t.TempDir()+"/missing")
-	a, _, _ := newApp(t, nil)
+	a, _, _, _, cancelStart := newApp(t, nil)
+	defer cancelStart()
 	require.Error(t, a.Err())
 }

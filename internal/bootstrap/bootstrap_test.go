@@ -109,7 +109,7 @@ func TestEveryConstructorRunsAndStartFailsAtThePing(t *testing.T) {
 	t.Parallel()
 	var g graph
 	rec := &recorder{}
-	a := bootstrap.New(testConfig(t, nil), fakeSQS(), fx.Populate(&g),
+	a := bootstrap.New(context.Background(), testConfig(t, nil), fakeSQS(), fx.Populate(&g),
 		fx.WithLogger(func() fxevent.Logger { return rec }))
 	require.NoError(t, a.Err(), "the whole graph is constructed without Docker")
 	assert.Equal(t, "http://sqs.local/wager-transactions.fifo", g.Queues.Input)
@@ -137,7 +137,7 @@ func TestConstructionErrorsSurfaceThroughErr(t *testing.T) {
 		"bad database":  {"DATABASE_URL": "postgres://%%%"},
 	}
 	for name, overrides := range cases {
-		a := bootstrap.New(testConfig(t, overrides), fakeSQS())
+		a := bootstrap.New(context.Background(), testConfig(t, overrides), fakeSQS())
 		require.Error(t, a.Err(), name)
 	}
 }
