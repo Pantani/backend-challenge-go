@@ -20,7 +20,7 @@ import (
 )
 
 // inCancelledTx runs op inside a unit of work whose context is cancelled
-// first, so the statement fails like it would on a dropped connection.
+// first, exercising cancellation independently from connection loss.
 func inCancelledTx(t *testing.T, op func(ctx context.Context, r app.Repositories) error) error {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -31,7 +31,7 @@ func inCancelledTx(t *testing.T, op func(ctx context.Context, r app.Repositories
 	})
 }
 
-func TestRepositoriesFailOnBrokenConnections(t *testing.T) {
+func TestRepositoriesFailOnCancelledContext(t *testing.T) {
 	t.Parallel()
 	s := newServices(t, defaultPolicy)
 	w := s.openWallet(t, "10.00")
@@ -83,7 +83,7 @@ func TestRepositoriesFailOnBrokenConnections(t *testing.T) {
 	}
 }
 
-func TestQueriesFailOnBrokenConnections(t *testing.T) {
+func TestQueriesFailOnCancelledContext(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -106,6 +106,29 @@ func TestQueriesFailOnBrokenConnections(t *testing.T) {
 	for name, call := range calls {
 		assert.Error(t, call(), name)
 	}
+}
+
+func TestTerminatedConnectionFailsAndPoolRecovers(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	disposable, err := postgres.NewPool(ctx, postgres.Config{URL: env.DatabaseURL, MaxConns: 1,
+		LockTimeout: time.Second, StatementTimeout: time.Second})
+	require.NoError(t, err)
+	t.Cleanup(disposable.Close)
+	conn, err := disposable.Acquire(ctx)
+	require.NoError(t, err)
+	t.Cleanup(conn.Release)
+	pid := conn.Conn().PgConn().PID()
+	var terminated bool
+	require.NoError(t, pool.QueryRow(ctx, `SELECT pg_terminate_backend($1, 5000)`, pid).Scan(&terminated))
+	require.True(t, terminated)
+	_, err = conn.Exec(ctx, `SELECT 1`)
+	require.Error(t, err, "a killed physical connection must not execute")
+	conn.Release()
+	require.NoError(t, postgres.Ping(ctx, disposable))
+	var replacementPID uint32
+	require.NoError(t, disposable.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&replacementPID))
+	require.NotEqual(t, pid, replacementPID, "the pool replaced the terminated backend")
 }
 
 func TestClosedPoolIsUnavailable(t *testing.T) {
@@ -214,7 +237,7 @@ func TestCorruptRowsAreReportedNotHidden(t *testing.T) {
 	t.Parallel()
 	w, tx := uuid.NewString(), uuid.NewString()
 	// XYZ passes the schema's format check but is not a supported currency.
-	require.Empty(t, sqlState(t,
+	require.NoError(t, execStatements(t,
 		`INSERT INTO wallets VALUES ('`+w+`', gen_random_uuid(), 'XYZ', 100, 1, now(), now())`,
 		insertTransaction(txRow{ID: tx, WalletID: w, Kind: "WIN", Status: "PROCESSED", Amount: 100, Currency: "XYZ", Provider: "corrupt", Result: ptr(100)}),
 		insertLedgerEntry(w, tx, "CREDIT", 100, 0, 100, "XYZ")))

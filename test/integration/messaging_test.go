@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -300,21 +302,24 @@ func queueDepth(api sqsadapter.API, url string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	var visible, hidden int
-	_, _ = fmt.Sscan(out.Attributes["ApproximateNumberOfMessages"], &visible)
-	_, _ = fmt.Sscan(out.Attributes["ApproximateNumberOfMessagesNotVisible"], &hidden)
-	return visible + hidden, nil
+	visible, err := strconv.Atoi(out.Attributes["ApproximateNumberOfMessages"])
+	if err != nil {
+		return 0, fmt.Errorf("queue visible count: %w", err)
+	}
+	hidden, err := strconv.Atoi(out.Attributes["ApproximateNumberOfMessagesNotVisible"])
+	return visible + hidden, err
 }
 
 func TestInvalidMessagesGoToTheDLQ(t *testing.T) {
 	t.Parallel()
 	s := newServices(t, defaultPolicy)
 	api, q, _ := provisionQueues(t, 5)
-	sendRaw(t, api, q, "bad-1", `{"messageId":"bad-1","type":"WagerTransactionRequested","data":{"money":{"amount":25.0}}}`, "g")
+	messageID := "bad-" + uuid.NewString()
+	sendRaw(t, api, q, uuid.NewString(), `{"messageId":"`+messageID+`","type":"WagerTransactionRequested","data":{"money":{"amount":25.0}}}`, uuid.NewString())
 	consumerFor(api, q, s.wagers).PollOnce(context.Background())
 	dead := drain(t, api, q.DLQ)
 	require.Len(t, dead, 1)
-	assert.Contains(t, dead[0], "bad-1")
+	assert.Contains(t, dead[0], messageID)
 	depth, err := queueDepth(api, q.Input)
 	require.NoError(t, err)
 	assert.Zero(t, depth)
@@ -348,7 +353,7 @@ func TestTransientFailuresAreRetriedThenRedrivenToTheDLQ(t *testing.T) {
 	// Once PostgreSQL is back, replaying the DLQ message processes it once.
 	dead := drain(t, api, q.DLQ)
 	require.Len(t, dead, 1)
-	sendRaw(t, api, q, "replayed", dead[0], w.ID().String())
+	sendRaw(t, api, q, uuid.NewString(), dead[0], w.ID().String())
 	consumerFor(api, q, s.wagers).PollOnce(context.Background())
 	assert.Equal(t, "99.00", s.balance(t, w))
 }
@@ -356,35 +361,39 @@ func TestTransientFailuresAreRetriedThenRedrivenToTheDLQ(t *testing.T) {
 func TestSameOperationThroughHTTPAndSQS(t *testing.T) {
 	t.Parallel()
 	s := newServices(t, defaultPolicy)
-	api, q, _ := provisionQueues(t, 5)
+	r := startApp(t)
 	w := s.openWallet(t, "100.00")
 	in := s.input(w, "provider-a", "cross", "BET", "10.00", "")
-
-	cmd, err := app.NewSubmitCommand(in)
-	require.NoError(t, err)
-	_, err = testenv.Parallel(2, func(i int) (struct{}, error) {
+	messageID := uuid.NewString()
+	responses, err := testenv.Parallel(2, func(i int) (testenv.Response, error) {
 		if i == 0 {
-			_, err := s.wagers.Submit(context.Background(), cmd)
-			return struct{}{}, err
+			return r.http.Submit(context.Background(), ids(w), "provider-a", in.ExternalTransactionID, "BET", "10.00", "")
 		}
-		env := testenv.Envelope(s.prefix+"cross-msg", in)
-		if err := testenv.SendMessage(context.Background(), api, q.Input, env); err != nil {
-			return struct{}{}, err
-		}
-		consumerFor(api, q, s.wagers).PollOnce(context.Background())
-		return struct{}{}, nil
+		return testenv.Response{}, testenv.SendMessage(context.Background(), r.api, r.queues.Input, testenv.Envelope(messageID, in))
 	})
 	require.NoError(t, err)
+	require.Contains(t, []int{http.StatusOK, http.StatusCreated}, responses[0].Status, responses[0].Body)
+	require.Equal(t, "PROCESSED", responses[0].Body["status"])
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
-		depth, err := queueDepth(api, q.Input)
+		depth, err := queueDepth(r.api, r.queues.Input)
 		if !assert.NoError(collect, err) {
 			return
 		}
 		assert.Zero(collect, depth)
 	}, 10*time.Second, 100*time.Millisecond)
-	assert.Equal(t, "90.00", s.balance(t, w))
-	assert.Equal(t, 1, s.debits(t, w))
-	assert.Equal(t, wager.StatusProcessed, s.tx(t, "provider-a", s.prefix+"cross").Status())
+	require.Equal(t, "90.00", s.balance(t, w))
+	require.Equal(t, 1, s.debits(t, w))
+	var transactions, completed int
+	require.NoError(t, pool.QueryRow(context.Background(), `SELECT count(*) FROM wager_transactions
+		WHERE provider_id = $1 AND external_transaction_id = $2`, in.ProviderID, in.ExternalTransactionID).Scan(&transactions))
+	require.Equal(t, 1, transactions)
+	require.NoError(t, pool.QueryRow(context.Background(), `SELECT count(*) FROM inbox_messages
+		WHERE message_id = $1 AND processed_at IS NOT NULL`, messageID).Scan(&completed))
+	require.Equal(t, 1, completed)
+	depth, err := queueDepth(r.api, r.queues.DLQ)
+	require.NoError(t, err)
+	require.Zero(t, depth)
+	require.Equal(t, wager.StatusProcessed, s.tx(t, "provider-a", s.prefix+"cross").Status())
 }
 
 func TestSQSSenderMustBeBoundToTheProvider(t *testing.T) {
