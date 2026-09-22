@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+export LC_ALL=C
 
 if [ "$#" -ne 3 ]; then
 	printf 'usage: %s REPORT MINIMUM EXPECTED_PACKAGES\n' "$0" >&2
@@ -9,6 +10,16 @@ fi
 report=$1
 minimum=$2
 expected=$3
+
+if [ ! -r "$expected" ]; then
+	printf 'expected package inventory is not readable: %s\n' "$expected" >&2
+	exit 1
+fi
+if [ ! -s "$expected" ]; then
+	printf 'expected package inventory is empty: %s\n' "$expected" >&2
+	exit 1
+fi
+
 actual=$(mktemp "${TMPDIR:-/tmp}/go-coverage-packages.XXXXXX")
 trap 'rm -f "$actual"' EXIT
 
