@@ -7,6 +7,7 @@ run:
     - e2e
 
 linters:
+  default: standard
   enable:
     - gocyclo
     - gocognit
@@ -33,6 +34,7 @@ linters:
     gosec:
       excludes:
         - G115 # int conversions are bounds-checked explicitly where needed
+        - G404 # math/rand is fine outside of crypto/security contexts
   exclusions:
     presets:
       - std-error-handling

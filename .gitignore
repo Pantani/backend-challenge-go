@@ -1,5 +1,16 @@
+# Build artifacts
+/bin/
+*.exe
+*.test
+
+# Coverage
 /coverage/
 coverage.out
-*.test
-/bin/
+coverage.html
+
+# Env files
 .env
+
+# IDE
+.idea/
+.vscode/
