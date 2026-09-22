@@ -97,7 +97,7 @@ func (k *keySet) refresh(ctx context.Context) ([]jose.JSONWebKey, error) {
 	if start {
 		k.startRefresh(context.WithoutCancel(ctx), state)
 	}
-	return k.waitRefresh(ctx)
+	return k.waitRefresh(ctx, state)
 }
 
 // startRefresh receives a cancellation-detached context: shared work must
@@ -132,12 +132,10 @@ func (k *keySet) cooldownError() error {
 	return fmt.Errorf("JWKS refresh cooldown active: %w", k.lastErr)
 }
 
-// waitRefresh waits for the current shared attempt or the caller's own
-// cancellation, whichever happens first.
-func (k *keySet) waitRefresh(ctx context.Context) ([]jose.JSONWebKey, error) {
-	k.mu.Lock()
-	state := k.current
-	k.mu.Unlock()
+// waitRefresh waits for the caller's prepared attempt or its own
+// cancellation, whichever happens first. The explicit state keeps a waiter
+// bound to its attempt even when a later refresh replaces k.current.
+func (k *keySet) waitRefresh(ctx context.Context, state *refreshState) ([]jose.JSONWebKey, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()

@@ -22,6 +22,33 @@ type verifyResult struct {
 	err     error
 }
 
+func TestKeySetWaiterRemainsBoundToPreparedRefresh(t *testing.T) {
+	t.Parallel()
+	set := &keySet{}
+	first, start, _, err := set.prepareRefresh()
+	require.NoError(t, err)
+	require.True(t, start)
+
+	set.mu.Lock()
+	first.keys = []jose.JSONWebKey{{KeyID: "first"}}
+	set.refreshing = false
+	set.lastAttempt = time.Time{}
+	close(first.done)
+	set.mu.Unlock()
+
+	second, start, _, err := set.prepareRefresh()
+	require.NoError(t, err)
+	require.True(t, start)
+	require.NotSame(t, first, second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	keys, err := set.waitRefresh(ctx, first)
+	require.NoError(t, err)
+	require.Len(t, keys, 1)
+	assert.Equal(t, "first", keys[0].KeyID)
+}
+
 func TestKeySetCallerCancellationDoesNotPoisonSharedRefresh(t *testing.T) {
 	t.Parallel()
 	key := newSigningKey(t)
