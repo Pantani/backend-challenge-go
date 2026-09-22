@@ -388,7 +388,9 @@ func TestOutboxOutcomeAndLeaseChecks(t *testing.T) {
 	assert.Equal(t, "23514", rejectedState(t, `UPDATE outbox_events SET published_at = now(), dead_lettered_at = now()`+where), "one outcome")
 	assert.Equal(t, "23514", rejectedState(t, `UPDATE outbox_events SET locked_by = 'relay'`+where), "lease owner without expiry")
 	assert.Equal(t, "23514", rejectedState(t, `UPDATE outbox_events SET locked_until = now()`+where), "lease expiry without owner")
-	require.NoError(t, execStatements(t, `UPDATE outbox_events SET locked_by = 'relay', locked_until = now()`+where), "a whole lease")
+	assert.Equal(t, "23514", rejectedState(t, `UPDATE outbox_events SET locked_by = 'relay', locked_until = now()`+where), "lease without claim token")
+	require.NoError(t, execStatements(t, `UPDATE outbox_events SET locked_by = 'relay', locked_until = now(), claim_id = gen_random_uuid()`+where),
+		"a whole claim triplet")
 	require.NoError(t, execStatements(t, `UPDATE outbox_events SET dead_lettered_at = now()`+where))
 }
 
@@ -448,7 +450,12 @@ func TestMigrationsApplyAndRevert(t *testing.T) {
 // A new migration needs an explicit data oracle, rather than silently passing.
 func TestMigrationUpgradesPreserveRepresentativeData(t *testing.T) {
 	t.Parallel()
-	checks := map[int]func(context.Context, *testing.T, *pgx.Conn){2: verifyMigrationTwo, 3: verifyMigrationThree, 4: verifyMigrationFour}
+	checks := map[int]func(context.Context, *testing.T, *pgx.Conn){
+		2: verifyMigrationTwo,
+		3: verifyMigrationThree,
+		4: verifyMigrationFour,
+		5: verifyMigrationFive,
+	}
 	for target := 2; target <= latestMigration(t); target++ {
 		t.Run(fmt.Sprintf("v%d_to_v%d", target-1, target), func(t *testing.T) {
 			check, ok := checks[target]
@@ -456,6 +463,34 @@ func TestMigrationUpgradesPreserveRepresentativeData(t *testing.T) {
 			upgradeBoundary(t, target, check)
 		})
 	}
+}
+
+func TestMigrationFiveDownInvalidatesActiveClaims(t *testing.T) {
+	t.Parallel()
+	url := databaseForTest(t, "migration_five_down")
+	m, err := postgres.NewMigrator(url)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, m.Close()) })
+	require.NoError(t, m.Up())
+
+	withConn(t, url, func(ctx context.Context, conn *pgx.Conn) error {
+		_, err := conn.Exec(ctx, `INSERT INTO outbox_events
+			(event_id, aggregate_type, aggregate_id, partition_key, event_type, payload, occurred_at, next_attempt_at,
+			 locked_by, locked_until, claim_id)
+			VALUES (gen_random_uuid(), 'Wallet', gen_random_uuid(), 'active-v5', 'Upgrade', '{}', now(), now(),
+			 'relay', now() + interval '1 hour', gen_random_uuid())`)
+		require.NoError(t, err)
+		require.NoError(t, m.Down(1))
+
+		var owner *string
+		var until *time.Time
+		require.NoError(t, conn.QueryRow(ctx, `SELECT locked_by, locked_until FROM outbox_events
+			WHERE partition_key = 'active-v5'`).Scan(&owner, &until))
+		require.Nil(t, owner, "downgrade invalidates the unverifiable claim owner")
+		require.Nil(t, until, "downgrade invalidates the unverifiable claim expiry")
+		assertSchemaObjects(ctx, t, conn, nil, nil, []string{"outbox_events_lease_pair"})
+		return nil
+	})
 }
 
 func TestMigrationStatementIsBounded(t *testing.T) {
@@ -529,13 +564,13 @@ func upgradeBoundary(t *testing.T, target int, check func(context.Context, *test
 	require.NoError(t, m.Migrate(uint(target-1)))
 	withConn(t, url, func(ctx context.Context, conn *pgx.Conn) error {
 		seedUpgradeRows(ctx, t, conn, target-1)
-		before := migrationSnapshot(ctx, t, conn)
+		before := migrationSnapshot(ctx, t, conn, target == 5)
 		require.NoError(t, m.Migrate(uint(target)))
 		version, dirty, err := m.Version()
 		require.NoError(t, err)
 		require.Equal(t, uint(target), version)
 		require.False(t, dirty)
-		require.Equal(t, before, migrationSnapshot(ctx, t, conn), "existing financial and delivery data survives")
+		require.Equal(t, before, migrationSnapshot(ctx, t, conn, target == 5), "existing financial and delivery data survives")
 		verifyResultCurrencies(ctx, t, conn)
 		check(ctx, t, conn)
 		return nil
@@ -601,14 +636,19 @@ func seedUpgradeOutbox(ctx context.Context, t *testing.T, conn *pgx.Conn, versio
 	}
 }
 
-func migrationSnapshot(ctx context.Context, t *testing.T, conn *pgx.Conn) map[string]string {
+func migrationSnapshot(ctx context.Context, t *testing.T, conn *pgx.Conn, ignoreClaims bool) map[string]string {
 	t.Helper()
 	snapshot := make(map[string]string)
+	excluded := "'result_currency' - 'claim_id'"
+	if ignoreClaims {
+		// Version 5 deliberately invalidates unverifiable legacy leases.
+		excluded += " - 'locked_by' - 'locked_until'"
+	}
 	for _, table := range []string{"wallets", "wager_transactions", "ledger_entries", "outbox_events"} {
 		var data string
 		// Added columns are checked independently; all original values must survive.
 		query := `SELECT jsonb_agg(row ORDER BY row::text)::text FROM
-			(SELECT (to_jsonb(t) - 'result_currency') || jsonb_build_object('dead_lettered_at', to_jsonb(t)->'dead_lettered_at') AS row FROM ` + table + ` t) q`
+			(SELECT (to_jsonb(t) - ` + excluded + `) || jsonb_build_object('dead_lettered_at', to_jsonb(t)->'dead_lettered_at') AS row FROM ` + table + ` t) q`
 		require.NoError(t, conn.QueryRow(ctx, query).Scan(&data))
 		snapshot[table] = data
 	}
@@ -669,6 +709,25 @@ func verifyMigrationFour(ctx context.Context, t *testing.T, conn *pgx.Conn) {
 	assertConnSQLState(ctx, t, conn, "23514", `UPDATE outbox_events SET dead_lettered_at = now() WHERE partition_key = 'published'`)
 	assertConnSQLState(ctx, t, conn, "23514", `UPDATE outbox_events SET locked_until = NULL WHERE partition_key = 'leased'`)
 	assertConnSQLState(ctx, t, conn, "23514", `UPDATE wager_transactions SET status = 'PENDING' WHERE status = 'PENDING_REFERENCE'`)
+}
+
+func verifyMigrationFive(ctx context.Context, t *testing.T, conn *pgx.Conn) {
+	t.Helper()
+	assertSchemaObjects(ctx, t, conn, nil, nil, []string{"outbox_events_lease_triplet"})
+	var owner *string
+	var until *time.Time
+	var claimID *uuid.UUID
+	require.NoError(t, conn.QueryRow(ctx, `SELECT locked_by, locked_until, claim_id FROM outbox_events
+		WHERE partition_key = 'leased'`).Scan(&owner, &until, &claimID))
+	require.Nil(t, owner, "upgrade invalidates the legacy claim owner")
+	require.Nil(t, until, "upgrade invalidates the legacy claim expiry")
+	require.Nil(t, claimID, "upgrade does not invent an unverifiable claim token")
+
+	assertConnSQLState(ctx, t, conn, "23514", `UPDATE outbox_events
+		SET locked_by = 'relay', locked_until = now() WHERE partition_key = 'leased'`)
+	_, err := conn.Exec(ctx, `UPDATE outbox_events SET locked_by = 'relay', locked_until = now(), claim_id = gen_random_uuid()
+		WHERE partition_key = 'leased'`)
+	require.NoError(t, err, "a complete claim triplet is valid")
 }
 
 func assertSchemaObjects(ctx context.Context, t *testing.T, conn *pgx.Conn, indexes, triggers, constraints []string) {

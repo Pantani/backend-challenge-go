@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/fx/fxtest"
@@ -32,8 +33,8 @@ func (blockingAPI) ReceiveMessage(ctx context.Context, _ *sqs.ReceiveMessageInpu
 // emptyStore has nothing to relay.
 type emptyStore struct{ app.OutboxStore }
 
-func (emptyStore) Claim(context.Context, string, time.Time, time.Duration, int) ([]app.OutboxMessage, error) {
-	return nil, nil
+func (emptyStore) Claim(context.Context, string, uuid.UUID, time.Time, time.Duration) (app.OutboxMessage, bool, error) {
+	return app.OutboxMessage{}, false, nil
 }
 func (emptyStore) OldestPending(context.Context) (time.Time, bool, error) {
 	return time.Time{}, false, nil

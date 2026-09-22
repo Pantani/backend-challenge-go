@@ -88,6 +88,7 @@ func TestQueriesFailOnCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	q, store := postgres.NewQueries(pool), postgres.NewOutboxStore(pool)
+	claimID := uuid.New()
 	calls := map[string]func() error{
 		"wallet":    func() error { _, err := q.GetWallet(ctx, uuid.New()); return err },
 		"ledger":    func() error { _, err := q.ListLedger(ctx, uuid.New(), 0, 1); return err },
@@ -95,10 +96,11 @@ func TestQueriesFailOnCancelledContext(t *testing.T) {
 		"tx ext":    func() error { _, err := q.GetTransactionByExternal(ctx, "p", "e"); return err },
 		"reconcile": func() error { _, err := q.Reconcile(ctx, uuid.New()); return err },
 		"due":       func() error { _, err := q.ListDuePending(ctx, time.Now(), 1); return err },
-		"claim":     func() error { _, err := store.Claim(ctx, "o", time.Now(), time.Second, 1); return err },
-		"published": func() error { _, err := store.MarkPublished(ctx, uuid.New(), "o", time.Now()); return err },
-		"failed":    func() error { return store.MarkFailed(ctx, uuid.New(), "o", time.Now(), "x") },
-		"dead":      func() error { return store.MarkDead(ctx, uuid.New(), "o", time.Now(), "x") },
+		"claim":     func() error { _, _, err := store.Claim(ctx, "o", claimID, time.Now(), time.Second); return err },
+		"attempt":   func() error { _, _, err := store.StartAttempt(ctx, uuid.New(), claimID); return err },
+		"published": func() error { _, err := store.MarkPublished(ctx, uuid.New(), claimID, time.Now()); return err },
+		"failed":    func() error { _, err := store.MarkFailed(ctx, uuid.New(), claimID, time.Now(), "x"); return err },
+		"dead":      func() error { _, err := store.MarkDead(ctx, uuid.New(), claimID, time.Now(), "x"); return err },
 		"oldest":    func() error { _, _, err := store.OldestPending(ctx); return err },
 		"ping":      func() error { return postgres.Ping(ctx, pool) },
 		"begin":     func() error { return postgres.NewUnitOfWork(pool).Do(ctx, nil) },
@@ -139,7 +141,7 @@ func TestClosedPoolIsUnavailable(t *testing.T) {
 	closed.Close()
 	_, err = postgres.NewQueries(closed).GetWallet(context.Background(), uuid.New())
 	require.ErrorIs(t, err, app.ErrUnavailable)
-	err = postgres.NewOutboxStore(closed).MarkDead(context.Background(), uuid.New(), "o", time.Now(), "x")
+	_, err = postgres.NewOutboxStore(closed).MarkDead(context.Background(), uuid.New(), uuid.New(), time.Now(), "x")
 	require.ErrorIs(t, err, app.ErrUnavailable)
 }
 

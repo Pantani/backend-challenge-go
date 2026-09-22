@@ -102,32 +102,46 @@ type fakeStore struct {
 	claimedOwner string
 	rounds       int
 	dead         []uuid.UUID
+	attempts     map[uuid.UUID]int
 }
 
-// Claim hands out the queued messages once, like a drained outbox.
-func (s *fakeStore) Claim(_ context.Context, owner string, _ time.Time, _ time.Duration, _ int) ([]app.OutboxMessage, error) {
+// Claim hands out the queued messages one at a time, like a drained outbox.
+func (s *fakeStore) Claim(_ context.Context, owner string, claimID uuid.UUID, _ time.Time, _ time.Duration) (app.OutboxMessage, bool, error) {
 	s.claimedOwner = owner
-	msgs := s.msgs
-	s.msgs = nil
 	s.rounds++
-	return msgs, s.claimErr
+	if s.claimErr != nil || len(s.msgs) == 0 {
+		return app.OutboxMessage{}, false, s.claimErr
+	}
+	m := s.msgs[0]
+	s.msgs = s.msgs[1:]
+	m.ClaimID = claimID
+	if s.attempts == nil {
+		s.attempts = make(map[uuid.UUID]int)
+	}
+	s.attempts[m.EventID] = m.Attempts
+	return m, true, nil
 }
 
-func (s *fakeStore) MarkPublished(_ context.Context, id uuid.UUID, _ string, _ time.Time) (bool, error) {
+func (s *fakeStore) StartAttempt(_ context.Context, id, _ uuid.UUID) (int, bool, error) {
+	s.attempts[id]++
+	return s.attempts[id], true, nil
+}
+
+func (s *fakeStore) MarkPublished(_ context.Context, id, _ uuid.UUID, _ time.Time) (bool, error) {
 	if s.markOK {
 		s.published = append(s.published, id)
 	}
 	return s.markOK, s.markErr
 }
 
-func (s *fakeStore) MarkFailed(_ context.Context, id uuid.UUID, _ string, next time.Time, _ string) error {
+func (s *fakeStore) MarkFailed(_ context.Context, id, _ uuid.UUID, next time.Time, _ string) (bool, error) {
 	s.failed[id] = next
-	return s.markFailErr
+	return true, s.markFailErr
 }
 
-func (s *fakeStore) MarkDead(_ context.Context, id uuid.UUID, _ string, _ time.Time, _ string) error {
+func (s *fakeStore) MarkDead(_ context.Context, id, _ uuid.UUID, _ time.Time, _ string) (bool, error) {
 	s.dead = append(s.dead, id)
-	return s.markFailErr
+	return true, s.markFailErr
 }
 
 func (s *fakeStore) OldestPending(context.Context) (time.Time, bool, error) {
@@ -159,7 +173,7 @@ func newRelay(store *fakeStore, pub fakePublisher, logs *testutil.SyncBuffer) *w
 func TestRelayPublishesAndRetries(t *testing.T) {
 	ok, bad := uuid.New(), uuid.New()
 	store := &fakeStore{markOK: true, failed: map[uuid.UUID]time.Time{}, msgs: []app.OutboxMessage{
-		{EventID: ok, Attempts: 1}, {EventID: bad, Attempts: 3},
+		{EventID: ok}, {EventID: bad, Attempts: 2},
 	}, hasOldest: true, oldest: t0.Add(-time.Second)}
 	logs := &testutil.SyncBuffer{}
 	newRelay(store, fakePublisher{fail: map[uuid.UUID]bool{bad: true}}, logs).Tick(context.Background())
@@ -172,7 +186,7 @@ func TestRelayPublishesAndRetries(t *testing.T) {
 
 func TestRelayBackoffIsCapped(t *testing.T) {
 	id := uuid.New()
-	store := &fakeStore{failed: map[uuid.UUID]time.Time{}, msgs: []app.OutboxMessage{{EventID: id, Attempts: 40}}}
+	store := &fakeStore{failed: map[uuid.UUID]time.Time{}, msgs: []app.OutboxMessage{{EventID: id, Attempts: 39}}}
 	newRelay(store, fakePublisher{fail: map[uuid.UUID]bool{id: true}}, &testutil.SyncBuffer{}).Tick(context.Background())
 	assert.Equal(t, t0.Add(30*time.Second), store.failed[id])
 }
@@ -227,10 +241,20 @@ func TestRelayRunsRoundsUntilDrainedOrCancelled(t *testing.T) {
 	assert.Equal(t, 1, cancelled.rounds, "shutdown stops further rounds")
 }
 
+func TestRelayPreservesBatchThroughputWithSingularClaims(t *testing.T) {
+	msgs := make([]app.OutboxMessage, 25)
+	for i := range msgs {
+		msgs[i].EventID = uuid.New()
+	}
+	store := &fakeStore{markOK: true, msgs: msgs}
+	newRelay(store, fakePublisher{}, &testutil.SyncBuffer{}).Tick(context.Background())
+	assert.Len(t, store.published, len(msgs), "singular claims still honor the configured batch across rounds")
+}
+
 func TestRelayDeadLettersPoisonEvents(t *testing.T) {
 	poison, last := uuid.New(), uuid.New()
 	store := &fakeStore{failed: map[uuid.UUID]time.Time{}, msgs: []app.OutboxMessage{
-		{EventID: poison, Attempts: 50}, {EventID: last, Attempts: 49},
+		{EventID: poison, Attempts: 49}, {EventID: last, Attempts: 48},
 	}}
 	logs := &testutil.SyncBuffer{}
 	newRelay(store, fakePublisher{fail: map[uuid.UUID]bool{poison: true, last: true}}, logs).Tick(context.Background())
@@ -242,7 +266,7 @@ func TestRelayDeadLettersPoisonEvents(t *testing.T) {
 
 func TestRelayMarkDeadFailureIsLogged(t *testing.T) {
 	poison := uuid.New()
-	store := &fakeStore{failed: map[uuid.UUID]time.Time{}, msgs: []app.OutboxMessage{{EventID: poison, Attempts: 50}}, markFailErr: errBoom}
+	store := &fakeStore{failed: map[uuid.UUID]time.Time{}, msgs: []app.OutboxMessage{{EventID: poison, Attempts: 49}}, markFailErr: errBoom}
 	logs := &testutil.SyncBuffer{}
 	newRelay(store, fakePublisher{fail: map[uuid.UUID]bool{poison: true}}, logs).Tick(context.Background())
 	assert.Equal(t, []uuid.UUID{poison}, store.dead, "MarkDead was attempted")

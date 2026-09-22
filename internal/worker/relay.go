@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/Pantani/backend-challenge-go/internal/app"
 )
 
@@ -74,35 +76,42 @@ const maxRounds = 20
 // Tick publishes claim rounds until nothing is due, then refreshes the lag.
 func (r *Relay) Tick(ctx context.Context) {
 	for range maxRounds {
-		if r.round(ctx) == 0 || ctx.Err() != nil {
+		if !r.round(ctx) || ctx.Err() != nil {
 			break
 		}
 	}
 	r.refreshLag(ctx)
 }
 
-// round claims and publishes one batch, returning how many were claimed.
+// round claims and publishes up to one configured batch. It reports whether
+// the batch was full and another round may have immediately due work.
 // It stops between publications once ctx is done: the publication in flight
 // completes, the remaining claims simply expire with their lease.
-func (r *Relay) round(ctx context.Context) int {
-	msgs, err := r.store.Claim(ctx, r.cfg.Owner, r.clock.Now(), r.cfg.Lease, r.cfg.BatchSize)
-	if err != nil {
-		r.logger.WarnContext(ctx, "outbox claim failed", "error", err)
-		return 0
-	}
-	for _, m := range msgs {
-		if ctx.Err() != nil {
-			break
+func (r *Relay) round(ctx context.Context) bool {
+	for range r.cfg.BatchSize {
+		m, ok, err := r.store.Claim(ctx, r.cfg.Owner, uuid.New(), r.clock.Now(), r.cfg.Lease)
+		if err != nil {
+			r.logger.WarnContext(ctx, "outbox claim failed", "error", err)
+			return false
+		}
+		if !ok || ctx.Err() != nil {
+			return false
 		}
 		r.publish(ctx, m)
 	}
-	return len(msgs)
+	return true
 }
 
 func (r *Relay) publish(parent context.Context, m app.OutboxMessage) {
 	ctx, cancel := Detach(parent, r.cfg.PublishTime)
 	defer cancel()
 	log := r.logger.With("eventId", m.EventID, "eventType", m.EventType, "aggregateId", m.AggregateID)
+	attempts, ok, err := r.store.StartAttempt(ctx, m.EventID, m.ClaimID)
+	if err != nil || !ok {
+		log.WarnContext(ctx, "outbox publication attempt not started; claim was lost", "error", err)
+		return
+	}
+	m.Attempts = attempts
 	if err := r.publisher.Publish(ctx, m); err != nil {
 		r.failed(ctx, log, m, err)
 		return
@@ -114,16 +123,19 @@ func (r *Relay) publish(parent context.Context, m app.OutboxMessage) {
 // exhausted its attempts so it stops blocking its wallet's later events.
 func (r *Relay) failed(ctx context.Context, log *slog.Logger, m app.OutboxMessage, cause error) {
 	r.metrics.OutboxFailure()
-	var err error
+	var (
+		ok  bool
+		err error
+	)
 	if m.Attempts >= r.cfg.MaxAttempts {
 		log.ErrorContext(ctx, "outbox event dead-lettered after exhausting its attempts", "attempts", m.Attempts, "error", cause)
 		r.metrics.OutboxDeadLettered()
-		err = r.store.MarkDead(ctx, m.EventID, r.cfg.Owner, r.clock.Now(), cause.Error())
+		ok, err = r.store.MarkDead(ctx, m.EventID, m.ClaimID, r.clock.Now(), cause.Error())
 	} else {
 		log.WarnContext(ctx, "outbox publish failed", "attempts", m.Attempts, "error", cause)
-		err = r.store.MarkFailed(ctx, m.EventID, r.cfg.Owner, r.clock.Now().Add(r.backoff(m.Attempts)), cause.Error())
+		ok, err = r.store.MarkFailed(ctx, m.EventID, m.ClaimID, r.clock.Now().Add(r.backoff(m.Attempts)), cause.Error())
 	}
-	if err != nil {
+	if err != nil || !ok {
 		log.WarnContext(ctx, "outbox failure not recorded; lease expiry will release it", "error", err)
 	}
 }
@@ -131,7 +143,7 @@ func (r *Relay) failed(ctx context.Context, log *slog.Logger, m app.OutboxMessag
 // confirm records the publication. If this fails (or the lease was lost) the
 // record is published again later with the same eventId.
 func (r *Relay) confirm(ctx context.Context, log *slog.Logger, m app.OutboxMessage) {
-	ok, err := r.store.MarkPublished(ctx, m.EventID, r.cfg.Owner, r.clock.Now())
+	ok, err := r.store.MarkPublished(ctx, m.EventID, m.ClaimID, r.clock.Now())
 	if err != nil || !ok {
 		log.WarnContext(ctx, "outbox publication not confirmed; it will be republished with the same eventId", "error", err)
 		return

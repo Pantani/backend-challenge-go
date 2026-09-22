@@ -126,7 +126,7 @@ func TestTwoPublishersShareTheOutbox(t *testing.T) {
 // forgetfulStore publishes but crashes before confirming.
 type forgetfulStore struct{ app.OutboxStore }
 
-func (forgetfulStore) MarkPublished(context.Context, uuid.UUID, string, time.Time) (bool, error) {
+func (forgetfulStore) MarkPublished(context.Context, uuid.UUID, uuid.UUID, time.Time) (bool, error) {
 	return false, fmt.Errorf("crash before confirming")
 }
 
@@ -1010,36 +1010,50 @@ func insertOutboxEvent(t *testing.T) uuid.UUID {
 	return id
 }
 
-func claimed(msgs []app.OutboxMessage, id uuid.UUID) bool {
-	return slices.ContainsFunc(msgs, func(m app.OutboxMessage) bool { return m.EventID == id })
-}
-
 // Not parallel: Claim leases the whole (shared) outbox.
-func TestOutboxLeaseExpiryHandsTheEventOver(t *testing.T) {
+func TestOutboxClaimTokenFencesReusedOwner(t *testing.T) {
 	ctx := context.Background()
 	store := postgres.NewOutboxStore(pool)
 	id := insertOutboxEvent(t)
+	owner := "shared-instance"
+	firstClaimID, secondClaimID := uuid.New(), uuid.New()
+	firstNow := time.Now()
 
-	first, err := store.Claim(ctx, "relay-a", time.Now(), time.Millisecond, 1000)
+	first, ok, err := store.Claim(ctx, owner, firstClaimID, firstNow, time.Minute)
 	require.NoError(t, err)
-	require.True(t, claimed(first, id), "the fresh event is the head of its partition")
-	held, err := store.Claim(ctx, "relay-b", time.Now().Add(-time.Hour), time.Millisecond, 1000)
-	require.NoError(t, err)
-	assert.False(t, claimed(held, id), "a live lease is not taken over")
+	require.True(t, ok, "the fresh event is the head of its partition")
+	require.Equal(t, id, first.EventID)
+	require.Equal(t, firstClaimID, first.ClaimID)
+	require.Zero(t, first.Attempts, "claiming alone is not a publication attempt")
 
-	time.Sleep(10 * time.Millisecond)
-	second, err := store.Claim(ctx, "relay-b", time.Now(), time.Millisecond, 1000)
+	_, held, err := store.Claim(ctx, owner, secondClaimID, firstNow.Add(30*time.Second), time.Minute)
 	require.NoError(t, err)
-	require.True(t, claimed(second, id), "an expired lease is taken over")
+	assert.False(t, held, "a live lease is not taken over")
 
-	ok, err := store.MarkPublished(ctx, id, "relay-a", time.Now())
+	second, ok, err := store.Claim(ctx, owner, secondClaimID, firstNow.Add(2*time.Minute), time.Minute)
 	require.NoError(t, err)
-	assert.False(t, ok, "the previous owner lost the lease")
-	require.NoError(t, store.MarkFailed(ctx, id, "relay-a", time.Now(), "late"), "a stale MarkFailed is a no-op, not an error")
-	ok, err = store.MarkPublished(ctx, id, "relay-b", time.Now())
+	require.True(t, ok, "an expired lease is taken over")
+	require.Equal(t, id, second.EventID)
+	require.Equal(t, secondClaimID, second.ClaimID)
+
+	ok, err = store.MarkPublished(ctx, id, firstClaimID, firstNow.Add(2*time.Minute))
 	require.NoError(t, err)
-	assert.True(t, ok, "the current owner confirms the publication")
-	ok, err = store.MarkPublished(ctx, id, "relay-b", time.Now())
+	assert.False(t, ok, "the previous claim cannot publish under the reused owner")
+	ok, err = store.MarkFailed(ctx, id, firstClaimID, firstNow.Add(3*time.Minute), "late failure")
+	require.NoError(t, err)
+	assert.False(t, ok, "the previous claim cannot reschedule under the reused owner")
+	ok, err = store.MarkDead(ctx, id, firstClaimID, firstNow.Add(3*time.Minute), "late dead letter")
+	require.NoError(t, err)
+	assert.False(t, ok, "the previous claim cannot dead-letter under the reused owner")
+
+	attempts, started, err := store.StartAttempt(ctx, id, secondClaimID)
+	require.NoError(t, err)
+	require.True(t, started)
+	require.Equal(t, 1, attempts)
+	ok, err = store.MarkPublished(ctx, id, secondClaimID, firstNow.Add(3*time.Minute))
+	require.NoError(t, err)
+	assert.True(t, ok, "the current claim confirms the publication")
+	ok, err = store.MarkPublished(ctx, id, secondClaimID, firstNow.Add(3*time.Minute))
 	require.NoError(t, err)
 	assert.False(t, ok, "a publication is confirmed once")
 }
