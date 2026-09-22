@@ -34,10 +34,14 @@ test-e2e:
 ## Combined coverage of unit + integration + e2e (binary built with -cover).
 coverage:
 	rm -rf $(COVERAGE_DIR) && mkdir -p $(COVERAGE_DIR)/unit $(COVERAGE_DIR)/integration $(COVERAGE_DIR)/e2e
-	go test -race -covermode=atomic -count=1 -coverpkg=./cmd/...,./internal/... ./cmd/... ./internal/... -args -test.gocoverdir=$(COVERAGE_DIR)/unit
-	go test -race -covermode=atomic -count=1 -tags integration -coverpkg=./cmd/...,./internal/... ./test/integration/... -args -test.gocoverdir=$(COVERAGE_DIR)/integration
+	scripts/test-check-go-coverage.sh
+	go list -tags integration,e2e -f '{{if .GoFiles}}{{.ImportPath}}{{end}}' ./cmd/... ./internal/... ./test/testenv | sed '/^$$/d' | sort -u > $(COVERAGE_DIR)/packages.expected
+	go test -race -covermode=atomic -count=1 -tags integration -coverpkg=./cmd/...,./internal/...,./test/testenv ./cmd/... ./internal/... ./test/testenv -args -test.gocoverdir=$(COVERAGE_DIR)/unit
+	go test -race -covermode=atomic -count=1 -tags integration -coverpkg=./cmd/...,./internal/...,./test/testenv ./test/integration/... -args -test.gocoverdir=$(COVERAGE_DIR)/integration
 	E2E_GOCOVERDIR=$(COVERAGE_DIR)/e2e go test -count=1 -timeout 15m -tags e2e ./test/e2e/...
 	go tool covdata textfmt -i=$(COVERAGE_DIR)/unit,$(COVERAGE_DIR)/integration,$(COVERAGE_DIR)/e2e -o $(COVERAGE_DIR)/coverage.out
+	go tool covdata percent -i=$(COVERAGE_DIR)/unit,$(COVERAGE_DIR)/integration,$(COVERAGE_DIR)/e2e > $(COVERAGE_DIR)/packages.txt
+	scripts/check-go-coverage.sh $(COVERAGE_DIR)/packages.txt 90 $(COVERAGE_DIR)/packages.expected
 	go tool cover -func=$(COVERAGE_DIR)/coverage.out | tail -1
 
 up:

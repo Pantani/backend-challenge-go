@@ -140,7 +140,7 @@ make lint              # gofmt/goimports, gocyclo ≤ 6, gocognit ≤ 8 (código
 make                   # vet + lint + testes unitários com -race
 ```
 
-O CI (`.github/workflows/ci.yml`) roda tidy, gofmt, vet com todas as tags, build, testes unitários com `-race`, `golangci-lint` v2 fixado e `govulncheck` em todo push/PR; os testes de integração e e2e (que precisam de Docker) rodam num job à parte, disparado manualmente (`workflow_dispatch`) ou toda noite.
+O CI (`.github/workflows/ci.yml`) roda tidy, gofmt, vet com todas as tags, build, testes unitários com `-race`, `golangci-lint` v2 fixado e `govulncheck` em todo push/PR. A cobertura autoritativa, que precisa de Docker, roda num job à parte disparado manualmente (`workflow_dispatch`) ou toda noite; a política de custo mantém esse job fora de pushes e PRs.
 
 ### Integração e e2e
 
@@ -159,11 +159,11 @@ make test-integration   # go test -race -count=1 -tags integration ./test/integr
 # (idempotência e pendências preservadas) e reconciliação de todas as carteiras ao final.
 make test-e2e           # go test -count=1 -timeout 15m -tags e2e ./test/e2e/...
 
-# Cobertura combinada unidade + integração + e2e (binário compilado com -cover).
+# Cobertura combinada unidade + integração + e2e, com mínimo de 90,0% por pacote.
 make coverage
 ```
 
-`make coverage` combina as três suítes (o e2e roda o binário real sem `-race`) e cobre `cmd/` e `internal/`; só os testes unitários (`go test ./...`) já cobrem 100% de `app`, `config`, `domain/*`, `observability` e `worker`, e o restante dos adaptadores, `bootstrap` e `cli` depende dos containers.
+`make coverage` é o gate autoritativo: combina as três suítes (o e2e roda o binário real sem `-race`), instrumenta todos os pacotes com código não-teste em `cmd/`, `internal/` e `test/testenv`, e falha se algum pacote estiver ausente, tiver saída de cobertura inválida ou ficar abaixo de 90,0% de statements. O relatório combinado fica em `coverage/coverage.out` e os percentuais por pacote em `coverage/packages.txt`. Só os testes unitários (`go test ./...`) já cobrem 100% de `app`, `config`, `domain/*`, `observability` e `worker`; o restante dos adaptadores, `bootstrap` e `cli` depende dos containers.
 
 ### Simulações de falha cobertas
 

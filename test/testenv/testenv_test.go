@@ -115,6 +115,22 @@ func TestClientHonorsHTTPTimeout(t *testing.T) {
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
+func TestClientReturnsMalformedResponseError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{`)
+	}))
+	defer srv.Close()
+
+	res, err := (Client{Base: srv.URL}).Do(t.Context(), http.MethodGet, "/", "", "", nil)
+	require.Equal(t, http.StatusOK, res.Status)
+	require.Error(t, err)
+}
+
+func TestClientRejectsInvalidMethod(t *testing.T) {
+	_, err := (Client{Base: "http://example.invalid"}).Do(t.Context(), "invalid\nmethod", "/", "", "", nil)
+	require.ErrorContains(t, err, "invalid method")
+}
+
 type deadlineTransport struct{}
 
 func (deadlineTransport) RoundTrip(req *http.Request) (*http.Response, error) {

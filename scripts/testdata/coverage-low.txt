@@ -1,0 +1,2 @@
+example.com/wallet/cmd/wallet coverage: 89.9% of statements
+example.com/wallet/internal/service coverage: 100.0% of statements
