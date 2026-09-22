@@ -82,10 +82,7 @@ func (f *e2eFixture) Close(ctx context.Context) error {
 }
 
 func (f *e2eFixture) closeResources(ctx context.Context) error {
-	var errs []error
-	for _, inst := range f.instances {
-		errs = append(errs, inst.stop(ctx))
-	}
+	errs := []error{f.closeProcesses(ctx)}
 	if f.pool != nil {
 		f.poolDone = make(chan struct{})
 		go func() {
@@ -98,6 +95,13 @@ func (f *e2eFixture) closeResources(ctx context.Context) error {
 		errs = append(errs, os.RemoveAll(f.tempDir))
 	}
 	return errors.Join(errs...)
+}
+
+func (f *e2eFixture) closeProcesses(ctx context.Context) error {
+	_, err := testenv.Parallel(len(f.instances), func(index int) (struct{}, error) {
+		return struct{}{}, f.instances[index].stop(ctx)
+	})
+	return err
 }
 
 // prepare builds the binary with coverage, migrates, provisions the queues
@@ -272,16 +276,17 @@ func get(ctx context.Context, url string) (int, error) {
 
 // kill simulates an abrupt crash and reaps the child before restart.
 func (i *instance) kill(ctx context.Context) error {
-	if err := i.processRun.kill(ctx); err != nil {
-		return err
-	}
+	killErr := i.processRun.kill(ctx)
 	err := waitDone(ctx, i.done)
 	i.stopped = err == nil
-	return err
+	return errors.Join(killErr, err)
 }
 
-// stop bounds every wait; the sole Wait owner keeps tracking a late reap.
+// stop reserves half the available deadline for forced termination and reap.
+// The 30-second cap allows the service's 15-second graceful shutdown budget.
 func (i *instance) stop(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	if i.stopped {
 		return nil
 	}
@@ -296,8 +301,11 @@ func (i *instance) stop(ctx context.Context) error {
 }
 
 func (i *instance) awaitStop(ctx context.Context) error {
-	if err := waitDone(ctx, i.done); err != nil {
-		return errors.Join(err, i.processRun.kill(ctx), waitDone(ctx, i.done))
+	deadline, _ := ctx.Deadline() // stop always supplies a bounded context.
+	graceful, cancel := context.WithTimeout(ctx, time.Until(deadline)/2)
+	defer cancel()
+	if err := waitDone(graceful, i.done); err != nil {
+		return errors.Join(fmt.Errorf("%s graceful shutdown: %w", i.name, err), i.kill(ctx))
 	}
 	i.stopped = true
 	return i.waitErr

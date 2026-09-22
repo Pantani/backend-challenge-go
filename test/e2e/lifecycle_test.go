@@ -195,24 +195,58 @@ func TestFixtureOwnsProcessBeforeReadinessFailure(t *testing.T) {
 }
 
 func TestProcessTimeoutKillsAndReapsChild(t *testing.T) {
+	assertForcedFixtureClose(t, 1)
+}
+
+func TestFixtureReapsMultipleForcedChildrenBeforeReturning(t *testing.T) {
+	assertForcedFixtureClose(t, 3)
+}
+
+func assertForcedFixtureClose(t *testing.T, count int) {
+	t.Helper()
 	f := &e2eFixture{}
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 		_ = f.Close(ctx) // The expected deadline failure is asserted below.
 	})
+	for range count {
+		startIgnoringTerm(t, f)
+	}
+	const budget = 500 * time.Millisecond
+	cleanup, cleanupCancel := context.WithTimeout(t.Context(), budget)
+	defer cleanupCancel()
+	started := time.Now()
+	err := f.Close(cleanup)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.NoError(t, cleanup.Err(), "forced stop must finish inside the total cleanup deadline")
+	require.Less(t, time.Since(started), budget)
+	for _, inst := range f.instances {
+		assertForcedChildReaped(t, inst)
+	}
+}
+
+func startIgnoringTerm(t *testing.T, f *e2eFixture) {
+	t.Helper()
 	i := &instance{name: "ignores-term"}
 	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
 	defer cancel()
 	err := i.startCommand(ctx, exec.CommandContext(context.WithoutCancel(ctx), "sh", "-c", "trap '' TERM; while :; do :; done"), f)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
-	cleanup, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 100*time.Millisecond)
-	defer cleanupCancel()
-	err = f.Close(cleanup)
-	require.ErrorIs(t, err, context.DeadlineExceeded)
-	reapCtx, reapCancel := context.WithTimeout(t.Context(), time.Second)
-	defer reapCancel()
-	require.NoError(t, waitDone(reapCtx, i.done), "the tracked Wait owner must finish after Kill")
+}
+
+func assertForcedChildReaped(t *testing.T, i *instance) {
+	t.Helper()
+	select {
+	case <-i.killDone:
+	default:
+		t.Fatal("Close returned before Kill executed")
+	}
+	select {
+	case <-i.done:
+	default:
+		t.Fatal("Close returned before its Wait owner reaped the child")
+	}
 	require.NotNil(t, i.cmd.ProcessState, "Wait must reap the process")
 	require.True(t, errors.Is(i.cmd.Process.Signal(syscall.Signal(0)), os.ErrProcessDone))
 }
