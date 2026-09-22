@@ -69,7 +69,7 @@ Todas têm padrão local, exceto `AWS_ENDPOINT_URL`, que vazio significa a AWS r
 | `INSTANCE_ID` | hostname | identifica o processo (dono dos leases da outbox e atributo `instance` dos logs) |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` ou `error` |
 | `DATABASE_URL` | `postgres://wallet:wallet@localhost:5432/wallet?sslmode=disable` | PostgreSQL. O padrão é o dono (para o `migrate`); o serviço deve usar `wallet_service` (ver [Papéis do banco](#papéis-do-banco)) |
-| `DB_MAX_CONNS` | `20` | máximo de conexões do pool |
+| `DB_MAX_CONNS` | `20` | máximo de conexões do pool (1 a 2147483647, o limite do `int32` do pgx) |
 | `DB_LOCK_TIMEOUT` / `DB_STATEMENT_TIMEOUT` | `5s` / `10s` | `lock_timeout` e `statement_timeout` de cada conexão |
 | `OIDC_ISSUER` | `http://localhost:8180/realms/wallet` | `iss` esperado nos tokens |
 | `OIDC_JWKS_URL` | `…/protocol/openid-connect/certs` | onde buscar as chaves (no compose, `http://keycloak:8080/…`) |
@@ -85,7 +85,7 @@ Todas têm padrão local, exceto `AWS_ENDPOINT_URL`, que vazio significa a AWS r
 | `STARTUP_TIMEOUT` | `25s` | prazo para construir e iniciar a aplicação |
 | `SHUTDOWN_TIMEOUT` | `61s` | prazo total do encerramento gracioso (consumidores param de buscar, HTTP drena, workers terminam, pool fecha) |
 
-A configuração é validada no início (`internal/config`) e todos os erros são reportados juntos: parse, `LOG_LEVEL`, valores não positivos, limites do SQS (`SQS_MAX_MESSAGES` 1–10, `SQS_WAIT_TIME` 0–20 s, visibilidade e `SQS_RETRY_MAX` ≤ 12 h), durações do SQS em segundos inteiros e timeouts do PostgreSQL em milissegundos inteiros (os adaptadores truncariam o resto, e `0` desliga o timeout no PostgreSQL), bases de backoff ≤ máximos e `SQS_SENDER_PROVIDERS`. Duas relações evitam processamento duplicado: `SQS_VISIBILITY_TIMEOUT > SQS_MAX_MESSAGES × (SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT)` e `OUTBOX_PUBLISH_TIMEOUT + OUTBOX_FINALIZE_TIMEOUT < OUTBOX_LEASE`.
+A configuração é validada no início (`internal/config`) e todos os erros são reportados juntos: parse, `LOG_LEVEL`, valores não positivos, limites do SQS (`SQS_MAX_MESSAGES` 1–10, `SQS_WAIT_TIME` 0–20 s, visibilidade, `SQS_PROCESS_TIMEOUT`, `SQS_ACK_TIMEOUT` e `SQS_RETRY_MAX` ≤ 12 h), durações do SQS em segundos inteiros e timeouts do PostgreSQL em milissegundos inteiros (os adaptadores truncariam o resto, e `0` desliga o timeout no PostgreSQL), bases de backoff ≤ máximos e `SQS_SENDER_PROVIDERS`. Duas relações evitam processamento duplicado: `SQS_VISIBILITY_TIMEOUT > SQS_MAX_MESSAGES × (SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT)` e `OUTBOX_PUBLISH_TIMEOUT + OUTBOX_FINALIZE_TIMEOUT < OUTBOX_LEASE`.
 
 ## Autenticação
 

@@ -117,6 +117,26 @@ func TestLoadRejectsDurationsTheAdaptersWouldTruncate(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsValuesThatWouldOverflow(t *testing.T) {
+	t.Parallel()
+	tests := map[string]map[string]string{
+		"DB_MAX_CONNS":        {"DB_MAX_CONNS": "4294967297"},
+		"SQS_PROCESS_TIMEOUT": {"SQS_PROCESS_TIMEOUT": "2562047h"},
+		"SQS_ACK_TIMEOUT":     {"SQS_ACK_TIMEOUT": "2562047h"},
+		"OUTBOX_LEASE": {
+			"OUTBOX_PUBLISH_TIMEOUT":  "2562047h",
+			"OUTBOX_FINALIZE_TIMEOUT": "2562047h",
+		},
+	}
+	for want, env := range tests {
+		t.Run(want, func(t *testing.T) {
+			t.Parallel()
+			_, err := config.Load(config.MapLookup(env))
+			require.ErrorContains(t, err, want)
+		})
+	}
+}
+
 func TestLoadRejectsMalformedSQSSenderProviders(t *testing.T) {
 	t.Parallel()
 	for _, value := range []string{"missing-equals", "=provider-a", "sender=", "sender=a | b", "sender=a||b"} {

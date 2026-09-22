@@ -6,6 +6,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"slices"
 	"strconv"
@@ -248,7 +249,7 @@ func check(rules []rule) error {
 func (d Database) validate() error {
 	return check([]rule{
 		{d.DatabaseURL != "", "DATABASE_URL is required"},
-		{d.DBMaxConns > 0, "DB_MAX_CONNS must be positive"},
+		{between(d.DBMaxConns, 1, math.MaxInt32), "DB_MAX_CONNS must be between 1 and 2147483647"},
 		// PostgreSQL receives these in whole milliseconds, and 0 disables them.
 		{d.DBLockTimeout > 0 && whole(d.DBLockTimeout, time.Millisecond), "DB_LOCK_TIMEOUT must be a positive whole number of milliseconds"},
 		{d.DBStatementTimeout > 0 && whole(d.DBStatementTimeout, time.Millisecond), "DB_STATEMENT_TIMEOUT must be a positive whole number of milliseconds"},
@@ -265,8 +266,8 @@ func (s SQS) validate() error {
 		// SQS takes wait, visibility and retry delays in whole seconds.
 		{whole(s.SQSWaitTime, time.Second) && s.SQSWaitTime >= 0 && s.SQSWaitTime <= maxSQSWaitTime, "SQS_WAIT_TIME must be whole seconds between 0s and 20s"},
 		{whole(s.SQSVisibilityTimeout, time.Second) && s.SQSVisibilityTimeout > 0 && s.SQSVisibilityTimeout <= maxSQSDuration, "SQS_VISIBILITY_TIMEOUT must be positive whole seconds, at most 12h"},
-		{s.SQSProcessTimeout > 0, "SQS_PROCESS_TIMEOUT must be positive"},
-		{s.SQSAckTimeout > 0, "SQS_ACK_TIMEOUT must be positive"},
+		{s.SQSProcessTimeout > 0 && s.SQSProcessTimeout <= maxSQSDuration, "SQS_PROCESS_TIMEOUT must be positive, at most 12h"},
+		{s.SQSAckTimeout > 0 && s.SQSAckTimeout <= maxSQSDuration, "SQS_ACK_TIMEOUT must be positive, at most 12h"},
 		{whole(s.SQSRetryBase, time.Second) && s.SQSRetryBase > 0, "SQS_RETRY_BASE must be positive whole seconds"},
 		{whole(s.SQSRetryMax, time.Second) && s.SQSRetryMax > 0 && s.SQSRetryMax <= maxSQSDuration, "SQS_RETRY_MAX must be positive whole seconds, at most 12h"},
 		{s.SQSRetryBase <= s.SQSRetryMax, "SQS_RETRY_BASE must not exceed SQS_RETRY_MAX"},
@@ -307,7 +308,7 @@ func (c Config) validate() error {
 		{c.OutboxRetryBase <= c.OutboxRetryMax, "OUTBOX_RETRY_BASE must not exceed OUTBOX_RETRY_MAX"},
 		// A claimed record must be published and finalized before its lease
 		// lets another instance claim it.
-		{c.OutboxPublishTimeout+c.OutboxFinalizeTimeout < c.OutboxLease,
+		{c.OutboxPublishTimeout < c.OutboxLease-c.OutboxFinalizeTimeout,
 			"OUTBOX_PUBLISH_TIMEOUT plus OUTBOX_FINALIZE_TIMEOUT must be lower than OUTBOX_LEASE"},
 	}))
 }

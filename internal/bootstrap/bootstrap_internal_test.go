@@ -130,11 +130,8 @@ func TestShutdownStopsConsumersBeforeHTTPDrains(t *testing.T) {
 		status <- resp.StatusCode
 	}()
 	<-entered
-	stopped := make(chan struct{})
-	go func() {
-		lc.RequireStop()
-		close(stopped)
-	}()
+	stopped := make(chan error, 1)
+	go func() { stopped <- lc.Stop(context.Background()) }()
 
 	require.Eventually(t, func() bool { return d.Consumers.Running() == 0 }, 5*time.Second, 5*time.Millisecond,
 		"the consumers stop while the request is in flight")
@@ -146,7 +143,7 @@ func TestShutdownStopsConsumersBeforeHTTPDrains(t *testing.T) {
 	}
 	close(release)
 	assert.Equal(t, http.StatusNoContent, <-status, "the in-flight request completes")
-	<-stopped
+	require.NoError(t, <-stopped)
 	assert.Zero(t, d.Group.Running())
 }
 

@@ -123,8 +123,16 @@ func newPool(lc fx.Lifecycle, startCtx startupContext, cfg config.Config) (*pgxp
 		return nil, err
 	}
 	lc.Append(fx.Hook{
-		OnStart: func(ctx context.Context) error { return postgres.Ping(ctx, pool) },
-		OnStop:  func(context.Context) error { pool.Close(); return nil },
+		// Fx only stops hooks whose start succeeded, so a failed ping closes
+		// the pool itself.
+		OnStart: func(ctx context.Context) error {
+			if err := postgres.Ping(ctx, pool); err != nil {
+				pool.Close()
+				return err
+			}
+			return nil
+		},
+		OnStop: func(context.Context) error { pool.Close(); return nil },
 	})
 	return pool, nil
 }

@@ -265,6 +265,9 @@ func (r *processRun) stop(ctx context.Context) error {
 	}
 	select {
 	case <-r.done:
+		if r.waitErr == nil {
+			return fmt.Errorf("%s exited unexpectedly before cleanup", r.name)
+		}
 		return r.waitErr
 	default:
 	}
