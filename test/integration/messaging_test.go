@@ -464,12 +464,12 @@ func waitUntil(deadline time.Time) {
 }
 
 const (
-	slowBatchOldVisibility    = 2 * time.Second
-	slowBatchVisibility       = 4 * time.Second
-	slowBatchProcessBudget    = 1940 * time.Millisecond
+	slowBatchOldVisibility    = 3 * time.Second
+	slowBatchVisibility       = 6 * time.Second
+	slowBatchProcessBudget    = 2900 * time.Millisecond
 	slowBatchAckBudget        = 50 * time.Millisecond
-	slowBatchHeadReleaseAfter = 1400 * time.Millisecond
-	slowBatchProbeUntilAfter  = 2400 * time.Millisecond
+	slowBatchHeadReleaseAfter = 2200 * time.Millisecond
+	slowBatchProbeUntilAfter  = 4600 * time.Millisecond
 	slowBatchMinHeadroom      = 400 * time.Millisecond
 )
 
@@ -486,8 +486,8 @@ func TestSlowBatchTimingBudget(t *testing.T) {
 
 func TestVisibilityProtectsSlowBatchFromSecondConsumer(t *testing.T) {
 	t.Parallel()
-	// The former per-message rule accepts 1.99s < 2s, while the complete
-	// two-message batch requires a visibility window strictly above 3.98s.
+	// The former per-message rule accepts 2.95s < 3s, while the complete
+	// two-message batch requires a visibility window strictly above 5.9s.
 	// The gates retain at least 400ms of processing headroom per item.
 	s := newServices(t, defaultPolicy)
 	api, q, _ := provisionQueues(t, 20)
