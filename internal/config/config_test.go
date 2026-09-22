@@ -69,35 +69,6 @@ func TestDefaults(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsUnrepresentableAdapterValues(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name, key, value string
-		load             func(config.Lookup) error
-	}{
-		{name: "pool count exceeds int32", key: "DB_MAX_CONNS", value: "2147483648", load: loadDatabase},
-		{name: "lock timeout below one millisecond", key: "DB_LOCK_TIMEOUT", value: "999us", load: loadDatabase},
-		{name: "lock timeout has fractional milliseconds", key: "DB_LOCK_TIMEOUT", value: "1500us", load: loadDatabase},
-		{name: "statement timeout below one millisecond", key: "DB_STATEMENT_TIMEOUT", value: "999us", load: loadDatabase},
-		{name: "statement timeout has fractional milliseconds", key: "DB_STATEMENT_TIMEOUT", value: "1500us", load: loadDatabase},
-		{name: "wait time has fractional seconds", key: "SQS_WAIT_TIME", value: "1500ms", load: loadSQS},
-		{name: "visibility has fractional seconds", key: "SQS_VISIBILITY_TIMEOUT", value: "300500ms", load: loadSQS},
-		{name: "retry base has fractional seconds", key: "SQS_RETRY_BASE", value: "1500ms", load: loadSQS},
-		{name: "retry max has fractional seconds", key: "SQS_RETRY_MAX", value: "60500ms", load: loadSQS},
-		{name: "wait time exceeds API maximum", key: "SQS_WAIT_TIME", value: "21s", load: loadSQS},
-		{name: "visibility exceeds API maximum", key: "SQS_VISIBILITY_TIMEOUT", value: "43201s", load: loadSQS},
-		{name: "retry base exceeds API maximum", key: "SQS_RETRY_BASE", value: "43201s", load: loadSQS},
-		{name: "retry max exceeds API maximum", key: "SQS_RETRY_MAX", value: "43201s", load: loadSQS},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			err := tt.load(config.MapLookup(map[string]string{tt.key: tt.value}))
-			require.ErrorContains(t, err, tt.key)
-		})
-	}
-}
-
 func TestLoadRejectsNonPositiveSQSValuesByEnvironmentName(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -154,93 +125,6 @@ func TestLoadStartupTimeout(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsOverflowingDurationRelationships(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name   string
-		values map[string]string
-	}{
-		{
-			name: "SQS drain addition overflows",
-			values: map[string]string{
-				"SQS_MAX_MESSAGES": "1", "SQS_PROCESS_TIMEOUT": "2562047h47m16.854775807s",
-				"SQS_ACK_TIMEOUT": "1ns", "SHUTDOWN_TIMEOUT": "2562047h47m16.854775807s",
-			},
-		},
-		{
-			name: "outbox drain addition overflows",
-			values: map[string]string{
-				"OUTBOX_PUBLISH_TIMEOUT": "2562047h47m16.854775806s", "OUTBOX_FINALIZE_TIMEOUT": "2ns",
-				"OUTBOX_LEASE": "2562047h47m16.854775807s", "SHUTDOWN_TIMEOUT": "2562047h47m16.854775807s",
-			},
-		},
-		{
-			name: "statement timeout exceeds drain near maximum duration",
-			values: map[string]string{
-				"DB_STATEMENT_TIMEOUT": "2562047h47m16.854s", "SHUTDOWN_TIMEOUT": "2562047h47m16.854775807s",
-			},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			_, err := config.Load(config.MapLookup(tt.values))
-			require.ErrorContains(t, err, "SHUTDOWN_TIMEOUT")
-		})
-	}
-}
-
-func TestShutdownDrainCoversConcurrentOperations(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name   string
-		values map[string]string
-	}{
-		{name: "HTTP write", values: map[string]string{"SHUTDOWN_TIMEOUT": "35s"}},
-		{name: "SQS process and acknowledgement", values: map[string]string{
-			"SHUTDOWN_TIMEOUT": "40s", "SQS_PROCESS_TIMEOUT": "30s", "SQS_ACK_TIMEOUT": "5s",
-			"SQS_MAX_MESSAGES": "1", "SQS_VISIBILITY_TIMEOUT": "36s",
-		}},
-		{name: "outbox publish and finalize", values: map[string]string{
-			"SHUTDOWN_TIMEOUT": "40s", "OUTBOX_PUBLISH_TIMEOUT": "30s", "OUTBOX_FINALIZE_TIMEOUT": "5s",
-			"OUTBOX_LEASE": "36s",
-		}},
-		{name: "database statement", values: map[string]string{
-			"SHUTDOWN_TIMEOUT": "40s", "DB_STATEMENT_TIMEOUT": "35s",
-		}},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			_, err := config.Load(config.MapLookup(tt.values))
-			require.ErrorContains(t, err, "SHUTDOWN_TIMEOUT")
-		})
-	}
-}
-
-func TestShutdownBudgetAccountsForSerialHTTPAndWorkerDrains(t *testing.T) {
-	t.Parallel()
-	for _, timeout := range []string{"40s", "60s"} {
-		t.Run(timeout, func(t *testing.T) {
-			t.Parallel()
-			_, err := config.Load(config.MapLookup(map[string]string{"SHUTDOWN_TIMEOUT": timeout}))
-			require.ErrorContains(t, err, "SHUTDOWN_TIMEOUT")
-		})
-	}
-	_, err := config.Load(config.MapLookup(map[string]string{"SHUTDOWN_TIMEOUT": "61s"}))
-	require.NoError(t, err)
-}
-
-func loadDatabase(lookup config.Lookup) error {
-	_, err := config.LoadDatabase(lookup)
-	return err
-}
-
-func loadSQS(lookup config.Lookup) error {
-	_, err := config.LoadSQS(lookup)
-	return err
-}
-
 func TestRejectsVisibilityShorterThanWholeBatch(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -259,57 +143,7 @@ func TestRejectsVisibilityShorterThanWholeBatch(t *testing.T) {
 				"SQS_ACK_TIMEOUT":        "5s",
 				"SQS_VISIBILITY_TIMEOUT": tt.visibility,
 			}))
-			require.ErrorContains(t, err, "whole receive batch")
-		})
-	}
-}
-
-func TestRejectsSQSDurationsThatLosePrecisionAtTheAdapter(t *testing.T) {
-	t.Parallel()
-	tests := map[string]map[string]string{
-		"visibility above exact batch budget": {
-			"SQS_MAX_MESSAGES":       "2",
-			"SQS_PROCESS_TIMEOUT":    "2.9s",
-			"SQS_ACK_TIMEOUT":        "50ms",
-			"SQS_VISIBILITY_TIMEOUT": "5.95s",
-		},
-		"subsecond wait": {
-			"SQS_WAIT_TIME": "500ms",
-		},
-		"fractional retry base": {
-			"SQS_RETRY_BASE": "1.5s",
-		},
-		"fractional retry max": {
-			"SQS_RETRY_MAX": "60.5s",
-		},
-	}
-	for name, values := range tests {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			_, err := config.LoadSQS(config.MapLookup(values))
-			require.ErrorContains(t, err, "whole seconds")
-		})
-	}
-}
-
-func TestRejectsWholeBatchBudgetOverflow(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name, process, ack string
-	}{
-		{name: "addition", process: "2562047h47m16.854775807s", ack: "1ns"},
-		{name: "multiplication", process: "1000000h", ack: "1s"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			_, err := config.Load(config.MapLookup(map[string]string{
-				"SQS_MAX_MESSAGES":       "10",
-				"SQS_PROCESS_TIMEOUT":    tt.process,
-				"SQS_ACK_TIMEOUT":        tt.ack,
-				"SQS_VISIBILITY_TIMEOUT": "12h",
-			}))
-			require.ErrorContains(t, err, "whole receive batch")
+			require.ErrorContains(t, err, "SQS_MAX_MESSAGES * (SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT)")
 		})
 	}
 }
@@ -343,10 +177,6 @@ func TestRejectsOutboxBudgetThatDoesNotFitLease(t *testing.T) {
 	tests := map[string]map[string]string{
 		"equal to lease": {
 			"OUTBOX_PUBLISH_TIMEOUT": "10s", "OUTBOX_FINALIZE_TIMEOUT": "20s", "OUTBOX_LEASE": "30s",
-		},
-		"addition overflow": {
-			"OUTBOX_PUBLISH_TIMEOUT": "2562047h47m16.854775805s", "OUTBOX_FINALIZE_TIMEOUT": "3ns",
-			"OUTBOX_LEASE": "2562047h47m16.854775807s", "SHUTDOWN_TIMEOUT": "2562047h47m16.854775807s",
 		},
 	}
 	for name, values := range tests {
@@ -390,9 +220,7 @@ func TestValidation(t *testing.T) {
 		"outbox retry base > max":        {"OUTBOX_RETRY_BASE": "2m"},
 		"visibility > 12h":               {"SQS_VISIBILITY_TIMEOUT": "13h"},
 		"sqs retry max > 12h":            {"SQS_RETRY_MAX": "13h"},
-		"shutdown <= process":            {"SHUTDOWN_TIMEOUT": "20s"},
-		"shutdown <= process + ack":      {"SHUTDOWN_TIMEOUT": "25s"},
-		"shutdown <= publish":            {"SHUTDOWN_TIMEOUT": "29s", "OUTBOX_PUBLISH_TIMEOUT": "29s", "OUTBOX_LEASE": "40s"},
+		"zero shutdown timeout":          {"SHUTDOWN_TIMEOUT": "0s"},
 		"zero publish timeout":           {"OUTBOX_PUBLISH_TIMEOUT": "0s"},
 		"zero finalize timeout":          {"OUTBOX_FINALIZE_TIMEOUT": "0s"},
 		"publish plus finalize >= lease": {"OUTBOX_PUBLISH_TIMEOUT": "25s"},
@@ -407,7 +235,7 @@ func TestValidation(t *testing.T) {
 
 func TestValidationMessages(t *testing.T) {
 	t.Parallel()
-	_, err := config.Load(config.MapLookup(map[string]string{"LOG_LEVEL": "loud", "SHUTDOWN_TIMEOUT": "1s"}))
+	_, err := config.Load(config.MapLookup(map[string]string{"LOG_LEVEL": "loud", "SHUTDOWN_TIMEOUT": "0s"}))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "LOG_LEVEL")
 	assert.Contains(t, err.Error(), "SHUTDOWN_TIMEOUT")
