@@ -46,17 +46,22 @@ func TestTokenCacheWaitHonorsCallerDeadline(t *testing.T) {
 	case <-time.After(150 * time.Millisecond):
 	}
 	releaseRequest()
-	require.NoError(t, <-first)
+	firstErr, waitErr := awaitValue(flowCtx, first)
+	require.NoError(t, waitErr, "first token refresh did not return")
+	require.NoError(t, firstErr)
 	if !returned {
-		err = <-second
+		err, waitErr = awaitValue(flowCtx, second)
+		require.NoError(t, waitErr, "cancelled cache waiter did not return")
 	}
 	require.True(t, returned, "waiting for the refresh lock must respect cancellation")
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
-func TestTokenCacheRefreshHonorsCallerDeadline(t *testing.T) {
+func TestTokenCacheRefreshHonorsCallerCancellation(t *testing.T) {
+	started := make(chan struct{})
 	cancelled := make(chan bool, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
 		_, _ = io.Copy(io.Discard, r.Body)
 		select {
 		case <-r.Context().Done():
@@ -69,9 +74,29 @@ func TestTokenCacheRefreshHonorsCallerDeadline(t *testing.T) {
 	defer srv.Close()
 	environment := &testenv.Env{KeycloakURL: srv.URL}
 	cache := newTokenCache(environment.Token)
-	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	_, err := cache.get(ctx, "provider-a")
+	result := make(chan error, 1)
+	go func() {
+		_, err := cache.get(ctx, "provider-a")
+		result <- err
+	}()
+	waitCtx, waitCancel := context.WithTimeout(t.Context(), time.Second)
+	defer waitCancel()
+	_, err := awaitValue(waitCtx, started)
+	require.NoError(t, err, "token handler did not start")
+	cancel()
+	requestErr, err := awaitValue(waitCtx, result)
+	require.NoError(t, err, "token refresh did not return after cancellation")
+	require.ErrorIs(t, requestErr, context.Canceled)
+	observed, err := awaitValue(waitCtx, cancelled)
+	require.NoError(t, err, "token handler did not report cancellation")
+	require.True(t, observed, "the refresh HTTP request must observe cancellation")
+}
+
+func TestAwaitValueHonorsDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+	defer cancel()
+	_, err := awaitValue(ctx, make(chan bool))
 	require.ErrorIs(t, err, context.DeadlineExceeded)
-	require.True(t, <-cancelled, "the refresh HTTP request must observe cancellation")
 }

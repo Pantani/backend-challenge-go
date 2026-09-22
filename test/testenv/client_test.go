@@ -10,13 +10,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestParallelReturnsWorkerErrorsInCallOrder(t *testing.T) {
+func TestParallelReturnsAllWorkerErrors(t *testing.T) {
+	first, second := errors.New("worker 0"), errors.New("worker 2")
 	values, err := Parallel(3, func(i int) (int, error) {
-		if i == 1 {
-			return 0, errors.New("worker 1")
+		switch i {
+		case 0:
+			return 0, first
+		case 2:
+			return 0, second
+		default:
+			return i, nil
 		}
-		return i, nil
 	})
-	assert.Equal(t, []int{0, 0, 2}, values)
-	require.ErrorContains(t, err, "worker 1")
+	assert.Equal(t, []int{0, 1, 0}, values)
+	require.ErrorIs(t, err, first)
+	require.ErrorIs(t, err, second)
 }

@@ -20,9 +20,11 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 )
 
-func TestClientDeadlineCancelsAuthenticationBeforeAPICall(t *testing.T) {
+func TestClientCancellationStopsAuthenticationBeforeAPICall(t *testing.T) {
+	started := make(chan struct{})
 	cancelled := make(chan bool, 1)
 	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
 		_, _ = io.Copy(io.Discard, r.Body)
 		select {
 		case <-r.Context().Done():
@@ -41,12 +43,25 @@ func TestClientDeadlineCancelsAuthenticationBeforeAPICall(t *testing.T) {
 	defer api.Close()
 	env := Env{KeycloakURL: tokenServer.URL}
 	c := Client{Base: api.URL, Token: env.Token}
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Millisecond)
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	_, err := c.Do(ctx, http.MethodGet, "/", "provider-a", "", nil)
-	require.ErrorIs(t, err, context.DeadlineExceeded)
-	require.True(t, <-cancelled, "authentication must observe the caller cancellation")
-	require.Zero(t, calls.Load(), "API request must not start after auth timeout")
+	result := make(chan error, 1)
+	go func() {
+		_, err := c.Do(ctx, http.MethodGet, "/", "provider-a", "", nil)
+		result <- err
+	}()
+	waitCtx, waitCancel := context.WithTimeout(t.Context(), time.Second)
+	defer waitCancel()
+	_, err := awaitValue(waitCtx, started)
+	require.NoError(t, err, "authentication handler did not start")
+	cancel()
+	requestErr, err := awaitValue(waitCtx, result)
+	require.NoError(t, err, "client did not return after cancellation")
+	require.ErrorIs(t, requestErr, context.Canceled)
+	observed, err := awaitValue(waitCtx, cancelled)
+	require.NoError(t, err, "authentication handler did not report cancellation")
+	require.True(t, observed, "authentication must observe the caller cancellation")
+	require.Zero(t, calls.Load(), "API request must not start after auth cancellation")
 }
 
 func TestRepoRootWalksUpToGoMod(t *testing.T) {
@@ -148,4 +163,21 @@ func TestClientSuppliesDefaultDeadline(t *testing.T) {
 	c := Client{Base: "http://example.invalid", HTTP: http.Client{Transport: deadlineTransport{}}}
 	_, err := c.Do(context.Background(), http.MethodGet, "/", "", "", nil)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+func TestAwaitValueHonorsDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+	defer cancel()
+	_, err := awaitValue(ctx, make(chan bool))
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+func awaitValue[T any](ctx context.Context, values <-chan T) (T, error) {
+	select {
+	case value := <-values:
+		return value, nil
+	case <-ctx.Done():
+		var zero T
+		return zero, ctx.Err()
+	}
 }

@@ -24,11 +24,11 @@ func newLifecycleFixture(t *testing.T) *e2eFixture {
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 	f := &e2eFixture{tempDir: filepath.Join(t.TempDir(), "owned")}
+	registerLifecycleCleanup(t, func(ctx context.Context) { _ = f.Close(ctx) })
 	require.NoError(t, os.Mkdir(f.tempDir, 0o700))
 	var err error
 	f.pool, err = pgxpool.New(ctx, env.DatabaseURL)
 	require.NoError(t, err)
-	t.Cleanup(f.pool.Close)
 	return f
 }
 
@@ -38,23 +38,36 @@ func startLifecycleProcess(t *testing.T, f *e2eFixture) *instance {
 		w.WriteHeader(http.StatusOK)
 	}))
 	t.Cleanup(srv.Close)
-	i := &instance{name: "lifecycle"}
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(context.WithoutCancel(ctx), "sh", "-c",
 		`trap 'exit 0' TERM; printf '{"msg":"http server listening","addr":"%s"}\n' "$1"; while :; do :; done`,
 		"child", strings.TrimPrefix(srv.URL, "http://"))
-	require.NoError(t, i.startCommand(ctx, cmd, f))
-	done := i.done
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		select {
-		case <-done:
-		case <-time.After(time.Second):
-			t.Error("probe process was not reaped")
+	i, err := startLifecycleCommand(t, f, cmd)
+	require.NoError(t, err)
+	return i
+}
+
+func startLifecycleCommand(t *testing.T, f *e2eFixture, cmd *exec.Cmd) (*instance, error) {
+	t.Helper()
+	i := &instance{name: "lifecycle"}
+	registerLifecycleCleanup(t, func(ctx context.Context) {
+		if i.processRun != nil {
+			_ = i.stop(ctx)
 		}
 	})
-	return i
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	return i, i.startCommand(ctx, cmd, f)
+}
+
+func registerLifecycleCleanup(t *testing.T, cleanup func(context.Context)) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		cleanup(ctx)
+	})
 }
 
 func TestFailedRestartPreservesOwnedCleanup(t *testing.T) {
@@ -137,7 +150,7 @@ func TestFixtureClosesPoolAndRemovesDirectory(t *testing.T) {
 	f := &e2eFixture{}
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	t.Cleanup(func() { require.NoError(t, f.Close(ctx)) })
+	registerLifecycleCleanup(t, func(ctx context.Context) { require.NoError(t, f.Close(ctx)) })
 	var err error
 	f.tempDir, err = os.MkdirTemp("", "wallet-e2e-cleanup")
 	require.NoError(t, err)
@@ -159,7 +172,7 @@ func TestGracefulStopReapsAndIsIdempotent(t *testing.T) {
 	f := &e2eFixture{}
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	t.Cleanup(func() { require.NoError(t, f.Close(ctx)) })
+	registerLifecycleCleanup(t, func(ctx context.Context) { require.NoError(t, f.Close(ctx)) })
 	i := &instance{name: "graceful"}
 	cmd := exec.CommandContext(context.WithoutCancel(ctx), "sh", "-c",
 		`trap 'exit 0' TERM; printf '{"msg":"http server listening","addr":"%s"}\n' "$1"; while :; do :; done`,
@@ -176,11 +189,7 @@ func TestFixtureOwnsProcessBeforeReadinessFailure(t *testing.T) {
 	dir, err := os.MkdirTemp("", "wallet-e2e-lifecycle")
 	require.NoError(t, err)
 	f.tempDir = dir
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		_ = f.Close(ctx) // The expected failure is asserted below.
-	})
+	registerLifecycleCleanup(t, func(ctx context.Context) { _ = f.Close(ctx) })
 	i := &instance{name: "early-exit"}
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
@@ -205,11 +214,7 @@ func TestFixtureReapsMultipleForcedChildrenBeforeReturning(t *testing.T) {
 func assertForcedFixtureClose(t *testing.T, count int) {
 	t.Helper()
 	f := &e2eFixture{}
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		_ = f.Close(ctx) // The expected deadline failure is asserted below.
-	})
+	registerLifecycleCleanup(t, func(ctx context.Context) { _ = f.Close(ctx) })
 	for range count {
 		startIgnoringTerm(t, f)
 	}
@@ -249,4 +254,37 @@ func assertForcedChildReaped(t *testing.T, i *instance) {
 	}
 	require.NotNil(t, i.cmd.ProcessState, "Wait must reap the process")
 	require.True(t, errors.Is(i.cmd.Process.Signal(syscall.Signal(0)), os.ErrProcessDone))
+}
+
+func TestLifecycleProcessCleanupSurvivesReadinessFailure(t *testing.T) {
+	f := &e2eFixture{}
+	var i *instance
+	require.True(t, t.Run("failed readiness", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		var err error
+		i, err = startLifecycleCommand(t, f, exec.CommandContext(context.WithoutCancel(ctx), "sh", "-c", "exit 7"))
+		require.ErrorContains(t, err, "exited before readiness")
+	}))
+	require.NotNil(t, i.cmd.ProcessState, "cleanup must reap a process whose readiness failed")
+}
+
+func TestLifecycleCleanupUsesFreshBoundedContext(t *testing.T) {
+	type observation struct {
+		err     error
+		bounded bool
+	}
+	observed := make(chan observation, 1)
+	require.True(t, t.Run("register cleanup", func(t *testing.T) {
+		registerLifecycleCleanup(t, func(ctx context.Context) {
+			_, bounded := ctx.Deadline()
+			observed <- observation{err: ctx.Err(), bounded: bounded}
+		})
+	}))
+	waitCtx, waitCancel := context.WithTimeout(t.Context(), time.Second)
+	defer waitCancel()
+	got, err := awaitValue(waitCtx, observed)
+	require.NoError(t, err, "registered lifecycle cleanup did not run")
+	require.NoError(t, got.err, "cleanup inherited a cancelled test context")
+	require.True(t, got.bounded, "cleanup context must have a deadline")
 }

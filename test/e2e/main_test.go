@@ -338,6 +338,16 @@ func waitDone(ctx context.Context, done <-chan struct{}) error {
 	}
 }
 
+func awaitValue[T any](ctx context.Context, values <-chan T) (T, error) {
+	select {
+	case value := <-values:
+		return value, nil
+	case <-ctx.Done():
+		var zero T
+		return zero, ctx.Err()
+	}
+}
+
 func processSignalError(err error) error {
 	if errors.Is(err, os.ErrProcessDone) {
 		return nil

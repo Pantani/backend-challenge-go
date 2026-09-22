@@ -3,14 +3,22 @@ set -eu
 export LC_ALL=C
 
 if [ "$#" -ne 3 ]; then
-	printf 'usage: %s REPORT MINIMUM EXPECTED_PACKAGES\n' "$0" >&2
+	printf 'usage: %s PROFILE MINIMUM EXPECTED_PACKAGES\n' "$0" >&2
 	exit 2
 fi
 
-report=$1
+profile=$1
 minimum=$2
 expected=$3
 
+if [ ! -r "$profile" ]; then
+	printf 'coverage profile is not readable: %s\n' "$profile" >&2
+	exit 1
+fi
+if [ ! -s "$profile" ]; then
+	printf 'coverage profile is empty: %s\n' "$profile" >&2
+	exit 1
+fi
 if [ ! -r "$expected" ]; then
 	printf 'expected package inventory is not readable: %s\n' "$expected" >&2
 	exit 1
@@ -29,49 +37,79 @@ BEGIN {
     printf "invalid minimum coverage: %s\n", minimum > "/dev/stderr"
     exit 1
   }
+  minimumPartCount=split(minimum, minimumParts, ".")
+  minimumScale=1
+  if (minimumPartCount == 2) {
+    for (i=1; i <= length(minimumParts[2]); i++) minimumScale *= 10
+  }
+  minimumNumerator=(minimumParts[1] * minimumScale) + minimumParts[2]
 }
-NF {
-  if (NF != 5 || $2 != "coverage:" || $4 != "of" || $5 != "statements") {
+NR == 1 {
+  if ($0 !~ /^mode: (set|count|atomic)$/) {
+    printf "invalid coverage mode: %s\n", $0 > "/dev/stderr"
+    failed=1
+  }
+  next
+}
+{
+  line=$0
+  if (!match(line, / [0-9]+ [0-9]+$/)) {
     printf "malformed coverage row: %s\n", $0 > "/dev/stderr"
     failed=1
     next
   }
 
+  location=substr(line, 1, RSTART - 1)
+  counters=substr(line, RSTART + 1)
+  split(counters, fields, " ")
+  statements=fields[1] + 0
+  count=fields[2] + 0
+  if (location !~ /:[0-9]+[.][0-9]+,[0-9]+[.][0-9]+$/) {
+    printf "malformed coverage row: %s\n", $0 > "/dev/stderr"
+    failed=1
+    next
+  }
+
+  file=location
+  sub(/:[0-9]+[.][0-9]+,[0-9]+[.][0-9]+$/, "", file)
+  package=file
+  if (!sub(/\/[^\/]+$/, "", package)) {
+    printf "coverage row has no package path: %s\n", $0 > "/dev/stderr"
+    failed=1
+    next
+  }
+  if (seenBlock[location]++) {
+    printf "duplicate coverage block: %s\n", location > "/dev/stderr"
+    failed=1
+    next
+  }
+
   found=1
-  package=$1
-  percent=$3
-  if (percent !~ /^[0-9]+([.][0-9]+)?%$/) {
-    printf "invalid coverage percentage: %s\n", $3 > "/dev/stderr"
-    failed=1
-    next
-  }
-
-  sub(/%$/, "", percent)
-  if (percent + 0 > 100) {
-    printf "invalid coverage percentage: %s\n", $3 > "/dev/stderr"
-    failed=1
-    next
-  }
-  if (seen[package]++) {
-    printf "duplicate coverage: %s\n", package > "/dev/stderr"
-    failed=1
-    next
-  }
-
-  print package
-  if ((percent + 0) < minimum) {
-    printf "%s coverage %.1f%% is below %.1f%%\n", package, percent, minimum > "/dev/stderr"
-    failed=1
-  }
+  totals[package] += statements
+  if (count > 0) covered[package] += statements
 }
 END {
+  if (failed) exit 1
   if (!found) {
-    print "coverage report contains no package rows" > "/dev/stderr"
-    failed=1
+    print "coverage profile contains no package rows" > "/dev/stderr"
+    exit 1
+  }
+  for (package in totals) {
+    total=totals[package]
+    if (total <= 0) {
+      printf "%s coverage profile contains no statements\n", package > "/dev/stderr"
+      failed=1
+      continue
+    }
+    print package
+    if ((covered[package] * 100 * minimumScale) < (total * minimumNumerator)) {
+      printf "%s coverage %.1f%% (%d/%d statements) is below %.1f%%\n", package, 100 * covered[package] / total, covered[package], total, minimum > "/dev/stderr"
+      failed=1
+    }
   }
   if (failed) exit 1
 }
-' "$report" >"$actual"
+' "$profile" >"$actual"
 sort -u -o "$actual" "$actual"
 
 missing=$(comm -23 "$expected" "$actual")
