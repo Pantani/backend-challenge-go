@@ -2,6 +2,7 @@ package sqs
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -142,7 +143,7 @@ func (c *Consumer) PollOnce(ctx context.Context) {
 		VisibilityTimeout:   int32(c.cfg.VisibilityTimeout.Seconds()),
 		MessageSystemAttributeNames: []types.MessageSystemAttributeName{
 			types.MessageSystemAttributeNameApproximateReceiveCount, types.MessageSystemAttributeNameSenderId,
-			types.MessageSystemAttributeNameMessageGroupId,
+			types.MessageSystemAttributeNameMessageGroupId, types.MessageSystemAttributeNameMessageDeduplicationId,
 		},
 	})
 	if err != nil {
@@ -225,8 +226,21 @@ func (c *Consumer) decode(m types.Message) (app.InboundMessage, error) {
 	if err != nil {
 		return app.InboundMessage{}, err
 	}
+	if err := validateFIFOIdentity(m, msg); err != nil {
+		return app.InboundMessage{}, err
+	}
 	sender := m.Attributes[string(types.MessageSystemAttributeNameSenderId)]
 	return msg, c.cfg.Senders.Authorize(sender, msg.Command.ProviderID)
+}
+
+func validateFIFOIdentity(m types.Message, msg app.InboundMessage) error {
+	if groupID(m) != msg.Command.WalletID.String() {
+		return fmt.Errorf("%w: MessageGroupId must equal walletId", ErrInvalidMessage)
+	}
+	if dedupID(m) != msg.MessageID {
+		return fmt.Errorf("%w: MessageDeduplicationId must equal messageId", ErrInvalidMessage)
+	}
+	return nil
 }
 
 // ack deletes a handled message within the ack budget.
@@ -281,6 +295,10 @@ func receiveCount(m types.Message) int {
 
 func groupID(m types.Message) string {
 	return m.Attributes[string(types.MessageSystemAttributeNameMessageGroupId)]
+}
+
+func dedupID(m types.Message) string {
+	return m.Attributes[string(types.MessageSystemAttributeNameMessageDeduplicationId)]
 }
 
 func (c *Consumer) changeVisibility(ctx context.Context, m types.Message, d time.Duration) {

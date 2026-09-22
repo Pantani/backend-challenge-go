@@ -3,6 +3,7 @@ package sqs_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -29,11 +30,27 @@ func TestMain(m *testing.M) { goleak.VerifyTestMain(m) }
 
 var errBoom = errors.New("boom")
 
+const (
+	testWalletID = "0192f291-27dd-7d3f-8071-5f8685deef37"
+	testWalletA  = "0192f291-27dd-7d3f-8071-5f8685deef38"
+	testWalletB  = "0192f291-27dd-7d3f-8071-5f8685deef39"
+)
+
 func body(messageID, amount string) string {
-	return fmt.Sprintf(`{"messageId":%q,"type":"WagerTransactionRequested","occurredAt":"2026-09-08T12:00:00.000Z",
+	return bodyAt(messageID, "2026-09-08T12:00:00.000Z", amount, testWalletID)
+}
+
+func bodyAt(messageID, occurredAt, amount, walletID string) string {
+	return fmt.Sprintf(`{"messageId":%s,"type":"WagerTransactionRequested","occurredAt":%s,
 "data":{"providerId":"provider-a","externalTransactionId":"t-1","idempotencyKey":"provider-a:t-1",
-"playerId":"0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1","walletId":"0192f291-27dd-7d3f-8071-5f8685deef37",
-"roundId":"round-987","gameId":"fortune-chimp","kind":"BET","money":{"amount":%q,"currency":"BRL"}}}`, messageID, amount)
+"playerId":"0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1","walletId":%s,
+"roundId":"round-987","gameId":"fortune-chimp","kind":"BET","money":{"amount":%s,"currency":"BRL"}}}`,
+		jsonString(messageID), jsonString(occurredAt), jsonString(walletID), jsonString(amount))
+}
+
+func jsonString(value string) string {
+	encoded, _ := json.Marshal(value)
+	return string(encoded)
 }
 
 func TestDecodeMessage(t *testing.T) {
@@ -120,6 +137,38 @@ func TestDecodeMessageInvalid(t *testing.T) {
 	}
 }
 
+func TestDecodeMessageRejectsInvalidEnvelopeMetadata(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		messageID  string
+		occurredAt string
+		want       string
+	}{
+		{name: "blank id", messageID: " ", occurredAt: "2026-09-22T12:00:00Z", want: "invalid messageId"},
+		{name: "oversized id", messageID: strings.Repeat("x", 129), occurredAt: "2026-09-22T12:00:00Z", want: "invalid messageId"},
+		{name: "non-printable id", messageID: "message-\x7f", occurredAt: "2026-09-22T12:00:00Z", want: "invalid messageId"},
+		{name: "missing time", messageID: "message-1", want: "invalid occurredAt"},
+		{name: "invalid time", messageID: "message-1", occurredAt: "yesterday", want: "invalid occurredAt"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := sqsadapter.DecodeMessage("consumer", bodyAt(tt.messageID, tt.occurredAt, "1.00", testWalletID))
+			require.ErrorIs(t, err, sqsadapter.ErrInvalidMessage)
+			assert.ErrorContains(t, err, tt.want)
+		})
+	}
+}
+
+func TestDecodeMessagePreservesMessageID(t *testing.T) {
+	t.Parallel()
+	const messageID = " message-1 "
+	msg, err := sqsadapter.DecodeMessage("consumer", bodyAt(messageID, "2026-09-22T12:00:00Z", "1.00", testWalletID))
+	require.NoError(t, err)
+	assert.Equal(t, messageID, msg.MessageID)
+}
+
 // fakeProcessor returns its results in order (nil once they run out). hook,
 // when set, runs before each call with the processing context and may
 // override the result.
@@ -158,18 +207,31 @@ func sampleTx() *wager.Transaction {
 }
 
 func message(id, bodyText, receiveCount string) types.Message {
-	return groupMessage(id, bodyText, receiveCount, "group-"+id)
+	return groupMessage(id, bodyText, receiveCount, testWalletID)
 }
 
 func groupMessage(id, bodyText, receiveCount, group string) types.Message {
+	return fifoMessage(id, bodyText, receiveCount, group, envelopeMessageID(bodyText))
+}
+
+func fifoMessage(id, bodyText, receiveCount, group, dedup string) types.Message {
 	return types.Message{
 		MessageId: aws.String(id), ReceiptHandle: aws.String("rh-" + id), Body: aws.String(bodyText),
 		Attributes: map[string]string{
 			string(types.MessageSystemAttributeNameApproximateReceiveCount): receiveCount,
 			string(types.MessageSystemAttributeNameSenderId):                "AIDA-PROVIDER-A",
 			string(types.MessageSystemAttributeNameMessageGroupId):          group,
+			string(types.MessageSystemAttributeNameMessageDeduplicationId):  dedup,
 		},
 	}
+}
+
+func envelopeMessageID(bodyText string) string {
+	var env struct {
+		MessageID string `json:"messageId"`
+	}
+	_ = json.Unmarshal([]byte(bodyText), &env)
+	return env.MessageID
 }
 
 type consumerFixture struct {
@@ -218,7 +280,8 @@ func TestConsumerAcksProcessedAndDuplicateMessages(t *testing.T) {
 func TestConsumerRetriesTransientFailuresWithBackoff(t *testing.T) {
 	t.Parallel()
 	f := newConsumer(t, &fakeProcessor{results: []error{app.ErrUnavailable, app.ErrConflict}},
-		message("a", body("m-a", "1.00"), "1"), message("b", body("m-b", "1.00"), "9"))
+		groupMessage("a", bodyAt("m-a", "2026-09-08T12:00:00Z", "1.00", testWalletA), "1", testWalletA),
+		groupMessage("b", bodyAt("m-b", "2026-09-08T12:00:00Z", "1.00", testWalletB), "9", testWalletB))
 	f.c.PollOnce(context.Background())
 	assert.Empty(t, f.api.deleted, "never deleted before a durable commit")
 	assert.Equal(t, map[string]int32{"rh-a": 2, "rh-b": 10}, f.api.visibility)
@@ -361,7 +424,9 @@ func TestConsumerBackoffCapAndReceiveCountParsing(t *testing.T) {
 	cfg := consumerConfig()
 	cfg.RetryMax = 24 * time.Hour
 	f := newConsumerWith(t, cfg, &fakeProcessor{results: []error{app.ErrUnavailable, app.ErrUnavailable, app.ErrUnavailable}},
-		message("a", body("m-a", "1.00"), "40"), message("b", body("m-b", "1.00"), "garbage"), message("c", body("m-c", "1.00"), ""))
+		groupMessage("a", bodyAt("m-a", "2026-09-08T12:00:00Z", "1.00", testWalletA), "40", testWalletA),
+		groupMessage("b", bodyAt("m-b", "2026-09-08T12:00:00Z", "1.00", testWalletB), "garbage", testWalletB),
+		message("c", body("m-c", "1.00"), ""))
 	f.c.PollOnce(context.Background())
 	assert.Equal(t, map[string]int32{"rh-a": 24 * 3600, "rh-b": 2, "rh-c": 2}, f.api.visibility,
 		"the shift is capped and an unreadable count is the first receive")
@@ -371,7 +436,8 @@ func TestConsumerReleasesGroupTailWhenDLQSendFails(t *testing.T) {
 	t.Parallel()
 	proc := &fakeProcessor{results: []error{app.ErrIdempotencyConflict, nil}}
 	f := newConsumer(t, proc,
-		groupMessage("a1", body("m-a1", "1.00"), "1", "wallet-a"), groupMessage("a2", body("m-a2", "1.00"), "1", "wallet-a"))
+		groupMessage("a1", bodyAt("m-a1", "2026-09-08T12:00:00Z", "1.00", testWalletA), "1", testWalletA),
+		groupMessage("a2", bodyAt("m-a2", "2026-09-08T12:00:00Z", "1.00", testWalletA), "1", testWalletA))
 	f.api.errs["send"] = errBoom
 	f.c.PollOnce(context.Background())
 	assert.Equal(t, 1, proc.calls, "a2 waits for a1 to leave the queue")
@@ -494,9 +560,9 @@ func TestConsumerKeepsGroupOrderAfterARetry(t *testing.T) {
 	t.Parallel()
 	proc := &fakeProcessor{results: []error{app.ErrUnavailable, nil}}
 	f := newConsumer(t, proc,
-		groupMessage("a1", body("m-a1", "1.00"), "1", "wallet-a"),
-		groupMessage("a2", body("m-a2", "1.00"), "1", "wallet-a"),
-		groupMessage("b1", body("m-b1", "1.00"), "1", "wallet-b"))
+		groupMessage("a1", bodyAt("m-a1", "2026-09-08T12:00:00Z", "1.00", testWalletA), "1", testWalletA),
+		groupMessage("a2", bodyAt("m-a2", "2026-09-08T12:00:00Z", "1.00", testWalletA), "1", testWalletA),
+		groupMessage("b1", bodyAt("m-b1", "2026-09-08T12:00:00Z", "1.00", testWalletB), "1", testWalletB))
 	f.c.PollOnce(context.Background())
 
 	assert.Equal(t, 2, proc.calls, "a2 is never processed before its retried head")
@@ -504,10 +570,32 @@ func TestConsumerKeepsGroupOrderAfterARetry(t *testing.T) {
 	assert.Equal(t, map[string]int32{"rh-a1": 2, "rh-a2": 0}, f.api.visibility, "the tail is released right away")
 }
 
-func TestConsumerWithoutGroupsDoesNotBlock(t *testing.T) {
+func TestConsumerRejectsInvalidFIFOIdentity(t *testing.T) {
 	t.Parallel()
-	proc := &fakeProcessor{results: []error{app.ErrUnavailable, nil}}
-	f := newConsumer(t, proc, groupMessage("x", body("m-x", "1.00"), "1", ""), groupMessage("y", body("m-y", "1.00"), "1", ""))
-	f.c.PollOnce(context.Background())
-	assert.Equal(t, 2, proc.calls, "standard (non-FIFO) messages have no group to protect")
+	tests := []struct {
+		name string
+		msg  types.Message
+	}{
+		{
+			name: "message group differs from wallet",
+			msg: fifoMessage("group", bodyAt("message-1", "2026-09-22T12:00:00Z", "1.00", testWalletA), "1",
+				testWalletB, "message-1"),
+		},
+		{
+			name: "deduplication id differs from message id",
+			msg: fifoMessage("dedup", bodyAt("message-1", "2026-09-22T12:00:00Z", "1.00", testWalletA), "1",
+				testWalletA, "other-message"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			proc := &fakeProcessor{}
+			f := newConsumer(t, proc, tt.msg)
+			f.c.PollOnce(context.Background())
+			assert.Zero(t, proc.calls)
+			require.Len(t, f.api.sent, 1)
+			assert.Equal(t, []string{aws.ToString(tt.msg.ReceiptHandle)}, f.api.deleted)
+		})
+	}
 }

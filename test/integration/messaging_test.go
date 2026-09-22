@@ -314,15 +314,50 @@ func TestInvalidMessagesGoToTheDLQ(t *testing.T) {
 	t.Parallel()
 	s := newServices(t, defaultPolicy)
 	api, q, _ := provisionQueues(t, 5)
-	messageID := "bad-" + uuid.NewString()
-	sendRaw(t, api, q, uuid.NewString(), `{"messageId":"`+messageID+`","type":"WagerTransactionRequested","data":{"money":{"amount":25.0}}}`, uuid.NewString())
-	consumerFor(api, q, s.wagers).PollOnce(context.Background())
+	w := s.openWallet(t, "100.00")
+	in := s.input(w, "provider-a", "invalid-sqs", "BET", "10.00", "")
+	tests := []struct {
+		name  string
+		env   sqsadapter.Envelope
+		group string
+		dedup string
+	}{
+		{
+			name: "invalid envelope metadata", env: testenv.Envelope("metadata-"+uuid.NewString(), in),
+			group: w.ID().String(),
+		},
+		{
+			name: "message group differs from wallet", env: testenv.Envelope("group-"+uuid.NewString(), in),
+			group: uuid.NewString(),
+		},
+		{
+			name: "deduplication id differs from message id", env: testenv.Envelope("dedup-"+uuid.NewString(), in),
+			group: w.ID().String(), dedup: uuid.NewString(),
+		},
+	}
+	tests[0].env.OccurredAt = "yesterday"
+	tests[0].dedup = tests[0].env.MessageID
+	tests[1].dedup = tests[1].env.MessageID
+	for _, tt := range tests {
+		body, err := sqsadapter.EncodeMessage(tt.env)
+		require.NoError(t, err)
+		sendRaw(t, api, q, tt.dedup, body, tt.group)
+	}
+	c := consumerFor(api, q, s.wagers)
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		c.PollOnce(context.Background())
+		depth, err := queueDepth(api, q.DLQ)
+		if !assert.NoError(collect, err) {
+			return
+		}
+		assert.Equal(collect, len(tests), depth)
+	}, 15*time.Second, 100*time.Millisecond)
 	dead := drain(t, api, q.DLQ)
-	require.Len(t, dead, 1)
-	assert.Contains(t, dead[0], messageID)
+	require.Len(t, dead, len(tests))
 	depth, err := queueDepth(api, q.Input)
 	require.NoError(t, err)
 	assert.Zero(t, depth)
+	assert.Equal(t, "100.00", s.balance(t, w), "invalid messages have no financial effect")
 }
 
 // flakyProcessor always fails transiently (e.g. PostgreSQL unavailable).

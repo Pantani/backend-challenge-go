@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/Pantani/backend-challenge-go/internal/app"
 	"github.com/Pantani/backend-challenge-go/internal/contract"
@@ -14,6 +15,8 @@ import (
 
 // MessageType is the only accepted envelope type.
 const MessageType = "WagerTransactionRequested"
+
+const maxMessageIDBytes = 128
 
 // ErrInvalidMessage reports an undecodable or invalid message; it is sent to
 // the DLQ without retries.
@@ -61,8 +64,8 @@ func DecodeMessage(consumer, body string) (app.InboundMessage, error) {
 	if err != nil {
 		return app.InboundMessage{}, err
 	}
-	if env.MessageID == "" || env.Type != MessageType {
-		return app.InboundMessage{}, fmt.Errorf("%w: messageId is required and type must be %s", ErrInvalidMessage, MessageType)
+	if err := validateEnvelope(env); err != nil {
+		return app.InboundMessage{}, err
 	}
 	cmd, err := app.NewSubmitCommand(env.Data.ToInput(env.Data.IdempotencyKey, env.MessageID, env.MessageID))
 	if err != nil {
@@ -70,4 +73,26 @@ func DecodeMessage(consumer, body string) (app.InboundMessage, error) {
 	}
 	sum := sha256.Sum256([]byte(env.Type + "\n" + cmd.IdempotencyKey + "\n" + cmd.PayloadHash))
 	return app.InboundMessage{Consumer: consumer, MessageID: env.MessageID, Hash: hex.EncodeToString(sum[:]), Command: cmd}, nil
+}
+
+func validateEnvelope(env Envelope) error {
+	if id := strings.TrimSpace(env.MessageID); id == "" || len(env.MessageID) > maxMessageIDBytes || !printableASCII(env.MessageID) {
+		return fmt.Errorf("%w: invalid messageId", ErrInvalidMessage)
+	}
+	if _, err := time.Parse(time.RFC3339, env.OccurredAt); err != nil {
+		return fmt.Errorf("%w: invalid occurredAt: %w", ErrInvalidMessage, err)
+	}
+	if env.Type != MessageType {
+		return fmt.Errorf("%w: unsupported type %q", ErrInvalidMessage, env.Type)
+	}
+	return nil
+}
+
+func printableASCII(value string) bool {
+	for i := range len(value) {
+		if value[i] < 0x20 || value[i] > 0x7e {
+			return false
+		}
+	}
+	return true
 }
