@@ -168,8 +168,16 @@ func (s *observedOutboxStore) snapshotClaims() []observedClaim {
 
 type gatedFailureStore struct {
 	*observedOutboxStore
-	entered chan struct{}
-	release chan struct{}
+	entered   chan struct{}
+	release   *releaseGate
+	delegated atomic.Bool
+	result    chan markFailedResult
+}
+
+type markFailedResult struct {
+	ok          bool
+	err         error
+	contextLive bool
 }
 
 func (s *gatedFailureStore) MarkFailed(
@@ -181,11 +189,15 @@ func (s *gatedFailureStore) MarkFailed(
 		return false, ctx.Err()
 	}
 	select {
-	case <-s.release:
+	case <-s.release.ch:
 	case <-ctx.Done():
 		return false, ctx.Err()
 	}
-	return s.OutboxStore.MarkFailed(ctx, eventID, claimID, next, cause)
+	s.delegated.Store(true)
+	contextLive := ctx.Err() == nil
+	ok, err := s.OutboxStore.MarkFailed(ctx, eventID, claimID, next, cause)
+	s.result <- markFailedResult{ok: ok, err: err, contextLive: contextLive}
+	return ok, err
 }
 
 type blockingPublisher struct{}
@@ -222,11 +234,57 @@ func (*relayCounters) OutboxLag(time.Duration) {}
 func relayForDeadlineTest(
 	store app.OutboxStore, pub worker.Publisher, metrics worker.RelayMetrics, batch int,
 ) *worker.Relay {
+	// The deliberately short lease forces reacquisition while the first relay
+	// is gated. Production config rejects PublishTime + FinalizeTime > Lease.
 	return worker.NewRelay(store, pub, app.SystemClock{}, worker.RelayConfig{
 		Owner: "shared-owner", BatchSize: batch, Lease: 80 * time.Millisecond,
 		RetryBase: time.Second, RetryMax: time.Second, PublishTime: 20 * time.Millisecond,
 		FinalizeTime: 500 * time.Millisecond, MaxAttempts: 5,
 	}, observability.NewLogger(io.Discard, "error", "deadline-it"), metrics)
+}
+
+func waitForRelaySignal(t *testing.T, signal <-chan struct{}, message string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(time.Second):
+		t.Fatal(message)
+	}
+}
+
+func registerRelayCleanup(t *testing.T, store *gatedFailureStore, done <-chan struct{}) {
+	t.Helper()
+	t.Cleanup(func() {
+		store.release.release()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("first relay did not stop during cleanup")
+		}
+	})
+}
+
+func waitForClaimExpiration(t *testing.T, eventID uuid.UUID) {
+	t.Helper()
+	var lockedUntil time.Time
+	require.NoError(t, pool.QueryRow(context.Background(),
+		`SELECT locked_until FROM outbox_events WHERE event_id = $1`, eventID).Scan(&lockedUntil))
+	if wait := time.Until(lockedUntil.Add(20 * time.Millisecond)); wait > 0 {
+		time.Sleep(wait)
+	}
+}
+
+func assertStaleFailureResult(t *testing.T, store *gatedFailureStore) {
+	t.Helper()
+	assert.True(t, store.delegated.Load(), "the stale mutation reached the real fenced store")
+	select {
+	case result := <-store.result:
+		assert.True(t, result.contextLive, "terminal mutation gets a live context within the shared finalization budget")
+		assert.False(t, result.ok, "the stale fencing token is rejected")
+		assert.NoError(t, result.err, "losing a claim is not a store error")
+	default:
+		t.Error("stale MarkFailed result was not captured")
+	}
 }
 
 func (p *recordingPublisher) Publish(_ context.Context, m app.OutboxMessage) error {
@@ -1162,7 +1220,8 @@ func TestRelayDeadlineFencesStaleFailureAndProgressesAnotherPartition(t *testing
 	base := postgres.NewOutboxStore(pool)
 	firstObserved := &observedOutboxStore{OutboxStore: base}
 	firstStore := &gatedFailureStore{
-		observedOutboxStore: firstObserved, entered: make(chan struct{}), release: make(chan struct{}),
+		observedOutboxStore: firstObserved, entered: make(chan struct{}, 1), release: newReleaseGate(),
+		result: make(chan markFailedResult, 1),
 	}
 	firstMetrics := &relayCounters{}
 	firstDone := make(chan struct{})
@@ -1170,29 +1229,16 @@ func TestRelayDeadlineFencesStaleFailureAndProgressesAnotherPartition(t *testing
 		defer close(firstDone)
 		relayForDeadlineTest(firstStore, blockingPublisher{}, firstMetrics, 1).Tick(context.Background())
 	}()
-
-	select {
-	case <-firstStore.entered:
-	case <-time.After(time.Second):
-		t.Fatal("first relay did not reach durable finalization")
-	}
-	var lockedUntil time.Time
-	require.NoError(t, pool.QueryRow(context.Background(),
-		`SELECT locked_until FROM outbox_events WHERE event_id = $1`, slowID).Scan(&lockedUntil))
-	if wait := time.Until(lockedUntil.Add(20 * time.Millisecond)); wait > 0 {
-		time.Sleep(wait)
-	}
+	registerRelayCleanup(t, firstStore, firstDone)
+	waitForRelaySignal(t, firstStore.entered, "first relay did not reach durable finalization")
+	waitForClaimExpiration(t, slowID)
 
 	secondStore := &observedOutboxStore{OutboxStore: base}
 	secondPublisher := &partitionPublisher{failID: slowID}
 	secondMetrics := &relayCounters{}
 	relayForDeadlineTest(secondStore, secondPublisher, secondMetrics, 2).Tick(context.Background())
-	close(firstStore.release)
-	select {
-	case <-firstDone:
-	case <-time.After(time.Second):
-		t.Fatal("first relay did not finish after finalization was released")
-	}
+	firstStore.release.release()
+	waitForRelaySignal(t, firstDone, "first relay did not finish after finalization was released")
 
 	firstClaims, secondClaims := firstObserved.snapshotClaims(), secondStore.snapshotClaims()
 	require.NotEmpty(t, firstClaims)
@@ -1218,6 +1264,7 @@ func TestRelayDeadlineFencesStaleFailureAndProgressesAnotherPartition(t *testing
 	assert.Equal(t, int64(1), secondMetrics.failures.Load())
 	assert.Equal(t, int64(1), secondMetrics.published.Load())
 	assert.Zero(t, secondMetrics.dead.Load())
+	assertStaleFailureResult(t, firstStore)
 }
 
 func TestInboxRegisterSerialisesConcurrentDeliveries(t *testing.T) {

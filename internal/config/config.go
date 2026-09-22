@@ -118,7 +118,7 @@ type Config struct {
 	OutboxRetryMax  time.Duration
 	// OutboxPublishTimeout bounds one broker publication.
 	OutboxPublishTimeout time.Duration
-	// OutboxFinalizeTimeout bounds attempt accounting and each durable outcome.
+	// OutboxFinalizeTimeout is shared by attempt accounting and its durable outcome.
 	OutboxFinalizeTimeout time.Duration
 	// OutboxMaxAttempts dead-letters an event after that many failures.
 	OutboxMaxAttempts int

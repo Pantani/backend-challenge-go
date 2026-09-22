@@ -66,7 +66,7 @@ Todas têm padrão local, exceto `AWS_ENDPOINT_URL`, que vazio significa a AWS r
 | `SQS_SENDER_PROVIDERS` | `000000000000=*` | vínculo `SenderId` do SQS → provedores permitidos (`id=provider-a\|provider-b;outroId=*`) |
 | `SQS_CONSUMERS`, `SQS_MAX_MESSAGES`, `SQS_WAIT_TIME`, `SQS_VISIBILITY_TIMEOUT`, `SQS_PROCESS_TIMEOUT`, `SQS_ACK_TIMEOUT`, `SQS_RETRY_BASE/MAX`, `SQS_MAX_RECEIVE_COUNT` | `2`, `10`, `10s`, `5m`, `20s`, `5s`, `2s/60s`, `5` | consumer; visibility covers the worst-case serial budget of the whole batch |
 | `PENDING_INTERVAL`, `PENDING_BASE_DELAY`, `PENDING_MAX_DELAY`, `PENDING_MAX_ATTEMPTS`, `PENDING_BATCH` | `1s`, `1s`, `60s`, `10`, `50` | referências pendentes |
-| `OUTBOX_INTERVAL`, `OUTBOX_BATCH`, `OUTBOX_LEASE`, `OUTBOX_RETRY_BASE/MAX`, `OUTBOX_PUBLISH_TIMEOUT`, `OUTBOX_FINALIZE_TIMEOUT`, `OUTBOX_MAX_ATTEMPTS` | `500ms`, `50`, `30s`, `1s/60s`, `10s`, `5s`, `20` | outbox publisher; publication and durable finalization have independent budgets |
+| `OUTBOX_INTERVAL`, `OUTBOX_BATCH`, `OUTBOX_LEASE`, `OUTBOX_RETRY_BASE/MAX`, `OUTBOX_PUBLISH_TIMEOUT`, `OUTBOX_FINALIZE_TIMEOUT`, `OUTBOX_MAX_ATTEMPTS` | `500ms`, `50`, `30s`, `1s/60s`, `10s`, `5s`, `20` | outbox publisher; attempt accounting and its terminal mutation share the total finalization budget |
 | `CONFLICT_RETRIES` | `5` | novas tentativas de uma transação SQL que perdeu uma disputa |
 | `SHUTDOWN_TIMEOUT` | `30s` | prazo do encerramento (maior que `SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT` e que `OUTBOX_PUBLISH_TIMEOUT`) |
 

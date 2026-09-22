@@ -46,8 +46,8 @@ type RelayConfig struct {
 	RetryMax time.Duration
 	// PublishTime bounds one broker publication.
 	PublishTime time.Duration
-	// FinalizeTime independently bounds attempt accounting and the durable
-	// confirmation, retry, or dead-letter mutation.
+	// FinalizeTime is the total budget shared by attempt accounting and the
+	// durable confirmation, retry, or dead-letter mutation.
 	FinalizeTime time.Duration
 	// MaxAttempts dead-letters a record after that many failed publications.
 	MaxAttempts int
@@ -57,17 +57,47 @@ type RelayConfig struct {
 // run at once: claims use FOR UPDATE SKIP LOCKED plus a lease, retries use
 // exponential backoff, and republication keeps the eventId.
 type Relay struct {
-	store     app.OutboxStore
-	publisher Publisher
-	clock     app.Clock
-	cfg       RelayConfig
-	logger    *slog.Logger
-	metrics   RelayMetrics
+	store         app.OutboxStore
+	publisher     Publisher
+	clock         app.Clock
+	cfg           RelayConfig
+	logger        *slog.Logger
+	metrics       RelayMetrics
+	timeoutNow    func() time.Time
+	detachContext func(context.Context, time.Duration) (context.Context, context.CancelFunc)
 }
 
 // NewRelay builds a relay.
 func NewRelay(store app.OutboxStore, publisher Publisher, clock app.Clock, cfg RelayConfig, logger *slog.Logger, metrics RelayMetrics) *Relay {
-	return &Relay{store: store, publisher: publisher, clock: clock, cfg: cfg, logger: logger, metrics: metrics}
+	return &Relay{
+		store: store, publisher: publisher, clock: clock, cfg: cfg, logger: logger, metrics: metrics,
+		timeoutNow: time.Now, detachContext: Detach,
+	}
+}
+
+type finalizationBudget struct {
+	remaining time.Duration
+	now       func() time.Time
+	detach    func(context.Context, time.Duration) (context.Context, context.CancelFunc)
+}
+
+func (b *finalizationBudget) context(parent context.Context) (context.Context, context.CancelFunc) {
+	started := b.now()
+	ctx, cancel := b.detach(parent, b.remaining)
+	return ctx, func() {
+		cancel()
+		b.remaining = subtractElapsed(b.remaining, b.now().Sub(started))
+	}
+}
+
+func subtractElapsed(remaining, elapsed time.Duration) time.Duration {
+	if elapsed <= 0 {
+		return remaining
+	}
+	if elapsed >= remaining {
+		return 0
+	}
+	return remaining - elapsed
 }
 
 // maxRounds bounds how many claim rounds one tick runs. Each round claims at
@@ -107,15 +137,16 @@ func (r *Relay) round(ctx context.Context) bool {
 
 func (r *Relay) publish(parent context.Context, m app.OutboxMessage) {
 	log := r.logger.With("eventId", m.EventID, "eventType", m.EventType, "aggregateId", m.AggregateID)
-	attempts, ok := r.startAttempt(parent, log, m)
+	finalize := &finalizationBudget{remaining: r.cfg.FinalizeTime, now: r.timeoutNow, detach: r.detachContext}
+	attempts, ok := r.startAttempt(parent, log, m, finalize)
 	if !ok {
 		return
 	}
 	m.Attempts = attempts
-	publishCtx, cancelPublish := Detach(parent, r.cfg.PublishTime)
+	publishCtx, cancelPublish := r.detachContext(parent, r.cfg.PublishTime)
 	err := r.publisher.Publish(publishCtx, m)
 	cancelPublish()
-	finalizeCtx, cancelFinalize := Detach(parent, r.cfg.FinalizeTime)
+	finalizeCtx, cancelFinalize := finalize.context(parent)
 	defer cancelFinalize()
 	if err != nil {
 		r.failed(finalizeCtx, log, m, err)
@@ -124,8 +155,10 @@ func (r *Relay) publish(parent context.Context, m app.OutboxMessage) {
 	r.confirm(finalizeCtx, log, m)
 }
 
-func (r *Relay) startAttempt(parent context.Context, log *slog.Logger, m app.OutboxMessage) (int, bool) {
-	ctx, cancel := Detach(parent, r.cfg.FinalizeTime)
+func (r *Relay) startAttempt(
+	parent context.Context, log *slog.Logger, m app.OutboxMessage, finalize *finalizationBudget,
+) (int, bool) {
+	ctx, cancel := finalize.context(parent)
 	defer cancel()
 	attempts, ok, err := r.store.StartAttempt(ctx, m.EventID, m.ClaimID)
 	if err != nil || !ok {
