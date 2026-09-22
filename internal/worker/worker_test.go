@@ -86,11 +86,16 @@ type fakeStore struct {
 	hasOldest    bool
 	oldestErr    error
 	claimedOwner string
+	rounds       int
 }
 
+// Claim hands out the queued messages once, like a drained outbox.
 func (s *fakeStore) Claim(_ context.Context, owner string, _ time.Time, _ time.Duration, _ int) ([]app.OutboxMessage, error) {
 	s.claimedOwner = owner
-	return s.msgs, s.claimErr
+	msgs := s.msgs
+	s.msgs = nil
+	s.rounds++
+	return msgs, s.claimErr
 }
 
 func (s *fakeStore) MarkPublished(_ context.Context, id uuid.UUID, _ string, _ time.Time) (bool, error) {
@@ -181,4 +186,16 @@ func TestPendingResolver(t *testing.T) {
 	before := logs.String()
 	worker.NewPendingResolver(fakePending{err: context.Canceled}, logger).Tick(ctx)
 	assert.Equal(t, before, logs.String(), "cancellation during shutdown is not an error")
+}
+
+func TestRelayRunsRoundsUntilDrainedOrCancelled(t *testing.T) {
+	store := &fakeStore{markOK: true, msgs: []app.OutboxMessage{{EventID: uuid.New()}}}
+	newRelay(store, fakePublisher{}, &syncWriter{w: &bytes.Buffer{}}).Tick(context.Background())
+	assert.Equal(t, 2, store.rounds, "a second round finds nothing left")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cancelled := &fakeStore{markOK: true, msgs: []app.OutboxMessage{{EventID: uuid.New()}}}
+	newRelay(cancelled, fakePublisher{}, &syncWriter{w: &bytes.Buffer{}}).Tick(ctx)
+	assert.Equal(t, 1, cancelled.rounds, "shutdown stops further rounds")
 }

@@ -43,6 +43,9 @@ type Config struct {
 	SQSRetryBase      time.Duration
 	SQSRetryMax       time.Duration
 	SQSMaxReceive     int
+	// SQSSenderProviders binds SQS SenderIds to providers
+	// ("senderId=provider-a|provider-b;otherId=*").
+	SQSSenderProviders string
 
 	PendingInterval    time.Duration
 	PendingBaseDelay   time.Duration
@@ -102,6 +105,8 @@ func (r *reader) loadSQS(c *Config) {
 	c.SQSProcessTimeout = r.dur("SQS_PROCESS_TIMEOUT", 20*time.Second)
 	c.SQSRetryBase, c.SQSRetryMax = r.dur("SQS_RETRY_BASE", 2*time.Second), r.dur("SQS_RETRY_MAX", 60*time.Second)
 	c.SQSMaxReceive = r.int("SQS_MAX_RECEIVE_COUNT", 5)
+	// LocalStack reports every sender as the account id 000000000000.
+	c.SQSSenderProviders = r.str("SQS_SENDER_PROVIDERS", "000000000000=*")
 }
 
 func (r *reader) loadWorkers(c *Config) {
@@ -125,6 +130,8 @@ func (c Config) validate() error {
 		{c.SQSWaitTime <= 20*time.Second, "SQS_WAIT_TIME must be at most 20s"},
 		{c.SQSProcessTimeout < c.SQSVisibility, "SQS_PROCESS_TIMEOUT must be lower than SQS_VISIBILITY_TIMEOUT"},
 		{between(int(c.PendingBaseDelay), 1, int(c.PendingMaxDelay)), "PENDING_BASE_DELAY must be in (0, PENDING_MAX_DELAY]"},
+		{positiveDurations(c.PendingInterval, c.OutboxInterval, c.OutboxLease, c.OutboxRetryBase, c.SQSRetryBase,
+			c.SQSProcessTimeout, c.ShutdownTimeout, c.ReadyTimeout), "worker intervals, leases, retries and timeouts must be positive"},
 	}
 	var errs []error
 	for _, rule := range rules {
@@ -141,6 +148,10 @@ func nonEmpty(values ...string) bool {
 
 func positive(values ...int) bool {
 	return !slices.ContainsFunc(values, func(v int) bool { return v <= 0 })
+}
+
+func positiveDurations(values ...time.Duration) bool {
+	return !slices.ContainsFunc(values, func(d time.Duration) bool { return d <= 0 })
 }
 
 func between(v, lo, hi int) bool { return v >= lo && v <= hi }

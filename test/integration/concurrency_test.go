@@ -251,3 +251,22 @@ func TestLockTimeoutIsTransient(t *testing.T) {
 	require.ErrorIs(t, err, app.ErrConflict)
 	assert.True(t, app.IsTransient(err))
 }
+
+func TestReplayKeepsTheCurrencyOfTheObservedBalance(t *testing.T) {
+	t.Parallel()
+	s := newServices(t, defaultPolicy)
+	w := s.openWallet(t, "100.00")
+	in := s.input(w, "provider-a", "usd-bet", "BET", "10.00", "")
+	in.Currency = "USD"
+	cmd, err := app.NewSubmitCommand(in)
+	require.NoError(t, err)
+	first, err := s.wagers.Submit(context.Background(), cmd)
+	require.NoError(t, err)
+	require.Equal(t, wager.CodeCurrencyMismatch, first.Transaction.FailureCode())
+
+	replay, err := s.wagers.Submit(context.Background(), cmd)
+	require.NoError(t, err)
+	assert.True(t, replay.Replay)
+	assert.Equal(t, "100.00 BRL", replay.Transaction.ResultBalance().String(), "the wallet balance keeps its own currency")
+	assert.Equal(t, "10.00 USD", replay.Transaction.Amount().String())
+}

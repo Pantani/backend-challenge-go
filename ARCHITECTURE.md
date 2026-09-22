@@ -72,7 +72,7 @@ A disputa 80,00 + 80,00 sobre 100,00 se serializa no lock: uma é `PROCESSED` e 
 Independentes de locks locais e da deduplicação do SQS FIFO:
 
 - `wallets.balance_minor >= 0`; `UNIQUE (player_id, currency)`; trigger que proíbe `DELETE`, impede mudança de identidade e exige versão `+1` **exatamente** quando o saldo muda.
-- **Constraint trigger adiado** (`wallets_match_ledger`, `DEFERRABLE INITIALLY DEFERRED`): no commit, o saldo guardado precisa ser igual ao `balance_after` do último lançamento. Nenhum saldo muda sem o lançamento correspondente na mesma transação.
+- **Constraint triggers adiados** (`DEFERRABLE INITIALLY DEFERRED`), disparados tanto por alterações em `wallets` (`wallets_match_ledger`) quanto por inserções em `ledger_entries` (`ledger_entries_match_wallet`, migration 2): no commit, o saldo guardado precisa ser igual ao `balance_after` do último lançamento. Nenhum saldo muda sem lançamento, e nenhum lançamento entra sem o saldo correspondente.
 - `ledger_entries`: check `balance_after = balance_before ± amount`, `UNIQUE (wallet_id, transaction_id)`, trigger de encadeamento (`balance_before` = último `balance_after` e moeda = moeda da carteira), triggers que proíbem `UPDATE`, `DELETE` e `TRUNCATE` (append-only).
 - `wager_transactions`: checks de formato interno × externo (OPENING sem provedor/chaves/rodada/jogo/referência), política de zero, referência obrigatória em reversões, `failure_code` em REJECTED/FAILED, resultado em PROCESSED, agenda em PENDING_REFERENCE. Índices únicos: `(provider_id, external_transaction_id)`, `(provider_id, idempotency_key)`, uma `OPENING` por carteira e **uma reversão bem-sucedida por transação referenciada**. Trigger: linhas terminais congeladas e colunas de identidade/payload imutáveis.
 - `outbox_events`: snapshot (`payload json`, que preserva o texto exato) e identidade imutáveis, sem `DELETE`, e publicação que não pode ser reescrita.
@@ -112,6 +112,7 @@ Todos esses pontos são verificados em `test/integration/schema_test.go`.
 ## 9. Consumidor SQS e inbox
 
 - Fila `wager-transactions.fifo` com redrive para `wager-transactions-dlq.fifo` (`maxReceiveCount=SQS_MAX_RECEIVE_COUNT`, padrão 5).
+- **Vínculo remetente → provedor**: o consumidor lê o atributo de sistema `SenderId` (o ID do usuário ou papel IAM que enviou a mensagem) e só aceita o `providerId` se `SQS_SENDER_PROVIDERS` permitir aquele remetente para aquele provedor. Isso é o equivalente ao `providerId` derivado do token no HTTP. Remetente não autorizado → DLQ, sem efeito financeiro. No LocalStack todo remetente é o account id `000000000000`, por isso o padrão local é `000000000000=*`. Em produção, cada provedor tem seu próprio principal IAM mapeado para o seu `providerId`.
 - **Contrato de envio**: `MessageGroupId` = `walletId`, o que dá ordem por carteira e paralelismo entre carteiras. `MessageDeduplicationId` = `messageId` do envelope. A deduplicação FIFO (janela de 5 min) é só uma otimização: a garantia vem da inbox e da idempotência.
 - Por mensagem, **numa única transação SQL**: `INSERT` na inbox `(consumer_name, message_id)` com o hash (tipo + chave + hash de negócio), processamento da operação (o mesmo caso de uso do HTTP) e conclusão da inbox. Uma reentrega de mensagem já commitada vira `duplicate` e é removida. O mesmo `messageId` com outro conteúdo é permanente e vai para a DLQ.
 - `DeleteMessage` só acontece **depois do commit**. Se o processo morrer entre um e outro, a reentrega é absorvida pela inbox (testado).
@@ -123,6 +124,7 @@ Todos esses pontos são verificados em `test/integration/schema_test.go`.
 
 - Os eventos são gravados na mesma transação do estado, do saldo, do ledger e da inbox. Nada é publicado antes do commit.
 - O relay (uma goroutine por instância) faz `UPDATE … WHERE event_id IN (SELECT … FOR UPDATE SKIP LOCKED) RETURNING`, que reivindica um lote com **lease** (`locked_by`, `locked_until`). Publishers concorrentes não pegam o mesmo registro enquanto o lease vale. Se um publisher morrer, o lease expira e outra instância assume.
+- **Ordem por carteira**: cada rodada reivindica, por `partition_key` (carteira), apenas o evento não publicado mais antigo, e só se ele estiver vencido e sem lease. Um evento posterior nunca sai antes do anterior, mesmo que o anterior esteja em backoff ou nas mãos de outro relay, então o SQS FIFO recebe os eventos de cada carteira na ordem do banco. Para drenar carteiras com vários eventos, cada tick executa rodadas até não haver mais nada vencido (limite de 20). O custo é que uma falha no evento da frente segura os demais daquela carteira até o retry, o que é intencional.
 - Falha de publicação → libera o lease e agenda `next_attempt_at` com backoff exponencial (`attempts`, `last_error`). Confirmação: `published_at` apenas se o lease ainda for do dono.
 - **Republicação preserva o `eventId`**: ele está no payload imutável e é o `MessageDeduplicationId`. Dentro de 5 min o SQS FIFO descarta a duplicata. Depois disso, o consumidor deduplica por `eventId` (entrega at-least-once).
 - Destino: `wallet-events.fifo`, com `MessageGroupId` = `walletId` (ordem por carteira) e atributos `eventType`, `eventId` e `aggregateType`.
@@ -147,6 +149,7 @@ A abertura interna emite `WagerTransactionProcessed` (com `origin: INTERNAL`, se
 - **Permissões** (papéis de realm em `realm_access.roles`):
   - `wallet-admin` (client `wallet-service`): `POST /wallets`, leitura de carteira, ledger e reconciliação, e leitura de qualquer transação.
   - `wager-provider`: `POST /wagering/transactions` e leitura **das próprias** transações.
+- No SQS, o mesmo vínculo é feito pelo `SenderId` da mensagem (§9).
 - **A identidade define o `providerId`**: claim `provider_id` (hardcoded mapper por client). Um corpo com outro `providerId` → `403`. `GET /wagering/transactions/{id}` de outro provedor → `404` (não revela existência). `/providers/{outro}/…` → `403`. OPENING só é visível ao serviço interno.
 - Um papel ausente, o provedor sem `provider_id` ou um token inválido/expirado não chegam aos casos de uso, então não há efeito financeiro nem exposição de dados (testado com Keycloak real).
 - **Broker**: o acesso ao SQS usa credenciais AWS (`AWS_ACCESS_KEY_ID`/`SECRET`). Em produção, a política recomendada é IAM por papel: o serviço com `sqs:ReceiveMessage/DeleteMessage/ChangeMessageVisibility/GetQueueAttributes` na fila de entrada, `SendMessage` na DLQ e na fila de eventos, e os provedores só com `SendMessage` na fila de entrada. O LocalStack community não aplica IAM (ver limitações). As validações de domínio no consumidor valem de qualquer forma.
@@ -173,6 +176,8 @@ A abertura interna emite `WagerTransactionProcessed` (com `origin: INTERNAL`, se
 | Conflito | `409` | `IDEMPOTENCY_CONFLICT`, `DUPLICATE_EXTERNAL_TRANSACTION`, `WALLET_ALREADY_EXISTS` |
 | Indisponibilidade transitória (banco, lock timeout, disputa esgotada) | `503` | `{code:"SERVICE_UNAVAILABLE"}` + `Retry-After: 1`; repetir com a mesma chave |
 | Erro inesperado | `500` | `{code:"INTERNAL_ERROR"}` (detalhes só no log) |
+
+O saldo observado (`balance` do resultado) é persistido com a própria moeda (`result_currency`). Numa rejeição `CURRENCY_MISMATCH`, o replay devolve o saldo na moeda da carteira, e não na moeda da operação.
 
 `X-Correlation-Id` é aceito (ou gerado) e devolvido. O ledger usa um cursor opaco (`base64url("v1:<seq>")`) sobre uma sequência crescente (`seq`), com ordem estável; `limit` vai de 1 a 200 (padrão 50).
 
@@ -216,7 +221,7 @@ Todos são **resultados definitivos**, persistidos em `REJECTED`/`FAILED`: a ope
 
 - **Aceite assíncrono**: não há. Operações sem dependência são concluídas na transação da requisição, e só `PENDING_REFERENCE` é persistido e retomado. Por isso o cenário "interromper depois de confirmar `PENDING`" não se aplica: não existe `PENDING` commitado.
 - **Carteira × provedor**: o desafio não associa carteiras a provedores. Qualquer provedor autenticado pode operar numa carteira cujo `walletId`/`playerId` conheça (as operações e leituras continuam isoladas por provedor).
-- **IAM no broker**: o LocalStack community não aplica políticas IAM, então localmente o controle é só por credenciais. A política recomendada está no §11.
+- **IAM no broker**: o LocalStack community não aplica políticas IAM e reporta todo remetente como `000000000000`, então localmente o vínculo `SenderId` → provedor não distingue provedores. A política recomendada está no §11, e o vínculo está no §9.
 - **Deduplicação no consumidor de eventos**: depois da janela de 5 min do SQS FIFO, uma republicação chega de novo com o mesmo `eventId`. Deduplicar por `eventId` é responsabilidade dos consumidores de `wallet-events.fifo`.
 - **Retenção**: inbox e outbox publicada crescem indefinidamente. Em produção caberia um job de expurgo por idade (o trigger da outbox bloqueia `DELETE`, que precisaria ser liberado para um papel de manutenção).
 - **Mensagem para carteira inexistente via SQS** é tratada como permanente (DLQ), não como pendente.

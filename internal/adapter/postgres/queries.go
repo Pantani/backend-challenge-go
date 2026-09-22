@@ -108,16 +108,25 @@ type OutboxStore struct {
 // NewOutboxStore builds the relay store.
 func NewOutboxStore(pool *pgxpool.Pool) *OutboxStore { return &OutboxStore{pool: pool} }
 
-// Claim leases due records with FOR UPDATE SKIP LOCKED, so concurrent
-// publishers never claim the same record while its lease is valid.
+// Claim leases, per partition (wallet), only the oldest unpublished record,
+// and only while it is due and not leased. A later event of a wallet is never
+// claimed before the earlier one is published, even when that one is failing
+// with backoff or leased by another relay, so SQS FIFO receives each wallet's
+// events in database order. FOR UPDATE SKIP LOCKED plus the conditions
+// repeated on the locked row keep concurrent relays from claiming the same
+// record.
 func (s *OutboxStore) Claim(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]app.OutboxMessage, error) {
-	rows, err := s.pool.Query(ctx, `UPDATE outbox_events
+	rows, err := s.pool.Query(ctx, `WITH heads AS (
+			SELECT DISTINCT ON (partition_key) event_id
+			FROM outbox_events WHERE published_at IS NULL
+			ORDER BY partition_key, seq)
+		UPDATE outbox_events
 		SET locked_by = $1, locked_until = $2::timestamptz + ($3::bigint * INTERVAL '1 millisecond'), attempts = attempts + 1
 		WHERE event_id IN (
-			SELECT event_id FROM outbox_events
-			WHERE published_at IS NULL AND next_attempt_at <= $2 AND (locked_until IS NULL OR locked_until < $2)
-			ORDER BY seq LIMIT $4
-			FOR UPDATE SKIP LOCKED)
+			SELECT o.event_id FROM outbox_events o JOIN heads h ON h.event_id = o.event_id
+			WHERE o.published_at IS NULL AND o.next_attempt_at <= $2 AND (o.locked_until IS NULL OR o.locked_until < $2)
+			ORDER BY o.seq LIMIT $4
+			FOR UPDATE OF o SKIP LOCKED)
 		RETURNING seq, event_id, event_type, aggregate_type, aggregate_id, partition_key, payload::text, occurred_at, attempts`,
 		owner, now, lease.Milliseconds(), limit)
 	if err != nil {

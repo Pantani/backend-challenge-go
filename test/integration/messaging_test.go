@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -185,11 +186,16 @@ func TestPublicationRetriesWithBackoff(t *testing.T) {
 	require.Eventually(t, func() bool { ok.Tick(context.Background()); return unpublished(t, w.ID()) == 0 }, 10*time.Second, 100*time.Millisecond)
 }
 
+// localSenders trusts the LocalStack account id, the SenderId of every
+// message sent to LocalStack.
+var localSenders = sqsadapter.SenderPolicy{"000000000000": {"*"}}
+
 // consumerFor builds a consumer on the test queues.
 func consumerFor(api sqsadapter.API, q sqsadapter.Queues, svc sqsadapter.Processor) *sqsadapter.Consumer {
 	return sqsadapter.NewConsumer(api, sqsadapter.ConsumerConfig{
 		Name: "it-consumer", QueueURL: q.Input, DLQURL: q.DLQ, MaxMessages: 10, WaitTime: time.Second,
 		VisibilityTimeout: 2 * time.Second, ProcessTimeout: time.Second, RetryBase: time.Second, RetryMax: time.Second,
+		Senders: localSenders,
 	}, svc, observability.NewLogger(io.Discard, "error", "c"), newMetrics())
 }
 
@@ -333,4 +339,77 @@ func TestSameOperationThroughHTTPAndSQS(t *testing.T) {
 	assert.Equal(t, "90.00", s.balance(t, w))
 	assert.Equal(t, 1, s.debits(t, w))
 	assert.Equal(t, wager.StatusProcessed, s.tx(t, "provider-a", s.prefix+"cross").Status())
+}
+
+func TestSQSSenderMustBeBoundToTheProvider(t *testing.T) {
+	t.Parallel()
+	s := newServices(t, defaultPolicy)
+	api, q, _ := provisionQueues(t, 5)
+	w := s.openWallet(t, "100.00")
+	sendMessage(t, api, q, s.prefix+"spoofed", s.input(w, "provider-a", "spoofed", "BET", "10.00", ""))
+
+	onlyB := sqsadapter.NewConsumer(api, sqsadapter.ConsumerConfig{
+		Name: "it-consumer", QueueURL: q.Input, DLQURL: q.DLQ, MaxMessages: 10, WaitTime: time.Second,
+		VisibilityTimeout: 2 * time.Second, ProcessTimeout: time.Second, RetryBase: time.Second, RetryMax: time.Second,
+		Senders: sqsadapter.SenderPolicy{"000000000000": {"provider-b"}},
+	}, s.wagers, observability.NewLogger(io.Discard, "error", "c"), newMetrics())
+	onlyB.PollOnce(context.Background())
+
+	dead := drain(t, api, q.DLQ)
+	require.Len(t, dead, 1, "a sender acting for another provider goes to the DLQ")
+	assert.Equal(t, "100.00", s.balance(t, w), "no financial effect")
+}
+
+// orderedPublisher fails the first attempt of one event and records order.
+type orderedPublisher struct {
+	recordingPublisher
+	failOnce uuid.UUID
+	failed   bool
+}
+
+func (p *orderedPublisher) Publish(ctx context.Context, m app.OutboxMessage) error {
+	p.mu.Lock()
+	fail := m.EventID == p.failOnce && !p.failed
+	p.failed = p.failed || fail
+	p.mu.Unlock()
+	if fail {
+		return fmt.Errorf("broker hiccup")
+	}
+	return p.recordingPublisher.Publish(ctx, m)
+}
+
+// Not parallel: relays claim the whole (shared) outbox.
+func TestOutboxKeepsPerWalletOrderWhenAnEventFails(t *testing.T) {
+	s := newServices(t, defaultPolicy)
+	w := s.openWallet(t, "100.00")
+	s.submit(t, w, "ordered-1", "BET", "1.00", "")
+	s.submit(t, w, "ordered-2", "BET", "1.00", "")
+	var order []uuid.UUID
+	rows, err := pool.Query(context.Background(), `SELECT event_id FROM outbox_events WHERE partition_key = $1 ORDER BY seq`, w.ID().String())
+	require.NoError(t, err)
+	for rows.Next() {
+		var id uuid.UUID
+		require.NoError(t, rows.Scan(&id))
+		order = append(order, id)
+	}
+	require.NoError(t, rows.Err())
+	require.Len(t, order, 6)
+
+	pub := &orderedPublisher{failOnce: order[0]}
+	store := postgres.NewOutboxStore(pool)
+	relays := []*worker.Relay{newRelay(t, "ordered-a", store, pub), newRelay(t, "ordered-b", store, pub)}
+	require.Eventually(t, func() bool {
+		parallel(2, func(i int) bool { relays[i].Tick(context.Background()); return true })
+		return unpublished(t, w.ID()) == 0
+	}, 20*time.Second, 100*time.Millisecond)
+
+	var published []uuid.UUID
+	pub.mu.Lock()
+	for _, id := range pub.ids {
+		if slices.Contains(order, id) {
+			published = append(published, id)
+		}
+	}
+	pub.mu.Unlock()
+	assert.Equal(t, order, published, "the failing head held back the rest of the wallet's events")
 }

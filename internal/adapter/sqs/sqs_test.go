@@ -102,7 +102,10 @@ func sampleTx() *wager.Transaction {
 func message(id, bodyText, receiveCount string) types.Message {
 	return types.Message{
 		MessageId: aws.String(id), ReceiptHandle: aws.String("rh-" + id), Body: aws.String(bodyText),
-		Attributes: map[string]string{string(types.MessageSystemAttributeNameApproximateReceiveCount): receiveCount},
+		Attributes: map[string]string{
+			string(types.MessageSystemAttributeNameApproximateReceiveCount): receiveCount,
+			string(types.MessageSystemAttributeNameSenderId):                "AIDA-PROVIDER-A",
+		},
 	}
 }
 
@@ -122,6 +125,7 @@ func newConsumer(t *testing.T, proc *fakeProcessor, msgs ...types.Message) *cons
 	f.c = sqsadapter.NewConsumer(f.api, sqsadapter.ConsumerConfig{
 		Name: "consumer", QueueURL: "http://sqs/in", DLQURL: "http://sqs/dlq", MaxMessages: 10, WaitTime: time.Second,
 		VisibilityTimeout: 30 * time.Second, ProcessTimeout: time.Second, RetryBase: 2 * time.Second, RetryMax: 10 * time.Second,
+		Senders: sqsadapter.SenderPolicy{"AIDA-PROVIDER-A": {"provider-a"}},
 	}, proc, observability.NewLogger(f.logs, "debug", "t"), observability.NewMetrics(prometheus.NewRegistry()))
 	return f
 }
@@ -291,4 +295,33 @@ func TestNewClientConfigError(t *testing.T) {
 	t.Setenv("AWS_CONFIG_FILE", t.TempDir()+"/missing")
 	_, err := sqsadapter.NewClient(context.Background(), sqsadapter.ClientConfig{Region: "us-east-1"})
 	require.Error(t, err)
+}
+
+func TestConsumerRejectsSendersActingForOtherProviders(t *testing.T) {
+	t.Parallel()
+	proc := &fakeProcessor{}
+	f := newConsumer(t, proc, message("a", body("m-a", "1.00"), "1"))
+	f.c = sqsadapter.NewConsumer(f.api, sqsadapter.ConsumerConfig{
+		Name: "consumer", QueueURL: "http://sqs/in", DLQURL: "http://sqs/dlq", ProcessTimeout: time.Second,
+		Senders: sqsadapter.SenderPolicy{"AIDA-PROVIDER-A": {"provider-b"}},
+	}, proc, observability.NewLogger(f.logs, "debug", "t"), observability.NewMetrics(prometheus.NewRegistry()))
+	f.c.PollOnce(context.Background())
+	assert.Zero(t, proc.calls, "the operation never reaches the use case")
+	require.Len(t, f.api.sent, 1)
+	assert.Contains(t, aws.ToString(f.api.sent[0].MessageAttributes["failureReason"].StringValue), "sender is not allowed")
+	assert.Equal(t, []string{"rh-a"}, f.api.deleted)
+}
+
+func TestSenderPolicy(t *testing.T) {
+	t.Parallel()
+	p, err := sqsadapter.ParseSenderPolicy("AIDA1=provider-a|provider-b; ROLE2=*")
+	require.NoError(t, err)
+	require.NoError(t, p.Authorize("AIDA1", "provider-b"))
+	require.NoError(t, p.Authorize("ROLE2", "anything"))
+	require.ErrorIs(t, p.Authorize("AIDA1", "provider-c"), sqsadapter.ErrUnauthorizedSender)
+	require.ErrorIs(t, p.Authorize("", "provider-a"), sqsadapter.ErrUnauthorizedSender, "a missing SenderId is never trusted")
+	for _, bad := range []string{"", "AIDA1", "=provider-a", "AIDA1=", "AIDA1=p;"} {
+		_, err := sqsadapter.ParseSenderPolicy(bad)
+		assert.ErrorIs(t, err, sqsadapter.ErrInvalidSenderPolicy, bad)
+	}
 }

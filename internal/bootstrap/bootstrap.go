@@ -134,12 +134,16 @@ func newPublisher(api sqsadapter.API, q sqsadapter.Queues) *sqsadapter.Publisher
 }
 
 func newConsumer(api sqsadapter.API, q sqsadapter.Queues, cfg config.Config, svc *app.WagerService,
-	logger *slog.Logger, metrics *observability.Metrics) *sqsadapter.Consumer {
+	logger *slog.Logger, metrics *observability.Metrics) (*sqsadapter.Consumer, error) {
+	senders, err := sqsadapter.ParseSenderPolicy(cfg.SQSSenderProviders)
+	if err != nil {
+		return nil, err
+	}
 	return sqsadapter.NewConsumer(api, sqsadapter.ConsumerConfig{
 		Name: cfg.SQSConsumerName, QueueURL: q.Input, DLQURL: q.DLQ, MaxMessages: int32(cfg.SQSMaxMessages),
 		WaitTime: cfg.SQSWaitTime, VisibilityTimeout: cfg.SQSVisibility, ProcessTimeout: cfg.SQSProcessTimeout,
-		RetryBase: cfg.SQSRetryBase, RetryMax: cfg.SQSRetryMax,
-	}, svc, logger, metrics)
+		RetryBase: cfg.SQSRetryBase, RetryMax: cfg.SQSRetryMax, Senders: senders,
+	}, svc, logger, metrics), nil
 }
 
 // AppModule provides the use cases.

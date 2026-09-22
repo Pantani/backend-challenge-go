@@ -51,8 +51,8 @@ func seededWallet(t *testing.T) (walletID, txID uuid.UUID) {
 	require.Empty(t, sqlState(t,
 		`INSERT INTO wallets VALUES ('`+w+`', gen_random_uuid(), 'BRL', 10000, 1, now(), now())`,
 		`INSERT INTO wager_transactions (id, origin, kind, status, wallet_id, player_id, amount_minor, currency,
-			result_balance_minor, created_at, updated_at)
-		 VALUES ('`+tx+`', 'INTERNAL', 'OPENING', 'PROCESSED', '`+w+`', gen_random_uuid(), 10000, 'BRL', 10000, now(), now())`,
+			result_balance_minor, result_currency, created_at, updated_at)
+		 VALUES ('`+tx+`', 'INTERNAL', 'OPENING', 'PROCESSED', '`+w+`', gen_random_uuid(), 10000, 'BRL', 10000, 'BRL', now(), now())`,
 		`INSERT INTO ledger_entries (id, wallet_id, transaction_id, direction, amount_minor, currency,
 			balance_before_minor, balance_after_minor, created_at)
 		 VALUES (gen_random_uuid(), '`+w+`', '`+tx+`', 'CREDIT', 10000, 'BRL', 0, 10000, now())`,
@@ -95,13 +95,30 @@ func TestLedgerIsAppendOnly(t *testing.T) {
 		VALUES (gen_random_uuid(), '`+id+`', '`+tx.String()+`', 'DEBIT', 100, 'BRL', 10000, 9900, now())`), "(walletId, transactionId) unique")
 }
 
+func TestLedgerEntryWithoutWalletUpdateFailsAtCommit(t *testing.T) {
+	t.Parallel()
+	w, _ := seededWallet(t)
+	id := w.String()
+	other := uuid.NewString()
+	assert.Equal(t, "23514", sqlState(t,
+		`INSERT INTO wager_transactions (id, origin, kind, status, wallet_id, player_id, amount_minor, currency,
+			provider_id, external_transaction_id, idempotency_key, payload_hash, round_id, game_id, result_balance_minor,
+			result_currency, created_at, updated_at)
+		 VALUES ('`+other+`', 'EXTERNAL', 'WIN', 'PROCESSED', '`+id+`', gen_random_uuid(), 500, 'BRL', 'p', '`+other+`',
+			'`+other+`', 'h', 'r', 'g', 10500, 'BRL', now(), now())`,
+		`INSERT INTO ledger_entries (id, wallet_id, transaction_id, direction, amount_minor, currency,
+			balance_before_minor, balance_after_minor, created_at)
+		 VALUES (gen_random_uuid(), '`+id+`', '`+other+`', 'CREDIT', 500, 'BRL', 10000, 10500, now())`),
+		"a chained entry that the wallet does not reflect is refused at commit")
+}
+
 func TestTransactionConstraints(t *testing.T) {
 	t.Parallel()
 	w, tx := seededWallet(t)
 	insert := func(kind, status string, amount int, extra string) string {
 		return `INSERT INTO wager_transactions (id, origin, kind, status, wallet_id, player_id, amount_minor, currency,
 			provider_id, external_transaction_id, idempotency_key, payload_hash, round_id, game_id,
-			reference_external_transaction_id, failure_code, result_balance_minor, next_attempt_at, created_at, updated_at)
+			reference_external_transaction_id, failure_code, result_balance_minor, result_currency, next_attempt_at, created_at, updated_at)
 			VALUES (gen_random_uuid(), 'EXTERNAL', '` + kind + `', '` + status + `', '` + w.String() + `', gen_random_uuid(), ` +
 			strconv.Itoa(amount) + `, 'BRL', 'p', gen_random_uuid()::text, gen_random_uuid()::text, 'h', 'r', 'g', ` +
 			extra + `, now(), now())`
@@ -110,21 +127,22 @@ func TestTransactionConstraints(t *testing.T) {
 		sql  string
 		want string
 	}{
-		"external OPENING":       {insert("OPENING", "PROCESSED", 1, "NULL, NULL, 1, NULL"), "23514"},
-		"LOSS must be zero":      {insert("LOSS", "PROCESSED", 1, "NULL, NULL, 1, NULL"), "23514"},
-		"BET must be positive":   {insert("BET", "PROCESSED", 0, "NULL, NULL, 1, NULL"), "23514"},
-		"REFUND needs reference": {insert("REFUND", "PROCESSED", 1, "NULL, NULL, 1, NULL"), "23514"},
-		"REJECTED needs code":    {insert("BET", "REJECTED", 1, "NULL, NULL, 1, NULL"), "23514"},
-		"PROCESSED needs result": {insert("BET", "PROCESSED", 1, "NULL, NULL, NULL, NULL"), "23514"},
-		"pending needs schedule": {insert("REFUND", "PENDING_REFERENCE", 1, "'x', NULL, NULL, NULL"), "23514"},
-		"valid LOSS":             {insert("LOSS", "PROCESSED", 0, "NULL, NULL, 1, NULL"), ""},
+		"external OPENING":       {insert("OPENING", "PROCESSED", 1, "NULL, NULL, 1, 'BRL', NULL"), "23514"},
+		"LOSS must be zero":      {insert("LOSS", "PROCESSED", 1, "NULL, NULL, 1, 'BRL', NULL"), "23514"},
+		"BET must be positive":   {insert("BET", "PROCESSED", 0, "NULL, NULL, 1, 'BRL', NULL"), "23514"},
+		"REFUND needs reference": {insert("REFUND", "PROCESSED", 1, "NULL, NULL, 1, 'BRL', NULL"), "23514"},
+		"REJECTED needs code":    {insert("BET", "REJECTED", 1, "NULL, NULL, 1, 'BRL', NULL"), "23514"},
+		"PROCESSED needs result": {insert("BET", "PROCESSED", 1, "NULL, NULL, NULL, NULL, NULL"), "23514"},
+		"result needs currency":  {insert("BET", "PROCESSED", 1, "NULL, NULL, 1, NULL, NULL"), "23514"},
+		"pending needs schedule": {insert("REFUND", "PENDING_REFERENCE", 1, "'x', NULL, NULL, NULL, NULL"), "23514"},
+		"valid LOSS":             {insert("LOSS", "PROCESSED", 0, "NULL, NULL, 1, 'BRL', NULL"), ""},
 	}
 	for name, tc := range cases {
 		assert.Equal(t, tc.want, sqlState(t, tc.sql), name)
 	}
 	assert.Equal(t, "23505", sqlState(t, `INSERT INTO wager_transactions (id, origin, kind, status, wallet_id, player_id,
-		amount_minor, currency, result_balance_minor, created_at, updated_at)
-		VALUES (gen_random_uuid(), 'INTERNAL', 'OPENING', 'PROCESSED', '`+w.String()+`', gen_random_uuid(), 1, 'BRL', 1, now(), now())`),
+		amount_minor, currency, result_balance_minor, result_currency, created_at, updated_at)
+		VALUES (gen_random_uuid(), 'INTERNAL', 'OPENING', 'PROCESSED', '`+w.String()+`', gen_random_uuid(), 1, 'BRL', 1, 'BRL', now(), now())`),
 		"a single opening credit per wallet")
 	assert.Equal(t, "23000", sqlState(t, `UPDATE wager_transactions SET failure_code = 'X' WHERE id = '`+tx.String()+`'`), "terminal rows are frozen")
 	assert.Equal(t, "23000", sqlState(t, `DELETE FROM wager_transactions WHERE id = '`+tx.String()+`'`))
@@ -175,10 +193,14 @@ func TestMigrationsApplyAndRevert(t *testing.T) {
 	require.NoError(t, m.Up(), "no change is not an error")
 	v, _, err = m.Version()
 	require.NoError(t, err)
-	assert.Equal(t, uint(1), v)
+	assert.Equal(t, uint(2), v)
 	assert.True(t, tableExists(t, url, "ledger_entries"))
 
 	require.NoError(t, m.Down(1))
+	v, _, err = m.Version()
+	require.NoError(t, err)
+	assert.Equal(t, uint(1), v)
+	require.NoError(t, m.Down(5), "reverting more steps than exist stops at zero")
 	assert.False(t, tableExists(t, url, "ledger_entries"))
 	require.NoError(t, m.Up())
 	assert.True(t, tableExists(t, url, "outbox_events"))

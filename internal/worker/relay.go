@@ -50,17 +50,31 @@ func NewRelay(store app.OutboxStore, publisher Publisher, clock app.Clock, cfg R
 	return &Relay{store: store, publisher: publisher, clock: clock, cfg: cfg, logger: logger, metrics: metrics}
 }
 
-// Tick claims and publishes one batch, then refreshes the lag gauge.
+// maxRounds bounds how many claim rounds one tick runs. Each round claims at
+// most one record per wallet, so rounds drain wallets with several events.
+const maxRounds = 20
+
+// Tick publishes claim rounds until nothing is due, then refreshes the lag.
 func (r *Relay) Tick(ctx context.Context) {
+	for range maxRounds {
+		if r.round(ctx) == 0 || ctx.Err() != nil {
+			break
+		}
+	}
+	r.refreshLag(ctx)
+}
+
+// round claims and publishes one batch, returning how many were claimed.
+func (r *Relay) round(ctx context.Context) int {
 	msgs, err := r.store.Claim(ctx, r.cfg.Owner, r.clock.Now(), r.cfg.Lease, r.cfg.BatchSize)
 	if err != nil {
 		r.logger.WarnContext(ctx, "outbox claim failed", "error", err)
-		return
+		return 0
 	}
 	for _, m := range msgs {
 		r.publish(ctx, m)
 	}
-	r.refreshLag(ctx)
+	return len(msgs)
 }
 
 func (r *Relay) publish(parent context.Context, m app.OutboxMessage) {

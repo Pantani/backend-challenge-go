@@ -46,6 +46,8 @@ type ConsumerConfig struct {
 	ProcessTimeout time.Duration
 	RetryBase      time.Duration
 	RetryMax       time.Duration
+	// Senders binds broker identities to the providers they may act for.
+	Senders SenderPolicy
 }
 
 // Consumer polls the FIFO input queue. A message is deleted only after its
@@ -78,11 +80,13 @@ func (c *Consumer) Run(ctx context.Context) {
 // PollOnce receives and handles one batch.
 func (c *Consumer) PollOnce(ctx context.Context) {
 	out, err := c.api.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
-		QueueUrl:                    aws.String(c.cfg.QueueURL),
-		MaxNumberOfMessages:         c.cfg.MaxMessages,
-		WaitTimeSeconds:             int32(c.cfg.WaitTime.Seconds()),
-		VisibilityTimeout:           int32(c.cfg.VisibilityTimeout.Seconds()),
-		MessageSystemAttributeNames: []types.MessageSystemAttributeName{types.MessageSystemAttributeNameApproximateReceiveCount},
+		QueueUrl:            aws.String(c.cfg.QueueURL),
+		MaxNumberOfMessages: c.cfg.MaxMessages,
+		WaitTimeSeconds:     int32(c.cfg.WaitTime.Seconds()),
+		VisibilityTimeout:   int32(c.cfg.VisibilityTimeout.Seconds()),
+		MessageSystemAttributeNames: []types.MessageSystemAttributeName{
+			types.MessageSystemAttributeNameApproximateReceiveCount, types.MessageSystemAttributeNameSenderId,
+		},
 	})
 	if err != nil {
 		c.receiveFailed(ctx, err)
@@ -120,7 +124,7 @@ func (c *Consumer) handle(parent context.Context, m types.Message) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), c.cfg.ProcessTimeout)
 	defer cancel()
 	ctx = observability.WithAttrs(ctx, slog.String("sqsMessageId", aws.ToString(m.MessageId)))
-	msg, err := DecodeMessage(c.cfg.Name, aws.ToString(m.Body))
+	msg, err := c.decode(m)
 	if err != nil {
 		c.deadLetter(ctx, m, err)
 		return
@@ -136,6 +140,16 @@ func (c *Consumer) handle(parent context.Context, m types.Message) {
 	default:
 		c.deadLetter(ctx, m, err)
 	}
+}
+
+// decode validates the message and binds its providerId to the sender.
+func (c *Consumer) decode(m types.Message) (app.InboundMessage, error) {
+	msg, err := DecodeMessage(c.cfg.Name, aws.ToString(m.Body))
+	if err != nil {
+		return app.InboundMessage{}, err
+	}
+	sender := m.Attributes[string(types.MessageSystemAttributeNameSenderId)]
+	return msg, c.cfg.Senders.Authorize(sender, msg.Command.ProviderID)
 }
 
 func (c *Consumer) ack(ctx context.Context, m types.Message, res app.ConsumeResult) {

@@ -27,6 +27,7 @@ func TestDefaults(t *testing.T) {
 	assert.Equal(t, 10, c.PendingMaxAttempts)
 	assert.Equal(t, 30*time.Second, c.SQSVisibility)
 	assert.NotEmpty(t, c.InstanceID)
+	assert.Equal(t, "000000000000=*", c.SQSSenderProviders, "LocalStack reports every sender as the account id")
 }
 
 func TestOverrides(t *testing.T) {
@@ -57,6 +58,9 @@ func TestValidation(t *testing.T) {
 		{"SQS_WAIT_TIME": "21s"},
 		{"SQS_PROCESS_TIMEOUT": "30s"},
 		{"PENDING_BASE_DELAY": "2m"},
+		{"PENDING_INTERVAL": "0s"},
+		{"OUTBOX_INTERVAL": "-1s"},
+		{"OUTBOX_LEASE": "0s"},
 	}
 	for _, values := range invalid {
 		_, err := config.Load(env(values))

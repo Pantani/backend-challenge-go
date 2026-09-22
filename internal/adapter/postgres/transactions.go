@@ -16,19 +16,19 @@ import (
 const transactionColumns = `id, origin, kind, status, wallet_id, player_id, amount_minor, currency,
 	provider_id, external_transaction_id, idempotency_key, payload_hash, round_id, game_id,
 	reference_external_transaction_id, reference_transaction_id, failure_code, result_balance_minor,
-	attempts, next_attempt_at, correlation_id, created_at, updated_at`
+	result_currency, attempts, next_attempt_at, correlation_id, created_at, updated_at`
 
 type transactionRepo struct{ db dbtx }
 
 func (r transactionRepo) Create(ctx context.Context, t *wager.Transaction) error {
 	ext := t.External()
 	_, err := r.db.Exec(ctx, `INSERT INTO wager_transactions (`+transactionColumns+`)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)`,
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)`,
 		t.ID(), string(t.Origin()), string(t.Kind()), string(t.Status()), t.WalletID(), t.PlayerID(),
 		t.Amount().Minor(), string(t.Amount().Currency()),
 		nullString(ext.ProviderID), nullString(ext.ExternalID), nullString(ext.IdempotencyKey), nullString(ext.PayloadHash),
 		nullString(ext.RoundID), nullString(ext.GameID), nullString(ext.ReferenceExternalID),
-		nullUUID(t.ReferenceTxID()), nullString(string(t.FailureCode())), resultBalance(t),
+		nullUUID(t.ReferenceTxID()), nullString(string(t.FailureCode())), resultBalance(t), resultCurrency(t),
 		t.Attempts(), nullTime(t.NextAttemptAt()), t.CorrelationID(), t.CreatedAt(), t.UpdatedAt())
 	return mapError(err)
 }
@@ -38,10 +38,10 @@ func (r transactionRepo) Create(ctx context.Context, t *wager.Transaction) error
 func (r transactionRepo) Save(ctx context.Context, t *wager.Transaction) error {
 	_, err := r.db.Exec(ctx, `UPDATE wager_transactions
 		SET status = $2, reference_transaction_id = $3, failure_code = $4, result_balance_minor = $5,
-		    attempts = $6, next_attempt_at = $7, updated_at = $8
+		    result_currency = $6, attempts = $7, next_attempt_at = $8, updated_at = $9
 		WHERE id = $1`,
 		t.ID(), string(t.Status()), nullUUID(t.ReferenceTxID()), nullString(string(t.FailureCode())),
-		resultBalance(t), t.Attempts(), nullTime(t.NextAttemptAt()), t.UpdatedAt())
+		resultBalance(t), resultCurrency(t), t.Attempts(), nullTime(t.NextAttemptAt()), t.UpdatedAt())
 	return mapError(err)
 }
 
@@ -117,7 +117,7 @@ type transactionRow struct {
 	origin, kind, status, currency             string
 	amount                                     int64
 	provider, external, key, hash, round, game *string
-	refExternal, failure                       *string
+	refExternal, failure, resultCurrency       *string
 	refID                                      *uuid.UUID
 	result                                     *int64
 	next                                       *time.Time
@@ -127,7 +127,7 @@ func scanTransaction(row pgx.Row) (*wager.Transaction, error) {
 	var r transactionRow
 	err := row.Scan(&r.s.ID, &r.origin, &r.kind, &r.status, &r.s.WalletID, &r.s.PlayerID, &r.amount, &r.currency,
 		&r.provider, &r.external, &r.key, &r.hash, &r.round, &r.game, &r.refExternal, &r.refID, &r.failure, &r.result,
-		&r.s.Attempts, &r.next, &r.s.CorrelationID, &r.s.CreatedAt, &r.s.UpdatedAt)
+		&r.resultCurrency, &r.s.Attempts, &r.next, &r.s.CorrelationID, &r.s.CreatedAt, &r.s.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, err
 	}
@@ -153,7 +153,7 @@ func (r transactionRow) toDomain() (*wager.Transaction, error) {
 	s.ReferenceTxID = derefUUID(r.refID)
 	s.NextAttemptAt = derefTime(r.next)
 	if r.result != nil {
-		s.ResultBalance, _ = money.FromMinor(*r.result, c)
+		s.ResultBalance, _ = money.FromMinor(*r.result, money.Currency(deref(r.resultCurrency)))
 	}
 	return wager.Rehydrate(s)
 }
@@ -164,6 +164,13 @@ func resultBalance(t *wager.Transaction) *int64 {
 	}
 	v := t.ResultBalance().Minor()
 	return &v
+}
+
+func resultCurrency(t *wager.Transaction) *string {
+	if t.ResultBalance().Validate() != nil {
+		return nil
+	}
+	return nullString(string(t.ResultBalance().Currency()))
 }
 
 func nullUUID(id uuid.UUID) *uuid.UUID {

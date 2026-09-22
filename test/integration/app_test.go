@@ -226,6 +226,7 @@ func TestApplicationRefusesToStartWithBrokenDependencies(t *testing.T) {
 		"database down": {"DATABASE_URL": "postgres://wallet:wallet@127.0.0.1:1/wallet?sslmode=disable"},
 		"bad database":  {"DATABASE_URL": "postgres://%%%"},
 		"bad listen":    {"HTTP_ADDR": "256.0.0.1:1"},
+		"sender policy": {"SQS_SENDER_PROVIDERS": "missing-equals"},
 	}
 	for name, overrides := range cases {
 		vars := queueVars(names)

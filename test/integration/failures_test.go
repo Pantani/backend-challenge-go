@@ -151,12 +151,14 @@ func TestCorruptRowsAreReportedNotHidden(t *testing.T) {
 	t.Parallel()
 	w, tx := uuid.NewString(), uuid.NewString()
 	// XYZ passes the schema's format check but is not a supported currency.
-	require.Empty(t, sqlState(t, `INSERT INTO wallets VALUES ('`+w+`', gen_random_uuid(), 'XYZ', 0, 1, now(), now())`))
-	require.Empty(t, sqlState(t, `INSERT INTO wager_transactions (id, origin, kind, status, wallet_id, player_id, amount_minor, currency,
-		provider_id, external_transaction_id, idempotency_key, payload_hash, round_id, game_id, result_balance_minor, created_at, updated_at)
+	require.Empty(t, sqlState(t,
+		`INSERT INTO wallets VALUES ('`+w+`', gen_random_uuid(), 'XYZ', 100, 1, now(), now())`,
+		`INSERT INTO wager_transactions (id, origin, kind, status, wallet_id, player_id, amount_minor, currency,
+		provider_id, external_transaction_id, idempotency_key, payload_hash, round_id, game_id, result_balance_minor,
+		result_currency, created_at, updated_at)
 		VALUES ('`+tx+`', 'EXTERNAL', 'WIN', 'PROCESSED', '`+w+`', gen_random_uuid(), 100, 'XYZ',
-		'corrupt', '`+tx+`', '`+tx+`', 'h', 'r', 'g', 100, now(), now())`))
-	require.Empty(t, sqlState(t, `INSERT INTO ledger_entries (id, wallet_id, transaction_id, direction, amount_minor, currency,
+		'corrupt', '`+tx+`', '`+tx+`', 'h', 'r', 'g', 100, 'XYZ', now(), now())`,
+		`INSERT INTO ledger_entries (id, wallet_id, transaction_id, direction, amount_minor, currency,
 		balance_before_minor, balance_after_minor, created_at) VALUES (gen_random_uuid(), '`+w+`', '`+tx+`', 'CREDIT', 100, 'XYZ', 0, 100, now())`))
 
 	ctx := context.Background()
