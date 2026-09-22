@@ -68,9 +68,9 @@ Todas têm padrão local, exceto `AWS_ENDPOINT_URL`, que vazio significa a AWS r
 | `PENDING_INTERVAL`, `PENDING_BASE_DELAY`, `PENDING_MAX_DELAY`, `PENDING_MAX_ATTEMPTS`, `PENDING_BATCH` | `1s`, `1s`, `60s`, `10`, `50` | referências pendentes |
 | `OUTBOX_INTERVAL`, `OUTBOX_BATCH`, `OUTBOX_LEASE`, `OUTBOX_RETRY_BASE/MAX`, `OUTBOX_PUBLISH_TIMEOUT`, `OUTBOX_MAX_ATTEMPTS` | `500ms`, `50`, `30s`, `1s/60s`, `10s`, `20` | publisher da outbox |
 | `CONFLICT_RETRIES` | `5` | novas tentativas de uma transação SQL que perdeu uma disputa |
-| `SHUTDOWN_TIMEOUT` | `25s` | prazo do encerramento |
+| `SHUTDOWN_TIMEOUT` | `30s` | prazo do encerramento (maior que `SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT` e que `OUTBOX_PUBLISH_TIMEOUT`) |
 
-A configuração é validada na inicialização: valores inválidos, `LOG_LEVEL` desconhecido, intervalos e timeouts não positivos, `SQS_MAX_MESSAGES` fora de 1–10, `SQS_WAIT_TIME` acima de 20 s, `SQS_VISIBILITY_TIMEOUT` e `SQS_RETRY_MAX` acima de 12 h (limite do SQS), `*_RETRY_BASE > *_RETRY_MAX`, `PENDING_BASE_DELAY` fora de `(0, PENDING_MAX_DELAY]`, `SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT >= SQS_VISIBILITY_TIMEOUT`, `OUTBOX_PUBLISH_TIMEOUT >= OUTBOX_LEASE` e `SHUTDOWN_TIMEOUT <= SQS_PROCESS_TIMEOUT`. O start também falha se PostgreSQL, SQS ou as filas estiverem indisponíveis.
+A configuração é validada na inicialização: valores inválidos, `LOG_LEVEL` desconhecido, intervalos e timeouts não positivos, `SQS_MAX_MESSAGES` fora de 1–10, `SQS_WAIT_TIME` acima de 20 s, `SQS_VISIBILITY_TIMEOUT` e `SQS_RETRY_MAX` acima de 12 h (limite do SQS), `*_RETRY_BASE > *_RETRY_MAX`, `PENDING_BASE_DELAY` fora de `(0, PENDING_MAX_DELAY]`, `SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT >= SQS_VISIBILITY_TIMEOUT`, `OUTBOX_PUBLISH_TIMEOUT >= OUTBOX_LEASE` e `SHUTDOWN_TIMEOUT` menor ou igual a `SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT` ou a `OUTBOX_PUBLISH_TIMEOUT`. O start também falha se PostgreSQL, SQS ou as filas estiverem indisponíveis.
 
 ## Autenticação
 

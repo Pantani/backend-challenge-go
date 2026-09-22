@@ -140,7 +140,7 @@ func Load(lookup Lookup) (Config, error) {
 	host, _ := os.Hostname()
 	c := Config{
 		InstanceID: r.str("INSTANCE_ID", host), LogLevel: r.str("LOG_LEVEL", "info"),
-		HTTPAddr: r.str("HTTP_ADDR", ":8080"), ShutdownTimeout: r.dur("SHUTDOWN_TIMEOUT", 25*time.Second),
+		HTTPAddr: r.str("HTTP_ADDR", ":8080"), ShutdownTimeout: r.dur("SHUTDOWN_TIMEOUT", 30*time.Second),
 		ReadyTimeout: r.dur("READY_TIMEOUT", 2*time.Second), ConflictRetries: r.int("CONFLICT_RETRIES", 5),
 		Database: r.database(), SQS: r.sqs(),
 
@@ -268,7 +268,8 @@ func (c Config) validate() error {
 			c.OutboxPublishTimeout, c.ShutdownTimeout, c.ReadyTimeout), "worker intervals, leases, retries and timeouts must be positive"},
 		{c.OutboxRetryBase <= c.OutboxRetryMax, "OUTBOX_RETRY_BASE must not exceed OUTBOX_RETRY_MAX"},
 		{c.OutboxPublishTimeout < c.OutboxLease, "OUTBOX_PUBLISH_TIMEOUT must be lower than OUTBOX_LEASE"},
-		{c.ShutdownTimeout > c.SQSProcessTimeout, "SHUTDOWN_TIMEOUT must exceed SQS_PROCESS_TIMEOUT"},
+		{c.ShutdownTimeout > c.SQSProcessTimeout+c.SQSAckTimeout, "SHUTDOWN_TIMEOUT must exceed SQS_PROCESS_TIMEOUT plus SQS_ACK_TIMEOUT"},
+		{c.ShutdownTimeout > c.OutboxPublishTimeout, "SHUTDOWN_TIMEOUT must exceed OUTBOX_PUBLISH_TIMEOUT"},
 	}))
 }
 
