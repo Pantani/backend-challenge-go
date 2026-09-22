@@ -4,6 +4,7 @@
 *.test
 
 # Coverage
+/coverage/
 coverage.out
 coverage.html
 
