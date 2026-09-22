@@ -282,12 +282,13 @@ func startupOwnershipError(ctx context.Context) error {
 // startup. Fx lifecycle rollback is best-effort when its startup context has
 // expired, so failed startup cleanup must not depend on OnStop hooks running.
 type startupRollback struct {
-	mu       sync.Mutex
-	group    *worker.Group
-	server   *http.Server
-	listener net.Listener
-	done     chan struct{}
-	err      error
+	mu         sync.Mutex
+	group      *worker.Group
+	server     *http.Server
+	listener   net.Listener
+	done       chan struct{}
+	cleanupCtx context.Context
+	err        error
 }
 
 func newStartupOwners(ctx context.Context, shutdownTimeout time.Duration) (*poolOwner, *startupRollback) {
@@ -298,18 +299,35 @@ func newStartupOwners(ctx context.Context, shutdownTimeout time.Duration) (*pool
 
 func (r *startupRollback) SetGroup(group *worker.Group) {
 	r.mu.Lock()
+	if r.done != nil {
+		ctx := r.cleanupCtx
+		r.mu.Unlock()
+		_ = stopGroup(ctx, group)
+		return
+	}
 	r.group = group
 	r.mu.Unlock()
 }
 
 func (r *startupRollback) SetServer(server *http.Server) {
 	r.mu.Lock()
+	if r.done != nil {
+		ctx := r.cleanupCtx
+		r.mu.Unlock()
+		_ = shutdownServer(ctx, server)
+		return
+	}
 	r.server = server
 	r.mu.Unlock()
 }
 
 func (r *startupRollback) SetListener(listener net.Listener) {
 	r.mu.Lock()
+	if r.done != nil {
+		r.mu.Unlock()
+		_ = closeAdmission(listener)
+		return
+	}
 	r.listener = listener
 	r.mu.Unlock()
 }
@@ -317,7 +335,7 @@ func (r *startupRollback) SetListener(listener net.Listener) {
 // Cleanup closes HTTP admission, joins background work, and drains the server.
 // The pool owner runs separately and always closes after these runtime users.
 func (r *startupRollback) Cleanup(ctx context.Context) error {
-	group, server, listener, done, run := r.beginCleanup()
+	group, server, listener, done, run := r.beginCleanup(ctx)
 	if !run {
 		return r.waitCleanup(ctx, done)
 	}
@@ -335,13 +353,14 @@ func (r *startupRollback) cleanupWithin(parent context.Context, timeout time.Dur
 	return r.Cleanup(ctx)
 }
 
-func (r *startupRollback) beginCleanup() (*worker.Group, *http.Server, net.Listener, <-chan struct{}, bool) {
+func (r *startupRollback) beginCleanup(ctx context.Context) (*worker.Group, *http.Server, net.Listener, <-chan struct{}, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.done != nil {
 		return nil, nil, nil, r.done, false
 	}
 	r.done = make(chan struct{})
+	r.cleanupCtx = ctx
 	return r.group, r.server, r.listener, r.done, true
 }
 

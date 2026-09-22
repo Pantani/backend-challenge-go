@@ -227,7 +227,7 @@ func reconcileWallet(t *testing.T, w testenv.Wallet) {
 	defer cancel()
 	rec, err := instances[0].client().Do(ctx, http.MethodPost, "/wallets/"+w.ID+"/reconciliation", "wallet-service", "", nil)
 	require.NoError(t, err)
-	require.Equal(t, http.StatusOK, rec.Status)
+	assert.Equal(t, http.StatusOK, rec.Status)
 	assert.Equal(t, true, rec.Body["consistent"], w.ID)
 	var balance int64
 	require.NoError(t, pool.QueryRow(ctx, `SELECT balance_minor FROM wallets WHERE id = $1`, w.ID).Scan(&balance))

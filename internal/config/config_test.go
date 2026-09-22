@@ -24,7 +24,7 @@ func TestDefaults(t *testing.T) {
 		{"LOG_LEVEL", c.LogLevel, "info"},
 		{"HTTP_ADDR", c.HTTPAddr, ":8080"},
 		{"STARTUP_TIMEOUT", c.StartupTimeout, 25 * time.Second},
-		{"SHUTDOWN_TIMEOUT", c.ShutdownTimeout, 40 * time.Second},
+		{"SHUTDOWN_TIMEOUT", c.ShutdownTimeout, 61 * time.Second},
 		{"READY_TIMEOUT", c.ReadyTimeout, 2 * time.Second},
 		{"CONFLICT_RETRIES", c.ConflictRetries, 5},
 		{"DATABASE_URL", c.DatabaseURL, "postgres://wallet:wallet@localhost:5432/wallet?sslmode=disable"},
@@ -216,6 +216,19 @@ func TestShutdownDrainCoversConcurrentOperations(t *testing.T) {
 			require.ErrorContains(t, err, "SHUTDOWN_TIMEOUT")
 		})
 	}
+}
+
+func TestShutdownBudgetAccountsForSerialHTTPAndWorkerDrains(t *testing.T) {
+	t.Parallel()
+	for _, timeout := range []string{"40s", "60s"} {
+		t.Run(timeout, func(t *testing.T) {
+			t.Parallel()
+			_, err := config.Load(config.MapLookup(map[string]string{"SHUTDOWN_TIMEOUT": timeout}))
+			require.ErrorContains(t, err, "SHUTDOWN_TIMEOUT")
+		})
+	}
+	_, err := config.Load(config.MapLookup(map[string]string{"SHUTDOWN_TIMEOUT": "61s"}))
+	require.NoError(t, err)
 }
 
 func loadDatabase(lookup config.Lookup) error {

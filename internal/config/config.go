@@ -87,8 +87,8 @@ type Config struct {
 	HTTPAddr string
 	// StartupTimeout bounds dependency construction and application start.
 	StartupTimeout time.Duration
-	// ShutdownTimeout bounds the whole graceful stop. Its drain phase must
-	// cover each concurrent operation before the final cleanup budget.
+	// ShutdownTimeout bounds the whole graceful stop. HTTP drains before the
+	// worker group, then the final cleanup budget remains available.
 	ShutdownTimeout time.Duration
 	// ReadyTimeout bounds the /health/ready dependency checks and is also
 	// added to the start budget of the application.
@@ -153,7 +153,7 @@ func Load(lookup Lookup) (Config, error) {
 	c := Config{
 		InstanceID: r.str("INSTANCE_ID", host), LogLevel: r.str("LOG_LEVEL", "info"),
 		HTTPAddr: r.str("HTTP_ADDR", ":8080"), StartupTimeout: r.dur("STARTUP_TIMEOUT", 25*time.Second),
-		ShutdownTimeout: r.dur("SHUTDOWN_TIMEOUT", 40*time.Second),
+		ShutdownTimeout: r.dur("SHUTDOWN_TIMEOUT", 61*time.Second),
 		ReadyTimeout:    r.dur("READY_TIMEOUT", 2*time.Second), ConflictRetries: r.int("CONFLICT_RETRIES", 5),
 		Database: r.database(), SQS: r.sqs(),
 
@@ -322,20 +322,25 @@ func (c Config) validate() error {
 	}), c.validateShutdown())
 }
 
-// validateShutdown reserves a final cleanup phase after every independent
-// in-flight operation has drained concurrently.
+// validateShutdown reserves cleanup time after the serial HTTP and worker
+// drain phases. Each worker operation may finish concurrently with its peers.
 func (c Config) validateShutdown() error {
 	drain, ok := shutdownDrain(c.ShutdownTimeout)
 	return check([]rule{
 		{ok && httpWriteBudget < drain,
 			"SHUTDOWN_TIMEOUT must leave more than 30s for HTTP writes before cleanup"},
-		{ok && durationSumLessThan(c.SQSProcessTimeout, c.SQSAckTimeout, drain),
-			"SHUTDOWN_TIMEOUT must cover SQS_PROCESS_TIMEOUT plus SQS_ACK_TIMEOUT before cleanup"},
-		{ok && durationSumLessThan(c.OutboxPublishTimeout, c.OutboxFinalizeTimeout, drain),
-			"SHUTDOWN_TIMEOUT must cover OUTBOX_PUBLISH_TIMEOUT plus OUTBOX_FINALIZE_TIMEOUT before cleanup"},
-		{ok && c.DBStatementTimeout < drain,
-			"SHUTDOWN_TIMEOUT must cover DB_STATEMENT_TIMEOUT before cleanup"},
+		{ok && durationSum3LessThan(httpWriteBudget, c.SQSProcessTimeout, c.SQSAckTimeout, drain),
+			"SHUTDOWN_TIMEOUT must cover HTTP writes plus SQS processing and acknowledgement before cleanup"},
+		{ok && durationSum3LessThan(httpWriteBudget, c.OutboxPublishTimeout, c.OutboxFinalizeTimeout, drain),
+			"SHUTDOWN_TIMEOUT must cover HTTP writes plus outbox publication and finalization before cleanup"},
+		{ok && durationSumLessThan(httpWriteBudget, c.DBStatementTimeout, drain),
+			"SHUTDOWN_TIMEOUT must cover HTTP writes plus DB_STATEMENT_TIMEOUT before cleanup"},
 	})
+}
+
+func durationSum3LessThan(first, second, third, limit time.Duration) bool {
+	return first >= 0 && second >= 0 && third >= 0 && first < limit &&
+		second < limit-first && third < limit-first-second
 }
 
 func shutdownDrain(timeout time.Duration) (time.Duration, bool) {

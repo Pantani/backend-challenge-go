@@ -636,3 +636,16 @@ func TestConsumerRejectsInvalidFIFOIdentity(t *testing.T) {
 		})
 	}
 }
+
+func TestConsumerAcceptsUppercaseWalletGroupID(t *testing.T) {
+	t.Parallel()
+	walletID := strings.ToUpper(testWalletA)
+	proc := &fakeProcessor{}
+	f := newConsumer(t, proc, groupMessage("uppercase-group", bodyAt("message-1", "2026-09-22T12:00:00Z", "1.00", walletID), "1", walletID))
+
+	f.c.PollOnce(context.Background())
+
+	assert.Equal(t, 1, proc.calls)
+	assert.Empty(t, f.api.sent)
+	assert.Equal(t, []string{"rh-uppercase-group"}, f.api.deleted)
+}

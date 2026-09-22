@@ -81,7 +81,7 @@ func TestVarsProduceValidLifecycleConfiguration(t *testing.T) {
 	env := Env{DatabaseURL: "postgres://wallet:wallet@localhost:5432/wallet?sslmode=disable"}
 	cfg, err := env.Config(nil)
 	require.NoError(t, err)
-	require.Equal(t, 40*time.Second, cfg.ShutdownTimeout)
+	require.Equal(t, 61*time.Second, cfg.ShutdownTimeout)
 }
 
 type failingContainer struct {

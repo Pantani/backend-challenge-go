@@ -245,7 +245,7 @@ func (e *Env) Vars(overrides map[string]string) map[string]string {
 		"PENDING_INTERVAL": "100ms", "PENDING_BASE_DELAY": "200ms", "PENDING_MAX_DELAY": "1s", "PENDING_MAX_ATTEMPTS": "5",
 		"OUTBOX_INTERVAL": "100ms", "OUTBOX_LEASE": "2s", "OUTBOX_PUBLISH_TIMEOUT": "1s", "OUTBOX_FINALIZE_TIMEOUT": "500ms",
 		"OUTBOX_RETRY_BASE": "200ms", "OUTBOX_RETRY_MAX": "1s",
-		"SHUTDOWN_TIMEOUT": "40s",
+		"SHUTDOWN_TIMEOUT": "61s",
 	}
 	for k, v := range overrides {
 		vars[k] = v

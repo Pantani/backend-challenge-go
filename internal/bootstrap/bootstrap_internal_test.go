@@ -465,6 +465,85 @@ func TestApplicationDirectRollbackOwnsCanceledStartup(t *testing.T) {
 	assert.EqualValues(t, 1, spy.closes.Load())
 }
 
+func TestStartupRollbackClosesResourcesRegisteredDuringCleanup(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	rollback := &startupRollback{}
+	initialGroup := worker.NewGroup(context.Background(), logger)
+	workerStopping := make(chan struct{})
+	releaseWorker := make(chan struct{})
+	release := sync.OnceFunc(func() { close(releaseWorker) })
+	defer release()
+	initialGroup.Go("hold-cleanup", func(ctx context.Context) {
+		<-ctx.Done()
+		close(workerStopping)
+		<-releaseWorker
+	})
+	rollback.SetGroup(initialGroup)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	cleanupDone := make(chan error, 1)
+	go func() { cleanupDone <- rollback.Cleanup(ctx) }()
+	require.Eventually(t, func() bool { return channelClosed(workerStopping) }, time.Second, time.Millisecond)
+
+	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer listener.Close()
+	rollback.SetListener(listener)
+	assert.True(t, listenerClosed(listener.Addr().String()), "late listener must close on registration")
+
+	serverListener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	server := &http.Server{}
+	serveDone := make(chan struct{})
+	go func() {
+		_ = server.Serve(serverListener)
+		close(serveDone)
+	}()
+	rollback.SetServer(server)
+	require.Eventually(t, func() bool { return channelClosed(serveDone) }, time.Second, time.Millisecond,
+		"late server must shut down on registration")
+
+	lateGroup := worker.NewGroup(context.Background(), logger)
+	lateWorkerDone := make(chan struct{})
+	lateGroup.Go("late-worker", func(ctx context.Context) {
+		<-ctx.Done()
+		close(lateWorkerDone)
+	})
+	rollback.SetGroup(lateGroup)
+	require.Eventually(t, func() bool { return channelClosed(lateWorkerDone) }, time.Second, time.Millisecond,
+		"late group must stop on registration")
+
+	release()
+	require.NoError(t, <-cleanupDone)
+}
+
+func TestStartupRollbackLateGroupUsesCleanupDeadline(t *testing.T) {
+	rollback := &startupRollback{}
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	require.NoError(t, rollback.Cleanup(ctx))
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	group := worker.NewGroup(context.Background(), logger)
+	workerStopping := make(chan struct{})
+	releaseWorker := make(chan struct{})
+	defer close(releaseWorker)
+	group.Go("slow-worker", func(ctx context.Context) {
+		<-ctx.Done()
+		close(workerStopping)
+		<-releaseWorker
+	})
+	setterDone := make(chan struct{})
+	go func() {
+		rollback.SetGroup(group)
+		close(setterDone)
+	}()
+	require.Eventually(t, func() bool { return channelClosed(workerStopping) }, time.Second, time.Millisecond,
+		"late group must receive cancellation")
+	require.Eventually(t, func() bool { return channelClosed(setterDone) }, time.Second, time.Millisecond,
+		"late group registration must obey the cleanup deadline")
+}
+
 func channelClosed(ch <-chan struct{}) bool {
 	select {
 	case <-ch:

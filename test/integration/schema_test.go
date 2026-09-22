@@ -493,6 +493,35 @@ func TestMigrationFiveDownInvalidatesActiveClaims(t *testing.T) {
 	})
 }
 
+func TestMigrationExplicitCommitSeparatesTransactions(t *testing.T) {
+	t.Parallel()
+	url := databaseForTest(t, "migration_commit")
+	withConn(t, url, func(ctx context.Context, conn *pgx.Conn) error {
+		_, err := conn.Exec(ctx, `CREATE TABLE migration_commit_probe (id INT)`)
+		return err
+	})
+	source, err := iofs.New(fstest.MapFS{"1_commit.up.sql": &fstest.MapFile{Data: []byte(`
+		BEGIN;
+		INSERT INTO migration_commit_probe VALUES (1);
+		COMMIT;
+		SELECT 1 / 0;
+	`)}}, ".")
+	require.NoError(t, err)
+	m, err := migrate.NewWithSourceInstance("iofs", source, "pgx5"+strings.TrimPrefix(url, "postgres"))
+	if err != nil {
+		require.NoError(t, errors.Join(err, source.Close()))
+	}
+	t.Cleanup(func() { srcErr, dbErr := m.Close(); require.NoError(t, errors.Join(srcErr, dbErr)) })
+	requireMigrationSQLState(t, m.Up(), "22012")
+	withConn(t, url, func(ctx context.Context, conn *pgx.Conn) error {
+		var count int
+		err := conn.QueryRow(ctx, `SELECT count(*) FROM migration_commit_probe`).Scan(&count)
+		require.NoError(t, err)
+		require.Equal(t, 1, count, "the first transaction commits before the later statement fails")
+		return nil
+	})
+}
+
 func TestMigrationStatementIsBounded(t *testing.T) {
 	url := databaseForTest(t, "migration_timeout")
 	source, err := iofs.New(fstest.MapFS{"1_slow.up.sql": &fstest.MapFile{Data: []byte("SELECT pg_sleep(6);")}}, ".")

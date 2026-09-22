@@ -46,6 +46,10 @@ Migration 5 changes the outbox fencing-token contract. Stop every relay before
 running either its `up` or `down` direction: both directions deliberately
 invalidate active outbox claims. After the migration finishes, restart only a
 binary compatible with the resulting schema version.
+The migration commits its structural change before validating the new check
+constraint so the validation scan does not hold the earlier write-blocking lock.
+If validation fails, inspect the partially applied schema and migration state
+before repairing the dirty version or retrying.
 
 O binário devolve `0` em sucesso, `2` para comando ou argumentos inválidos (imprime o uso) e `1` para qualquer outra falha; erros vão para `stderr`, os logs JSON para `stdout`.
 
@@ -75,9 +79,9 @@ Todas têm padrão local, exceto `AWS_ENDPOINT_URL`, que vazio significa a AWS r
 | `OUTBOX_INTERVAL`, `OUTBOX_BATCH`, `OUTBOX_LEASE`, `OUTBOX_RETRY_BASE/MAX`, `OUTBOX_PUBLISH_TIMEOUT`, `OUTBOX_FINALIZE_TIMEOUT`, `OUTBOX_MAX_ATTEMPTS` | `500ms`, `50`, `30s`, `1s/60s`, `10s`, `5s`, `20` | outbox publisher; attempt accounting and its terminal mutation share the total finalization budget |
 | `CONFLICT_RETRIES` | `5` | novas tentativas de uma transação SQL que perdeu uma disputa |
 | `STARTUP_TIMEOUT` | `25s` | positive startup budget; deliberately short positive values remain valid for cancellation testing |
-| `SHUTDOWN_TIMEOUT` | `40s` | total stop budget; the final 5s are reserved for cleanup and the preceding drain must exceed the largest concurrent HTTP, SQS, outbox, or database operation |
+| `SHUTDOWN_TIMEOUT` | `61s` | total stop budget; HTTP drains before workers, and the final 5s are reserved for cleanup |
 
-Configuration is validated at startup: invalid values, an unknown `LOG_LEVEL`, non-positive intervals and timeouts, `DB_MAX_CONNS` outside the adapter's positive `int32` range, PostgreSQL timeouts that cannot be represented exactly in milliseconds, `SQS_MAX_MESSAGES` outside 1–10, `SQS_WAIT_TIME` outside 0–20s, fractional `SQS_WAIT_TIME`, `SQS_VISIBILITY_TIMEOUT`, or SQS retry durations, `SQS_VISIBILITY_TIMEOUT` or either SQS retry bound above 12h, `*_RETRY_BASE > *_RETRY_MAX`, `PENDING_BASE_DELAY` outside `(0, PENDING_MAX_DELAY]`, `SQS_VISIBILITY_TIMEOUT <= SQS_MAX_MESSAGES * (SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT)`, and `OUTBOX_PUBLISH_TIMEOUT + OUTBOX_FINALIZE_TIMEOUT >= OUTBOX_LEASE`. Fractional adapter values are rejected rather than rounded so the validated budget is exactly the budget sent to PostgreSQL or SQS. Duration relationships reject overflow. The shutdown drain reserves 5s for cleanup and must be longer than the HTTP 30s write bound, SQS processing plus acknowledgement, outbox publication plus finalization, and the database statement timeout. Outbox lease validation applies to one singular claim immediately before publication; it is not multiplied by `OUTBOX_BATCH`. Startup also fails when PostgreSQL, SQS, or the queues are unavailable.
+Configuration is validated at startup: invalid values, an unknown `LOG_LEVEL`, non-positive intervals and timeouts, `DB_MAX_CONNS` outside the adapter's positive `int32` range, PostgreSQL timeouts that cannot be represented exactly in milliseconds, `SQS_MAX_MESSAGES` outside 1–10, `SQS_WAIT_TIME` outside 0–20s, fractional `SQS_WAIT_TIME`, `SQS_VISIBILITY_TIMEOUT`, or SQS retry durations, `SQS_VISIBILITY_TIMEOUT` or either SQS retry bound above 12h, `*_RETRY_BASE > *_RETRY_MAX`, `PENDING_BASE_DELAY` outside `(0, PENDING_MAX_DELAY]`, `SQS_VISIBILITY_TIMEOUT <= SQS_MAX_MESSAGES * (SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT)`, and `OUTBOX_PUBLISH_TIMEOUT + OUTBOX_FINALIZE_TIMEOUT >= OUTBOX_LEASE`. Fractional adapter values are rejected rather than rounded so the validated budget is exactly the budget sent to PostgreSQL or SQS. Duration relationships reject overflow. The shutdown drain reserves 5s for cleanup and must exceed the serial sum of the HTTP 30s write bound and the longest SQS processing plus acknowledgement, outbox publication plus finalization, or database statement operation. Outbox lease validation applies to one singular claim immediately before publication; it is not multiplied by `OUTBOX_BATCH`. Startup also fails when PostgreSQL, SQS, or the queues are unavailable.
 
 ## Autenticação
 
