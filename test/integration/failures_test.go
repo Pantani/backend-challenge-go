@@ -110,7 +110,8 @@ func TestQueriesFailOnCancelledContext(t *testing.T) {
 
 func TestTerminatedConnectionFailsAndPoolRecovers(t *testing.T) {
 	t.Parallel()
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	disposable, err := postgres.NewPool(ctx, postgres.Config{URL: env.DatabaseURL, MaxConns: 1,
 		LockTimeout: time.Second, StatementTimeout: time.Second})
 	require.NoError(t, err)

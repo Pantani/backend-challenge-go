@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strconv"
 	"sync"
@@ -250,13 +251,6 @@ func sendRaw(t *testing.T, api sqsadapter.API, q sqsadapter.Queues, dedup, body,
 	require.NoError(t, err)
 }
 
-func (s services) tx(t *testing.T, provider, ext string) *wager.Transaction {
-	t.Helper()
-	got, err := s.wagers.GetByExternal(context.Background(), app.Caller{Internal: true}, provider, ext)
-	require.NoError(t, err)
-	return got
-}
-
 // noDeleteAPI simulates a consumer crash after the commit and before the
 // message is removed from the queue.
 type noDeleteAPI struct{ sqsadapter.API }
@@ -297,7 +291,13 @@ func TestConsumerCrashAfterCommitIsRedeliveredAndDeduplicated(t *testing.T) {
 }
 
 func queueDepth(api sqsadapter.API, url string) (int, error) {
-	out, err := api.GetQueueAttributes(context.Background(), &awssqs.GetQueueAttributesInput{QueueUrl: aws.String(url),
+	return queueDepthContext(context.Background(), api, url)
+}
+
+func queueDepthContext(ctx context.Context, api sqsadapter.API, url string) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	out, err := api.GetQueueAttributes(ctx, &awssqs.GetQueueAttributesInput{QueueUrl: aws.String(url),
 		AttributeNames: []types.QueueAttributeName{"ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible"}})
 	if err != nil {
 		return 0, err
@@ -362,38 +362,138 @@ func TestSameOperationThroughHTTPAndSQS(t *testing.T) {
 	t.Parallel()
 	s := newServices(t, defaultPolicy)
 	r := startApp(t)
-	w := s.openWallet(t, "100.00")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	w, err := s.wallets.Open(ctx, app.OpenWalletCommand{PlayerID: uuid.New(), InitialBalance: testutil.BRL(t, "100.00")})
+	require.NoError(t, err)
 	in := s.input(w, "provider-a", "cross", "BET", "10.00", "")
 	messageID := uuid.NewString()
-	responses, err := testenv.Parallel(2, func(i int) (testenv.Response, error) {
-		if i == 0 {
-			return r.http.Submit(context.Background(), ids(w), "provider-a", in.ExternalTransactionID, "BET", "10.00", "")
-		}
-		return testenv.Response{}, testenv.SendMessage(context.Background(), r.api, r.queues.Input, testenv.Envelope(messageID, in))
-	})
+	responses, err := crossTransportSubmit(ctx, flowClient(ctx, r.http.Base, env), r.api, r.queues.Input, in, messageID)
 	require.NoError(t, err)
 	require.Contains(t, []int{http.StatusOK, http.StatusCreated}, responses[0].Status, responses[0].Body)
 	require.Equal(t, "PROCESSED", responses[0].Body["status"])
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
-		depth, err := queueDepth(r.api, r.queues.Input)
+		depth, err := queueDepthContext(ctx, r.api, r.queues.Input)
 		if !assert.NoError(collect, err) {
 			return
 		}
 		assert.Zero(collect, depth)
 	}, 10*time.Second, 100*time.Millisecond)
-	require.Equal(t, "90.00", s.balance(t, w))
-	require.Equal(t, 1, s.debits(t, w))
+	updated, err := s.wallets.Get(ctx, w.ID())
+	require.NoError(t, err)
+	require.Equal(t, "90.00", updated.Balance().Amount())
+	debits, err := testenv.CountDebits(ctx, pool, w.ID().String())
+	require.NoError(t, err)
+	require.Equal(t, 1, debits)
 	var transactions, completed int
-	require.NoError(t, pool.QueryRow(context.Background(), `SELECT count(*) FROM wager_transactions
+	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM wager_transactions
 		WHERE provider_id = $1 AND external_transaction_id = $2`, in.ProviderID, in.ExternalTransactionID).Scan(&transactions))
 	require.Equal(t, 1, transactions)
-	require.NoError(t, pool.QueryRow(context.Background(), `SELECT count(*) FROM inbox_messages
+	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM inbox_messages
 		WHERE message_id = $1 AND processed_at IS NOT NULL`, messageID).Scan(&completed))
 	require.Equal(t, 1, completed)
-	depth, err := queueDepth(r.api, r.queues.DLQ)
+	depth, err := queueDepthContext(ctx, r.api, r.queues.DLQ)
 	require.NoError(t, err)
 	require.Zero(t, depth)
-	require.Equal(t, wager.StatusProcessed, s.tx(t, "provider-a", s.prefix+"cross").Status())
+	transaction, err := s.wagers.GetByExternal(ctx, app.Caller{Internal: true}, in.ProviderID, in.ExternalTransactionID)
+	require.NoError(t, err)
+	require.Equal(t, wager.StatusProcessed, transaction.Status())
+}
+
+// A bounded transport must return the caller's deadline, not wait for the
+// server to respond or let SQS retries outlive the HTTP submission.
+func TestCrossTransportSubmissionHonorsDeadline(t *testing.T) {
+	cancelled := make(chan bool, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		select {
+		case <-r.Context().Done():
+			cancelled <- true
+		case <-time.After(time.Second):
+			cancelled <- false
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	client := testenv.Client{Base: server.URL, Token: func(string) (string, error) { return "test", nil }}
+	in := testenv.SubmitInput(testenv.Wallet{ID: uuid.NewString(), PlayerID: uuid.NewString()}, "provider-a", uuid.NewString(), "BET", "1.00", "")
+	deadline, _ := ctx.Deadline()
+	_, err := crossTransportSubmit(ctx, client, deadlineSendAPI{deadline: deadline}, "input", in, uuid.NewString())
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	select {
+	case stopped := <-cancelled:
+		require.True(t, stopped, "HTTP was cancelled before the server responded")
+	case <-time.After(2 * time.Second):
+		t.Fatal("HTTP cancellation was not observed")
+	}
+}
+
+func TestCrossTransportTokenHonorsDeadline(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		_, _ = io.WriteString(w, `{"access_token":"late-token"}`)
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	client := flowClient(ctx, server.URL, &testenv.Env{KeycloakURL: server.URL})
+	_, err := client.Token("provider-a")
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+func flowClient(ctx context.Context, base string, environment *testenv.Env) testenv.Client {
+	return testenv.Client{Base: base, Token: func(provider string) (string, error) {
+		tokenCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		return environment.Token(tokenCtx, provider)
+	}}
+}
+
+func TestQueueDepthHonorsDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	deadline, _ := ctx.Deadline()
+	_, err := queueDepthContext(ctx, deadlineDepthAPI{deadline: deadline}, "input")
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+type deadlineDepthAPI struct {
+	sqsadapter.API
+	deadline time.Time
+}
+
+func (a deadlineDepthAPI) GetQueueAttributes(ctx context.Context, _ *awssqs.GetQueueAttributesInput, _ ...func(*awssqs.Options)) (*awssqs.GetQueueAttributesOutput, error) {
+	if deadline, bounded := ctx.Deadline(); !bounded || deadline.After(a.deadline) {
+		return nil, fmt.Errorf("queue depth call lost the caller deadline")
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+type deadlineSendAPI struct {
+	sqsadapter.API
+	deadline time.Time
+}
+
+func (a deadlineSendAPI) SendMessage(ctx context.Context, _ *awssqs.SendMessageInput, _ ...func(*awssqs.Options)) (*awssqs.SendMessageOutput, error) {
+	if deadline, bounded := ctx.Deadline(); !bounded || deadline.After(a.deadline) {
+		return nil, fmt.Errorf("SQS call lost the caller deadline")
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func crossTransportSubmit(ctx context.Context, client testenv.Client, api sqsadapter.API, queue string, in app.SubmitInput, messageID string) ([]testenv.Response, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return testenv.Parallel(2, func(i int) (testenv.Response, error) {
+		if i == 0 {
+			return client.Submit(ctx, testenv.Wallet{ID: in.WalletID, PlayerID: in.PlayerID}, in.ProviderID, in.ExternalTransactionID, in.Kind, in.Amount, "")
+		}
+		return testenv.Response{}, testenv.SendMessage(ctx, api, queue, testenv.Envelope(messageID, in))
+	})
 }
 
 func TestSQSSenderMustBeBoundToTheProvider(t *testing.T) {

@@ -50,8 +50,14 @@ func startApp(t *testing.T) runningApp {
 	t.Helper()
 	api, q, names := provisionQueues(t, 3)
 	a, addr, group := newApp(t, queueVars(names))
-	require.NoError(t, a.Start(context.Background()))
-	t.Cleanup(func() { _ = a.Stop(context.Background()) })
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer stopCancel()
+		require.NoError(t, a.Stop(stopCtx))
+	})
+	require.NoError(t, a.Start(ctx))
 	return runningApp{http: client("http://" + addr.String()), group: group, app: a, api: api, queues: q}
 }
 

@@ -12,9 +12,11 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/golang-migrate/migrate/v4"
+	"github.com/golang-migrate/migrate/v4/database"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -446,7 +448,7 @@ func TestMigrationsApplyAndRevert(t *testing.T) {
 // A new migration needs an explicit data oracle, rather than silently passing.
 func TestMigrationUpgradesPreserveRepresentativeData(t *testing.T) {
 	t.Parallel()
-	checks := map[int]func(*testing.T, *pgx.Conn){2: verifyMigrationTwo, 3: verifyMigrationThree, 4: verifyMigrationFour}
+	checks := map[int]func(context.Context, *testing.T, *pgx.Conn){2: verifyMigrationTwo, 3: verifyMigrationThree, 4: verifyMigrationFour}
 	for target := 2; target <= latestMigration(t); target++ {
 		t.Run(fmt.Sprintf("v%d_to_v%d", target-1, target), func(t *testing.T) {
 			check, ok := checks[target]
@@ -456,7 +458,65 @@ func TestMigrationUpgradesPreserveRepresentativeData(t *testing.T) {
 	}
 }
 
-func upgradeBoundary(t *testing.T, target int, check func(*testing.T, *pgx.Conn)) {
+func TestMigrationStatementIsBounded(t *testing.T) {
+	url := databaseForTest(t, "migration_timeout")
+	source, err := iofs.New(fstest.MapFS{"1_slow.up.sql": &fstest.MapFile{Data: []byte("SELECT pg_sleep(6);")}}, ".")
+	require.NoError(t, err)
+	m, err := migrate.NewWithSourceInstance("iofs", source, "pgx5"+strings.TrimPrefix(url, "postgres"))
+	if err != nil {
+		require.NoError(t, errors.Join(err, source.Close()))
+	}
+	t.Cleanup(func() { srcErr, dbErr := m.Close(); require.NoError(t, errors.Join(srcErr, dbErr)) })
+	err = m.Up()
+	require.Error(t, err, "the database must cancel a migration statement before its six-second sleep completes")
+	requireMigrationSQLState(t, err, "57014")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	config, err := pgx.ParseConfig(url)
+	require.NoError(t, err)
+	require.Equal(t, 3*time.Second, config.ConnectTimeout)
+	var running int
+	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+		WHERE datname = $1 AND state = 'active' AND query LIKE '%pg_sleep%'`, config.Database).Scan(&running))
+	require.Zero(t, running, "no timed-out migration is left running in PostgreSQL")
+}
+
+func TestMigrationLockWaitIsBounded(t *testing.T) {
+	url := databaseForTest(t, "migration_lock_timeout")
+	source, err := iofs.New(fstest.MapFS{"1_locked.up.sql": &fstest.MapFile{
+		Data: []byte("ALTER TABLE migration_lock_probe ADD COLUMN checked BOOLEAN;")}}, ".")
+	require.NoError(t, err)
+	m, err := migrate.NewWithSourceInstance("iofs", source, "pgx5"+strings.TrimPrefix(url, "postgres"))
+	if err != nil {
+		require.NoError(t, errors.Join(err, source.Close()))
+	}
+	t.Cleanup(func() { srcErr, dbErr := m.Close(); require.NoError(t, errors.Join(srcErr, dbErr)) })
+	withConn(t, url, func(ctx context.Context, conn *pgx.Conn) error {
+		_, err := conn.Exec(ctx, `CREATE TABLE migration_lock_probe (id INT)`)
+		require.NoError(t, err)
+		tx, err := conn.Begin(ctx)
+		require.NoError(t, err)
+		defer func() { _ = tx.Rollback(ctx) }()
+		_, err = tx.Exec(ctx, `LOCK TABLE migration_lock_probe IN ACCESS EXCLUSIVE MODE`)
+		require.NoError(t, err)
+		err = m.Up()
+		require.Error(t, err)
+		requireMigrationSQLState(t, err, "55P03")
+		return nil
+	})
+}
+
+func requireMigrationSQLState(t *testing.T, err error, expected string) {
+	t.Helper()
+	// migrate/database.Error exposes OrigErr but has no Unwrap method.
+	var migrationError database.Error
+	require.ErrorAs(t, err, &migrationError)
+	state, unknown := sqlState(migrationError.OrigErr)
+	require.NoError(t, unknown)
+	require.Equal(t, expected, state, "original migration error: %v", err)
+}
+
+func upgradeBoundary(t *testing.T, target int, check func(context.Context, *testing.T, *pgx.Conn)) {
 	t.Helper()
 	url := databaseForTest(t, "upgrade")
 	source, err := iofs.New(os.DirFS(filepath.Join("..", "..", "internal", "adapter", "postgres")), "migrations")
@@ -477,7 +537,7 @@ func upgradeBoundary(t *testing.T, target int, check func(*testing.T, *pgx.Conn)
 		require.False(t, dirty)
 		require.Equal(t, before, migrationSnapshot(ctx, t, conn), "existing financial and delivery data survives")
 		verifyResultCurrencies(ctx, t, conn)
-		check(t, conn)
+		check(ctx, t, conn)
 		return nil
 	})
 }
@@ -565,23 +625,23 @@ func verifyResultCurrencies(ctx context.Context, t *testing.T, conn *pgx.Conn) {
 	require.Equal(t, []string{"BRL", "BRL"}, resultCurrencies, "rejected USD wager observes its BRL wallet")
 }
 
-func verifyMigrationTwo(t *testing.T, conn *pgx.Conn) {
+func verifyMigrationTwo(ctx context.Context, t *testing.T, conn *pgx.Conn) {
 	t.Helper()
-	assertSchemaObjects(t, conn, []string{"outbox_events_partition_unpublished"},
+	assertSchemaObjects(ctx, t, conn, []string{"outbox_events_partition_unpublished"},
 		[]string{"ledger_entries_match_wallet", "wager_transactions_guard"}, []string{"wager_transactions_result_currency"})
 	var walletID string
-	require.NoError(t, conn.QueryRow(context.Background(), `SELECT id FROM wallets`).Scan(&walletID))
+	require.NoError(t, conn.QueryRow(ctx, `SELECT id FROM wallets`).Scan(&walletID))
 	id := uuid.NewString()
-	assertConnSQLState(t, conn, "23514", insertTransaction(txRow{ID: id, WalletID: walletID, Kind: "WIN", Status: "PROCESSED", Amount: 100, Provider: "edge", Result: ptr(10100)}),
+	assertConnSQLState(ctx, t, conn, "23514", insertTransaction(txRow{ID: id, WalletID: walletID, Kind: "WIN", Status: "PROCESSED", Amount: 100, Provider: "edge", Result: ptr(10100)}),
 		insertLedgerEntry(walletID, id, "CREDIT", 100, 10000, 10100, "BRL"))
 }
 
-func verifyMigrationThree(t *testing.T, conn *pgx.Conn) {
+func verifyMigrationThree(ctx context.Context, t *testing.T, conn *pgx.Conn) {
 	t.Helper()
-	assertSchemaObjects(t, conn, []string{"outbox_events_unpublished", "outbox_events_partition_unpublished"},
+	assertSchemaObjects(ctx, t, conn, []string{"outbox_events_unpublished", "outbox_events_partition_unpublished"},
 		[]string{"wager_transactions_guard"}, []string{"wager_transactions_reference_not_empty"})
 	var predicates []string
-	rows, err := conn.Query(context.Background(), `SELECT pg_get_expr(indpred, indrelid) FROM pg_index
+	rows, err := conn.Query(ctx, `SELECT pg_get_expr(indpred, indrelid) FROM pg_index
 		WHERE indexrelid IN ('outbox_events_unpublished'::regclass, 'outbox_events_partition_unpublished'::regclass)`)
 	require.NoError(t, err)
 	predicates, err = pgx.CollectRows(rows, pgx.RowTo[string])
@@ -591,27 +651,27 @@ func verifyMigrationThree(t *testing.T, conn *pgx.Conn) {
 		require.Contains(t, predicate, "dead_lettered_at IS NULL")
 	}
 	var nulls int
-	require.NoError(t, conn.QueryRow(context.Background(), `SELECT count(*) FROM outbox_events WHERE dead_lettered_at IS NULL`).Scan(&nulls))
+	require.NoError(t, conn.QueryRow(ctx, `SELECT count(*) FROM outbox_events WHERE dead_lettered_at IS NULL`).Scan(&nulls))
 	require.Equal(t, 3, nulls)
 	var walletID string
-	require.NoError(t, conn.QueryRow(context.Background(), `SELECT id FROM wallets`).Scan(&walletID))
-	assertConnSQLState(t, conn, "23514", insertTransaction(txRow{WalletID: walletID, Kind: "REFUND", Status: "PENDING_REFERENCE", Amount: 100,
+	require.NoError(t, conn.QueryRow(ctx, `SELECT id FROM wallets`).Scan(&walletID))
+	assertConnSQLState(ctx, t, conn, "23514", insertTransaction(txRow{WalletID: walletID, Kind: "REFUND", Status: "PENDING_REFERENCE", Amount: 100,
 		Provider: "edge", Reference: ptr(""), NextAttempt: true}))
 }
 
-func verifyMigrationFour(t *testing.T, conn *pgx.Conn) {
+func verifyMigrationFour(ctx context.Context, t *testing.T, conn *pgx.Conn) {
 	t.Helper()
-	assertSchemaObjects(t, conn, []string{"outbox_events_unpublished"}, []string{"wager_transactions_guard"},
+	assertSchemaObjects(ctx, t, conn, []string{"outbox_events_unpublished"}, []string{"wager_transactions_guard"},
 		[]string{"wager_transactions_status_check", "outbox_events_single_outcome", "outbox_events_lease_pair"})
 	var dead int
-	require.NoError(t, conn.QueryRow(context.Background(), `SELECT count(*) FROM outbox_events WHERE dead_lettered_at IS NOT NULL`).Scan(&dead))
+	require.NoError(t, conn.QueryRow(ctx, `SELECT count(*) FROM outbox_events WHERE dead_lettered_at IS NOT NULL`).Scan(&dead))
 	require.Equal(t, 1, dead, "preexisting dead letter survives")
-	assertConnSQLState(t, conn, "23514", `UPDATE outbox_events SET dead_lettered_at = now() WHERE partition_key = 'published'`)
-	assertConnSQLState(t, conn, "23514", `UPDATE outbox_events SET locked_until = NULL WHERE partition_key = 'leased'`)
-	assertConnSQLState(t, conn, "23514", `UPDATE wager_transactions SET status = 'PENDING' WHERE status = 'PENDING_REFERENCE'`)
+	assertConnSQLState(ctx, t, conn, "23514", `UPDATE outbox_events SET dead_lettered_at = now() WHERE partition_key = 'published'`)
+	assertConnSQLState(ctx, t, conn, "23514", `UPDATE outbox_events SET locked_until = NULL WHERE partition_key = 'leased'`)
+	assertConnSQLState(ctx, t, conn, "23514", `UPDATE wager_transactions SET status = 'PENDING' WHERE status = 'PENDING_REFERENCE'`)
 }
 
-func assertSchemaObjects(t *testing.T, conn *pgx.Conn, indexes, triggers, constraints []string) {
+func assertSchemaObjects(ctx context.Context, t *testing.T, conn *pgx.Conn, indexes, triggers, constraints []string) {
 	t.Helper()
 	queries := []struct {
 		names []string
@@ -623,25 +683,25 @@ func assertSchemaObjects(t *testing.T, conn *pgx.Conn, indexes, triggers, constr
 	}
 	for _, query := range queries {
 		var count int
-		require.NoError(t, conn.QueryRow(context.Background(), query.query, query.names).Scan(&count))
+		require.NoError(t, conn.QueryRow(ctx, query.query, query.names).Scan(&count))
 		require.Equal(t, len(query.names), count, "named schema objects %v", query.names)
 	}
 }
 
-func assertConnSQLState(t *testing.T, conn *pgx.Conn, expected string, statements ...string) {
+func assertConnSQLState(ctx context.Context, t *testing.T, conn *pgx.Conn, expected string, statements ...string) {
 	t.Helper()
 	require.NotEmpty(t, expected)
-	tx, err := conn.Begin(context.Background())
+	tx, err := conn.Begin(ctx)
 	require.NoError(t, err)
-	defer func() { _ = tx.Rollback(context.Background()) }()
+	defer func() { _ = tx.Rollback(ctx) }()
 	for _, statement := range statements {
-		_, err = tx.Exec(context.Background(), statement)
+		_, err = tx.Exec(ctx, statement)
 		if err != nil {
 			break
 		}
 	}
 	if err == nil {
-		err = tx.Commit(context.Background())
+		err = tx.Commit(ctx)
 	}
 	require.Error(t, err)
 	state, unknown := sqlState(err)
@@ -685,6 +745,10 @@ func withConn(t *testing.T, url string, fn func(ctx context.Context, conn *pgx.C
 	defer cancel()
 	conn, err := pgx.Connect(ctx, url)
 	require.NoError(t, err)
-	defer func() { _ = conn.Close(ctx) }()
+	defer func() {
+		closeCtx, closeCancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+		defer closeCancel()
+		require.NoError(t, conn.Close(closeCtx))
+	}()
 	require.NoError(t, fn(ctx, conn))
 }
