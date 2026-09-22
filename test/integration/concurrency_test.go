@@ -5,7 +5,6 @@ package integration_test
 import (
 	"context"
 	"fmt"
-	"sync"
 	"testing"
 	"time"
 
@@ -16,25 +15,8 @@ import (
 	"github.com/Pantani/backend-challenge-go/internal/app"
 	"github.com/Pantani/backend-challenge-go/internal/domain/wager"
 	"github.com/Pantani/backend-challenge-go/internal/domain/wallet"
+	"github.com/Pantani/backend-challenge-go/test/testenv"
 )
-
-// parallel runs fn n times concurrently and collects the results.
-func parallel[T any](n int, fn func(i int) T) []T {
-	out := make([]T, n)
-	var wg sync.WaitGroup
-	start := make(chan struct{})
-	for i := range n {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			out[i] = fn(i)
-		}()
-	}
-	close(start)
-	wg.Wait()
-	return out
-}
 
 type outcome struct {
 	res app.SubmitResult
@@ -54,7 +36,7 @@ func TestFiftyIdenticalBetsDebitOnce(t *testing.T) {
 	t.Parallel()
 	s := newServices(t, defaultPolicy)
 	w := s.openWallet(t, "1000.00")
-	results := parallel(50, func(int) outcome { return s.submitAsync(w, "same-bet", "BET", "25.00", "") })
+	results := testenv.Parallel(50, func(int) outcome { return s.submitAsync(w, "same-bet", "BET", "25.00", "") })
 
 	ids, replays := map[string]int{}, 0
 	for _, r := range results {
@@ -80,7 +62,7 @@ func TestTwoBetsRaceOnSameBalance(t *testing.T) {
 	t.Parallel()
 	s := newServices(t, defaultPolicy)
 	w := s.openWallet(t, "100.00")
-	results := parallel(2, func(i int) outcome { return s.submitAsync(w, []string{"bet-a", "bet-b"}[i], "BET", "80.00", "") })
+	results := testenv.Parallel(2, func(i int) outcome { return s.submitAsync(w, []string{"bet-a", "bet-b"}[i], "BET", "80.00", "") })
 
 	statuses := map[wager.Status]int{}
 	for _, r := range results {
@@ -133,8 +115,8 @@ func TestIndependentWalletsProgressInParallel(t *testing.T) {
 func TestManyWalletsConcurrently(t *testing.T) {
 	t.Parallel()
 	s := newServices(t, defaultPolicy)
-	wallets := parallel(10, func(int) *wallet.Wallet { return s.openWallet(t, "100.00") })
-	results := parallel(100, func(i int) outcome {
+	wallets := testenv.Parallel(10, func(int) *wallet.Wallet { return s.openWallet(t, "100.00") })
+	results := testenv.Parallel(100, func(i int) outcome {
 		return s.submitAsync(wallets[i%10], fmt.Sprintf("multi-%d", i), "BET", "10.00", "")
 	})
 	for _, r := range results {
@@ -152,7 +134,7 @@ func TestConcurrentReversalsOnlyOneSucceeds(t *testing.T) {
 	s := newServices(t, defaultPolicy)
 	w := s.openWallet(t, "100.00")
 	s.submit(t, w, "rev-bet", "BET", "40.00", "")
-	results := parallel(2, func(i int) outcome {
+	results := testenv.Parallel(2, func(i int) outcome {
 		return s.submitAsync(w, []string{"rev-refund", "rev-rollback"}[i], []string{"REFUND", "ROLLBACK"}[i], "40.00", "rev-bet")
 	})
 	codes := map[wager.FailureCode]int{}
@@ -176,7 +158,7 @@ func TestPendingReferenceResolvedOnceByCompetingWorkers(t *testing.T) {
 	// Three instances race for the same due operation (they may also pick
 	// up pending rows of other tests sharing the database).
 	workers := []services{s, newServices(t, defaultPolicy), newServices(t, defaultPolicy)}
-	parallel(3, func(i int) error {
+	testenv.Parallel(3, func(i int) error {
 		_, err := workers[i].wagers.ResolveDue(context.Background())
 		assert.NoError(t, err)
 		return err
@@ -243,8 +225,8 @@ func TestLockTimeoutIsTransient(t *testing.T) {
 	_, err = tx.Exec(ctx, `SELECT 1 FROM wallets WHERE id = $1 FOR UPDATE`, w.ID())
 	require.NoError(t, err)
 
-	svc := app.NewWagerService(app.WagerDeps{UoW: postgres.NewUnitOfWork(short), Queries: postgres.NewQueries(short),
-		Clock: app.SystemClock{}, IDs: app.UUIDv7{}, Metrics: s.metrics, Logger: nil, Policy: defaultPolicy, ConflictRetries: 1})
+	svc := app.NewWagerService(app.WagerDeps{Deps: app.Deps{UoW: postgres.NewUnitOfWork(short), Queries: postgres.NewQueries(short),
+		Clock: app.SystemClock{}, IDs: app.UUIDv7{}, Metrics: s.metrics, Logger: nil}, Policy: defaultPolicy, ConflictRetries: 1})
 	cmd, err := app.NewSubmitCommand(s.input(w, "provider-a", "lock-timeout", "BET", "1.00", ""))
 	require.NoError(t, err)
 	_, err = svc.Submit(ctx, cmd)

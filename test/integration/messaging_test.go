@@ -16,7 +16,6 @@ import (
 	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"github.com/google/uuid"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -25,10 +24,10 @@ import (
 	"github.com/Pantani/backend-challenge-go/internal/app"
 	"github.com/Pantani/backend-challenge-go/internal/domain/wager"
 	"github.com/Pantani/backend-challenge-go/internal/observability"
+	"github.com/Pantani/backend-challenge-go/internal/testutil"
 	"github.com/Pantani/backend-challenge-go/internal/worker"
+	"github.com/Pantani/backend-challenge-go/test/testenv"
 )
-
-func newMetrics() *observability.Metrics { return observability.NewMetrics(prometheus.NewRegistry()) }
 
 func newRelay(t *testing.T, owner string, store app.OutboxStore, pub worker.Publisher) *worker.Relay {
 	t.Helper()
@@ -40,7 +39,7 @@ func newRelayWithAttempts(t *testing.T, owner string, store app.OutboxStore, pub
 	return worker.NewRelay(store, pub, app.SystemClock{}, worker.RelayConfig{
 		Owner: owner, BatchSize: 500, Lease: time.Second, RetryBase: 10 * time.Millisecond, RetryMax: 20 * time.Millisecond,
 		PublishTime: 5 * time.Second, MaxAttempts: maxAttempts,
-	}, observability.NewLogger(io.Discard, "error", owner), newMetrics())
+	}, observability.NewLogger(io.Discard, "error", owner), testutil.NewMetrics())
 }
 
 // unpublished counts outbox rows of a wallet not yet published.
@@ -96,7 +95,7 @@ func TestTwoPublishersShareTheOutbox(t *testing.T) {
 	pub := sqsadapter.NewPublisher(api, q.Events)
 	store := postgres.NewOutboxStore(pool)
 	relays := []*worker.Relay{newRelay(t, "relay-a", store, pub), newRelay(t, "relay-b", store, pub)}
-	parallel(2, func(i int) bool { relays[i].Tick(context.Background()); return true })
+	testenv.Parallel(2, func(i int) bool { relays[i].Tick(context.Background()); return true })
 	require.Eventually(t, func() bool { relays[0].Tick(context.Background()); return unpublished(t, w.ID()) == 0 }, 10*time.Second, 100*time.Millisecond)
 
 	ids := eventIDs(t, drain(t, api, q.Events))
@@ -202,21 +201,12 @@ func consumerFor(api sqsadapter.API, q sqsadapter.Queues, svc sqsadapter.Process
 		Name: "it-consumer", QueueURL: q.Input, DLQURL: q.DLQ, MaxMessages: 10, WaitTime: time.Second,
 		VisibilityTimeout: 2 * time.Second, ProcessTimeout: time.Second, RetryBase: time.Second, RetryMax: time.Second,
 		Senders: localSenders,
-	}, svc, observability.NewLogger(io.Discard, "error", "c"), newMetrics())
+	}, svc, observability.NewLogger(io.Discard, "error", "c"), testutil.NewMetrics())
 }
 
 func sendMessage(t *testing.T, api sqsadapter.API, q sqsadapter.Queues, messageID string, in app.SubmitInput) {
 	t.Helper()
-	data, err := json.Marshal(map[string]any{
-		"messageId": messageID, "type": sqsadapter.MessageType, "occurredAt": "2026-09-08T12:00:00.000Z",
-		"data": map[string]any{
-			"providerId": in.ProviderID, "externalTransactionId": in.ExternalTransactionID, "idempotencyKey": in.IdempotencyKey,
-			"playerId": in.PlayerID, "walletId": in.WalletID, "roundId": in.RoundID, "gameId": in.GameID, "kind": in.Kind,
-			"money": map[string]string{"amount": in.Amount, "currency": in.Currency},
-		},
-	})
-	require.NoError(t, err)
-	sendRaw(t, api, q, messageID, string(data), in.WalletID)
+	require.NoError(t, testenv.SendMessage(context.Background(), api, q.Input, testenv.Envelope(messageID, in)))
 }
 
 func sendRaw(t *testing.T, api sqsadapter.API, q sqsadapter.Queues, dedup, body, group string) {
@@ -331,7 +321,7 @@ func TestSameOperationThroughHTTPAndSQS(t *testing.T) {
 
 	cmd, err := app.NewSubmitCommand(in)
 	require.NoError(t, err)
-	results := parallel(2, func(i int) error {
+	results := testenv.Parallel(2, func(i int) error {
 		if i == 0 {
 			_, err := s.wagers.Submit(context.Background(), cmd)
 			return err
@@ -358,7 +348,7 @@ func TestSQSSenderMustBeBoundToTheProvider(t *testing.T) {
 		Name: "it-consumer", QueueURL: q.Input, DLQURL: q.DLQ, MaxMessages: 10, WaitTime: time.Second,
 		VisibilityTimeout: 2 * time.Second, ProcessTimeout: time.Second, RetryBase: time.Second, RetryMax: time.Second,
 		Senders: sqsadapter.SenderPolicy{"000000000000": {"provider-b"}},
-	}, s.wagers, observability.NewLogger(io.Discard, "error", "c"), newMetrics())
+	}, s.wagers, observability.NewLogger(io.Discard, "error", "c"), testutil.NewMetrics())
 	onlyB.PollOnce(context.Background())
 
 	dead := drain(t, api, q.DLQ)
@@ -405,7 +395,7 @@ func TestOutboxKeepsPerWalletOrderWhenAnEventFails(t *testing.T) {
 	store := postgres.NewOutboxStore(pool)
 	relays := []*worker.Relay{newRelay(t, "ordered-a", store, pub), newRelay(t, "ordered-b", store, pub)}
 	require.Eventually(t, func() bool {
-		parallel(2, func(i int) bool { relays[i].Tick(context.Background()); return true })
+		testenv.Parallel(2, func(i int) bool { relays[i].Tick(context.Background()); return true })
 		return unpublished(t, w.ID()) == 0
 	}, 20*time.Second, 100*time.Millisecond)
 
@@ -466,4 +456,96 @@ func TestProvisioningReconcilesChangedAttributes(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "45", out.Attributes["VisibilityTimeout"])
 	assert.Contains(t, out.Attributes["RedrivePolicy"], "7")
+}
+
+// insertOutboxEvent stores one due, unpublished event on its own partition.
+func insertOutboxEvent(t *testing.T) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	_, err := pool.Exec(context.Background(), `INSERT INTO outbox_events
+		(event_id, aggregate_type, aggregate_id, partition_key, event_type, payload, occurred_at, next_attempt_at)
+		VALUES ($1, 'Wallet', gen_random_uuid(), $2, 'T', '{"a":1}', now(), now())`, id, id.String())
+	require.NoError(t, err)
+	return id
+}
+
+func claimed(msgs []app.OutboxMessage, id uuid.UUID) bool {
+	return slices.ContainsFunc(msgs, func(m app.OutboxMessage) bool { return m.EventID == id })
+}
+
+// Not parallel: Claim leases the whole (shared) outbox.
+func TestOutboxLeaseExpiryHandsTheEventOver(t *testing.T) {
+	ctx := context.Background()
+	store := postgres.NewOutboxStore(pool)
+	id := insertOutboxEvent(t)
+
+	first, err := store.Claim(ctx, "relay-a", time.Now(), time.Millisecond, 1000)
+	require.NoError(t, err)
+	require.True(t, claimed(first, id), "the fresh event is the head of its partition")
+	held, err := store.Claim(ctx, "relay-b", time.Now().Add(-time.Hour), time.Millisecond, 1000)
+	require.NoError(t, err)
+	assert.False(t, claimed(held, id), "a live lease is not taken over")
+
+	time.Sleep(10 * time.Millisecond)
+	second, err := store.Claim(ctx, "relay-b", time.Now(), time.Millisecond, 1000)
+	require.NoError(t, err)
+	require.True(t, claimed(second, id), "an expired lease is taken over")
+
+	ok, err := store.MarkPublished(ctx, id, "relay-a", time.Now())
+	require.NoError(t, err)
+	assert.False(t, ok, "the previous owner lost the lease")
+	require.NoError(t, store.MarkFailed(ctx, id, "relay-a", time.Now(), "late"), "a stale MarkFailed is a no-op, not an error")
+	ok, err = store.MarkPublished(ctx, id, "relay-b", time.Now())
+	require.NoError(t, err)
+	assert.True(t, ok, "the current owner confirms the publication")
+	ok, err = store.MarkPublished(ctx, id, "relay-b", time.Now())
+	require.NoError(t, err)
+	assert.False(t, ok, "a publication is confirmed once")
+}
+
+func TestInboxRegisterSerialisesConcurrentDeliveries(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	consumer, message := "it-consumer", uuid.NewString()
+	registered, release := make(chan struct{}), make(chan struct{})
+	first := make(chan error, 1)
+	go func() {
+		first <- postgres.NewUnitOfWork(pool).Do(ctx, func(ctx context.Context, r app.Repositories) error {
+			_, created, err := r.Inbox().Register(ctx, consumer, message, "h1", time.Now())
+			if err == nil && !created {
+				err = fmt.Errorf("first delivery must create the entry")
+			}
+			close(registered)
+			<-release
+			return err
+		})
+	}()
+	<-registered
+
+	type outcome struct {
+		entry   app.InboxEntry
+		created bool
+		err     error
+	}
+	second := make(chan outcome, 1)
+	go func() {
+		var o outcome
+		o.err = postgres.NewUnitOfWork(pool).Do(ctx, func(ctx context.Context, r app.Repositories) error {
+			var err error
+			o.entry, o.created, err = r.Inbox().Register(ctx, consumer, message, "h1", time.Now())
+			return err
+		})
+		second <- o
+	}()
+	select {
+	case o := <-second:
+		t.Fatalf("second delivery returned %+v before the first committed", o)
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(release)
+	require.NoError(t, <-first)
+	o := <-second
+	require.NoError(t, o.err)
+	assert.False(t, o.created, "the redelivery sees the committed entry")
+	assert.Equal(t, app.InboxEntry{PayloadHash: "h1"}, o.entry, "not completed yet")
 }

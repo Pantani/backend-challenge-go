@@ -4,6 +4,7 @@ package integration_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -58,9 +59,10 @@ func TestKeycloakRejectsExpiredAndTamperedTokens(t *testing.T) {
 	_, err := v.Verify(ctx, shortLived)
 	require.NoError(t, err, "valid right after issuance")
 
-	time.Sleep(4 * time.Second)
-	_, err = v.Verify(ctx, shortLived)
-	require.ErrorIs(t, err, auth.ErrUnauthenticated, "expired")
+	require.Eventually(t, func() bool {
+		_, err := v.Verify(ctx, shortLived)
+		return errors.Is(err, auth.ErrUnauthenticated)
+	}, 10*time.Second, 200*time.Millisecond, "the short-lived token expires")
 
 	raw := token(t, "provider-a")
 	tampered := raw[:len(raw)-4] + "AAAA"

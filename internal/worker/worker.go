@@ -13,52 +13,70 @@ import (
 // Group supervises background goroutines. Stop cancels them and waits until
 // every one returned or the deadline expires.
 type Group struct {
-	ctx     context.Context
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
-	logger  *slog.Logger
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+	logger *slog.Logger
+
 	mu      sync.Mutex
-	running map[string]struct{}
+	running int
+	stopped bool
 }
 
 // NewGroup creates a group whose goroutines live until Stop.
 func NewGroup(parent context.Context, logger *slog.Logger) *Group {
 	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
-	return &Group{ctx: ctx, cancel: cancel, logger: logger, running: map[string]struct{}{}}
+	return &Group{ctx: ctx, cancel: cancel, logger: logger}
 }
 
 // Go starts fn in a goroutine; fn must return when its context is done.
+// Names are labels for the logs only: two workers may share one. A call
+// after Stop is logged and dropped instead of racing the wait.
 func (g *Group) Go(name string, fn func(ctx context.Context)) {
-	g.wg.Add(1)
-	g.setRunning(name, true)
+	if !g.start() {
+		g.logger.Warn("worker not started: group already stopped", "worker", name)
+		return
+	}
 	g.logger.Info("worker started", "worker", name)
 	go func() {
 		defer g.wg.Done()
 		defer g.logger.Info("worker stopped", "worker", name)
-		defer g.setRunning(name, false)
+		defer g.finish()
 		fn(g.ctx)
 	}()
 }
 
-func (g *Group) setRunning(name string, on bool) {
+// start registers a worker unless the group is stopped.
+func (g *Group) start() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if on {
-		g.running[name] = struct{}{}
-		return
+	if g.stopped {
+		return false
 	}
-	delete(g.running, name)
+	g.wg.Add(1)
+	g.running++
+	return true
+}
+
+func (g *Group) finish() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.running--
 }
 
 // Running returns how many workers have not returned yet.
 func (g *Group) Running() int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return len(g.running)
+	return g.running
 }
 
-// Stop cancels the workers and waits for them within ctx.
+// Stop cancels the workers and waits for them within ctx. It is safe to
+// call more than once.
 func (g *Group) Stop(ctx context.Context) error {
+	g.mu.Lock()
+	g.stopped = true
+	g.mu.Unlock()
 	g.cancel()
 	done := make(chan struct{})
 	go func() {

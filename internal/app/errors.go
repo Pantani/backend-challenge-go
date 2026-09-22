@@ -5,6 +5,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 )
 
 var (
@@ -34,6 +35,14 @@ var (
 	// by another instance.
 	ErrNotDue = errors.New("pending transaction is not due")
 )
+
+// errInvalidCursor reports a ledger cursor that was not produced by Ledger.
+var errInvalidCursor = errors.New("invalid cursor")
+
+// invalid wraps a domain or parsing error as ErrValidation.
+func invalid(err error) error {
+	return fmt.Errorf("%w: %w", ErrValidation, err)
+}
 
 // IsTransient reports whether retrying the same operation may succeed.
 func IsTransient(err error) bool {

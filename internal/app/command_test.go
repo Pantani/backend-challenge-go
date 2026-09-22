@@ -97,6 +97,7 @@ func TestConsumeMessage(t *testing.T) {
 	again, err := h.wagers.ConsumeMessage(ctx, msg)
 	require.NoError(t, err)
 	assert.True(t, again.Duplicate)
+	assert.Equal(t, 1.0, h.counter(t, "wager_transactions_total", map[string]string{"source": app.SourceSQS}), "duplicates are not observed")
 
 	msg.Hash = "changed"
 	_, err = h.wagers.ConsumeMessage(ctx, msg)
@@ -124,6 +125,10 @@ func TestConsumeMessageFailuresRollBack(t *testing.T) {
 		h.store.failOn(failing, errBoom)
 		_, err := h.wagers.ConsumeMessage(context.Background(), msg)
 		require.ErrorIs(t, err, errBoom, failing)
+		got, err := h.wallets.Get(context.Background(), msg.Command.WalletID)
+		require.NoError(t, err, failing)
+		assert.Equal(t, "100.00", got.Balance().Amount(), failing)
+		assert.Equal(t, 2, h.store.outboxCount(), failing)
 
 		res, err := h.wagers.ConsumeMessage(context.Background(), msg)
 		require.NoError(t, err, failing)

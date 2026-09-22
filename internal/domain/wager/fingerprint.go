@@ -1,6 +1,7 @@
 package wager
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -24,8 +25,9 @@ type Fingerprint struct {
 }
 
 // Hash returns the hex SHA-256 of the canonical JSON of the fingerprint:
-// object keys sorted lexicographically, no insignificant whitespace, money as
-// the fixed two-decimal string and the absent reference omitted.
+// object keys sorted lexicographically, no insignificant whitespace, no HTML
+// escaping of <, > and &, money as the fixed two-decimal string and the
+// absent reference omitted.
 func (f Fingerprint) Hash() string {
 	doc := map[string]any{
 		"providerId":            f.ProviderID,
@@ -40,9 +42,12 @@ func (f Fingerprint) Hash() string {
 	if f.ReferenceExternalTransactionID != "" {
 		doc["referenceExternalTransactionId"] = f.ReferenceExternalTransactionID
 	}
-	// encoding/json sorts map keys, which yields the canonical form. Marshal
+	// encoding/json sorts map keys, which yields the canonical form. Encoding
 	// cannot fail for maps of strings.
-	canonical, _ := json.Marshal(doc)
-	sum := sha256.Sum256(canonical)
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(doc)
+	sum := sha256.Sum256(bytes.TrimSuffix(buf.Bytes(), []byte("\n")))
 	return hex.EncodeToString(sum[:])
 }

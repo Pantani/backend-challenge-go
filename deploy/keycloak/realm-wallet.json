@@ -213,20 +213,6 @@
             "id.token.claim": "false",
             "introspection.token.claim": "true"
           }
-        },
-        {
-          "name": "provider-id",
-          "protocol": "openid-connect",
-          "protocolMapper": "oidc-hardcoded-claim-mapper",
-          "config": {
-            "claim.name": "provider_id",
-            "claim.value": "provider-a",
-            "jsonType.label": "String",
-            "access.token.claim": "true",
-            "id.token.claim": "false",
-            "userinfo.token.claim": "false",
-            "introspection.token.claim": "true"
-          }
         }
       ],
       "defaultClientScopes": [

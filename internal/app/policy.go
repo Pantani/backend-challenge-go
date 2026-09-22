@@ -1,14 +1,16 @@
 package app
 
 import (
-	"errors"
 	"time"
 )
 
 // Metric and log sources.
 const (
-	SourceHTTP   = "http"
-	SourceSQS    = "sqs"
+	// SourceHTTP labels operations submitted through the HTTP API.
+	SourceHTTP = "http"
+	// SourceSQS labels operations consumed from the broker.
+	SourceSQS = "sqs"
+	// SourceWorker labels pending references resolved by the worker.
 	SourceWorker = "worker"
 )
 
@@ -19,44 +21,32 @@ type PendingPolicy struct {
 	// MaxDelay caps the exponential backoff.
 	MaxDelay time.Duration
 	// MaxAttempts is how many deferrals happen before the operation is
-	// rejected with REFERENCE_NOT_FOUND (or REFERENCE_NOT_PROCESSED).
+	// rejected with REFERENCE_NOT_FOUND (or REFERENCE_NOT_PROCESSED). It must
+	// be at least 1 (config validation enforces it); with 0 an operation
+	// whose reference is missing would be rejected without ever waiting.
 	MaxAttempts int
 	// BatchSize bounds how many due operations one worker tick resolves.
 	BatchSize int
 }
 
-// maxShift keeps BaseDelay << attempts far from int64 overflow.
+// maxShift bounds the exponent of Backoff so base << shift stays far from
+// int64 overflow for realistic bases.
 const maxShift = 20
+
+// Backoff is the single exponential backoff formula of the service: it
+// returns base doubled exponent times (exponent is clamped to [0, 20]),
+// capped at limit. A non-positive base, a shift that overflows or a delay
+// above limit all yield limit.
+func Backoff(base, limit time.Duration, exponent int) time.Duration {
+	shift := min(max(exponent, 0), maxShift)
+	delay := base << shift
+	if delay <= 0 || delay > limit || delay>>shift != base {
+		return limit
+	}
+	return delay
+}
 
 // Next returns when the attempt-th retry should run (exponential backoff).
 func (p PendingPolicy) Next(attempts int, now time.Time) time.Time {
-	delay := p.BaseDelay << min(attempts, maxShift)
-	if delay <= 0 || delay > p.MaxDelay {
-		delay = p.MaxDelay
-	}
-	return now.Add(delay)
-}
-
-// retryConflicts runs fn again while it fails with ErrConflict, at most
-// retries extra times. Conflicts come from losing a race inside PostgreSQL
-// (unique violation, stale version, deadlock, serialization failure); the
-// retried transaction observes the committed winner and converges.
-func retryConflicts(retries int, onConflict func(), fn func() error) error {
-	err := fn()
-	for i := 0; i < retries && errors.Is(err, ErrConflict); i++ {
-		onConflict()
-		err = fn()
-	}
-	return err
-}
-
-// sequence runs steps in order and stops at the first error. It keeps
-// multi-step persistence flat and readable.
-func sequence(steps ...func() error) error {
-	for _, step := range steps {
-		if err := step(); err != nil {
-			return err
-		}
-	}
-	return nil
+	return now.Add(Backoff(p.BaseDelay, p.MaxDelay, attempts))
 }

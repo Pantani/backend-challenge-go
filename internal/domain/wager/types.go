@@ -37,17 +37,20 @@ var externalKinds = map[Kind]struct{}{
 // OPENING is reserved for internal wallet opening and is rejected.
 func ParseExternalKind(s string) (Kind, error) {
 	k := Kind(s)
-	if _, ok := externalKinds[k]; !ok {
+	if !k.External() {
 		return "", fmt.Errorf("%w: %q", ErrInvalidKind, s)
 	}
 	return k, nil
 }
 
-// Valid reports whether k is any known kind, including OPENING.
-func (k Kind) Valid() bool {
+// External reports whether k may be submitted by a provider.
+func (k Kind) External() bool {
 	_, ok := externalKinds[k]
-	return ok || k == KindOpening
+	return ok
 }
+
+// Valid reports whether k is any known kind, including OPENING.
+func (k Kind) Valid() bool { return k.External() || k == KindOpening }
 
 // RequiresReference reports whether the kind must reference another operation.
 func (k Kind) RequiresReference() bool { return k == KindRefund || k == KindRollback }
@@ -55,8 +58,13 @@ func (k Kind) RequiresReference() bool { return k == KindRefund || k == KindRoll
 // AcceptsReference reports whether the kind may carry a reference.
 func (k Kind) AcceptsReference() bool { return k.RequiresReference() || k == KindWin }
 
-// IsReversal reports whether the kind reverts a previous operation.
-func (k Kind) IsReversal() bool { return k.RequiresReference() }
+// IsReversal reports whether the kind reverts a previous operation. Today it
+// coincides with RequiresReference, but the two express different rules: a
+// reversal must match the target amount and may happen only once, while a
+// required reference is a validation constraint. Keeping them apart lets a
+// future kind require a reference without being a reversal (as WIN accepts
+// one without being).
+func (k Kind) IsReversal() bool { return k == KindRefund || k == KindRollback }
 
 // RequiresZeroAmount reports whether the kind must carry exactly 0.00.
 func (k Kind) RequiresZeroAmount() bool { return k == KindLoss }

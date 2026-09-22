@@ -21,12 +21,21 @@ const (
 // Valid reports whether d is a known direction.
 func (d Direction) Valid() bool { return d == Debit || d == Credit }
 
-// Opposite returns the reverse direction.
+// Opposite returns the reverse direction. An invalid direction maps to Debit;
+// callers must check Valid first.
 func (d Direction) Opposite() Direction {
 	if d == Debit {
 		return Credit
 	}
 	return Debit
+}
+
+// signed returns +amount for credits and -amount for debits.
+func (d Direction) signed(amount money.Money) money.Money {
+	if d == Debit {
+		return amount.Neg()
+	}
+	return amount
 }
 
 // LedgerEntry is an immutable, append-only movement of a wallet balance.
@@ -90,11 +99,7 @@ func (p LedgerEntryParams) validateAmounts() error {
 	if err := p.validateSigns(); err != nil {
 		return err
 	}
-	delta := p.Amount
-	if p.Direction == Debit {
-		delta = delta.Neg()
-	}
-	expected, err := p.BalanceBefore.Add(delta)
+	expected, err := p.BalanceBefore.Add(p.Direction.signed(p.Amount))
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidLedgerEntry, err)
 	}
@@ -128,11 +133,3 @@ func (e LedgerEntry) BalanceAfter() money.Money { return e.balanceAfter }
 
 // CreatedAt returns the creation instant.
 func (e LedgerEntry) CreatedAt() time.Time { return e.createdAt }
-
-// SignedAmount returns +amount for credits and -amount for debits.
-func (e LedgerEntry) SignedAmount() money.Money {
-	if e.direction == Debit {
-		return e.amount.Neg()
-	}
-	return e.amount
-}

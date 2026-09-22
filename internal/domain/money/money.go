@@ -20,9 +20,20 @@ import (
 )
 
 // Scale is the fixed number of decimal places of every supported currency.
+// amountPattern and Amount are written for Scale == 2 and must change with it.
 const Scale = 2
 
-const minorPerMajor = 100
+// minorPerMajor is 10^Scale, the number of minor units in one major unit.
+var minorPerMajor = pow10(Scale)
+
+// pow10 computes 10^n with integers only.
+func pow10(n int) int64 {
+	v := int64(1)
+	for range n {
+		v *= 10
+	}
+	return v
+}
 
 var (
 	// ErrInvalidAmount reports a malformed decimal amount.
@@ -88,12 +99,18 @@ func Parse(amount, currency string) (Money, error) {
 	return Money{minor: minor, currency: c}, nil
 }
 
+// combine joins the integer and fractional digits into minor units. The
+// bound is exact: the largest accepted value is math.MaxInt64 itself.
 func combine(integer, fraction string) (int64, error) {
 	major, err := strconv.ParseInt(integer, 10, 64)
-	if err != nil || major > (math.MaxInt64-99)/minorPerMajor {
+	if err != nil {
 		return 0, ErrOverflow
 	}
 	frac, _ := strconv.ParseInt(fraction, 10, 64) // regex guarantees two digits
+	maxMajor, maxFrac := math.MaxInt64/minorPerMajor, math.MaxInt64%minorPerMajor
+	if major > maxMajor || (major == maxMajor && frac > maxFrac) {
+		return 0, ErrOverflow
+	}
 	return major*minorPerMajor + frac, nil
 }
 
@@ -162,11 +179,8 @@ func addInt64(a, b int64) (int64, error) {
 	return sum, nil
 }
 
-// Sub returns m - o.
+// Sub returns m - o. Add already rejects uninitialized operands.
 func (m Money) Sub(o Money) (Money, error) {
-	if err := o.Validate(); err != nil {
-		return Money{}, err
-	}
 	return m.Add(o.Neg())
 }
 

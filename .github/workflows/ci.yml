@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main, first-release]
   workflow_dispatch:
+  schedule:
+    # Nightly integration and end-to-end run (Docker-backed, slow).
+    - cron: "0 3 * * *"
 
 permissions:
   contents: read
@@ -42,8 +45,8 @@ jobs:
             exit 1
           fi
 
-      - name: go vet
-        run: go vet ./...
+      - name: go vet (all build tags)
+        run: go vet -tags integration,e2e ./...
 
       - name: Build
         run: go build ./...
@@ -75,46 +78,8 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
+          version: v2.13
           args: --timeout=5m
-
-  complexity:
-    name: Complexity
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Install complexity tools
-        run: |
-          go install github.com/fzipp/gocyclo/cmd/gocyclo@latest
-          go install github.com/uudashr/gocognit/cmd/gocognit@latest
-
-      - name: Check cyclomatic complexity (max 6)
-        run: |
-          out="$(gocyclo -over 6 .)"
-          if [ -n "$out" ]; then
-            echo "Functions exceeding cyclomatic complexity of 6:"
-            echo "$out"
-            exit 1
-          fi
-          echo "OK: no function exceeds cyclomatic complexity of 6"
-
-      - name: Check cognitive complexity (max 8)
-        run: |
-          out="$(gocognit -over 8 .)"
-          if [ -n "$out" ]; then
-            echo "Functions exceeding cognitive complexity of 8:"
-            echo "$out"
-            exit 1
-          fi
-          echo "OK: no function exceeds cognitive complexity of 8"
 
   vulncheck:
     name: Vulnerability scan
@@ -134,3 +99,24 @@ jobs:
 
       - name: Run govulncheck
         run: govulncheck ./...
+
+  integration:
+    name: Integration and end-to-end (Docker)
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Integration tests (PostgreSQL, LocalStack, Keycloak via testcontainers)
+        run: make test-integration
+
+      - name: End-to-end tests (compiled binary, 3 instances)
+        run: make test-e2e

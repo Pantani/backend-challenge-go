@@ -1,15 +1,15 @@
 package sqs
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
+	"strings"
 
 	"github.com/Pantani/backend-challenge-go/internal/app"
+	"github.com/Pantani/backend-challenge-go/internal/contract"
 )
 
 // MessageType is the only accepted envelope type.
@@ -19,22 +19,11 @@ const MessageType = "WagerTransactionRequested"
 // the DLQ without retries.
 var ErrInvalidMessage = errors.New("invalid message")
 
-type moneyData struct {
-	Amount   string `json:"amount"`
-	Currency string `json:"currency"`
-}
-
-type messageData struct {
-	ProviderID                     string    `json:"providerId"`
-	ExternalTransactionID          string    `json:"externalTransactionId"`
-	IdempotencyKey                 string    `json:"idempotencyKey"`
-	PlayerID                       string    `json:"playerId"`
-	WalletID                       string    `json:"walletId"`
-	RoundID                        string    `json:"roundId"`
-	GameID                         string    `json:"gameId"`
-	Kind                           string    `json:"kind"`
-	Money                          moneyData `json:"money"`
-	ReferenceExternalTransactionID string    `json:"referenceExternalTransactionId"`
+// MessageData is the payload of a wager-transactions message: the shared
+// operation shape plus the idempotency key, which HTTP carries in a header.
+type MessageData struct {
+	contract.Operation
+	IdempotencyKey string `json:"idempotencyKey"`
 }
 
 // Envelope is the wager-transactions message contract.
@@ -42,20 +31,24 @@ type Envelope struct {
 	MessageID  string      `json:"messageId"`
 	Type       string      `json:"type"`
 	OccurredAt string      `json:"occurredAt"`
-	Data       messageData `json:"data"`
+	Data       MessageData `json:"data"`
+}
+
+// EncodeMessage serializes an envelope as a message body.
+func EncodeMessage(env Envelope) (string, error) {
+	b, err := json.Marshal(env)
+	if err != nil {
+		return "", fmt.Errorf("encoding message: %w", err)
+	}
+	return string(b), nil
 }
 
 // decodeEnvelope reads exactly one JSON object with no unknown fields and
 // nothing after it.
 func decodeEnvelope(body string) (Envelope, error) {
 	var env Envelope
-	dec := json.NewDecoder(bytes.NewReader([]byte(body)))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&env); err != nil {
+	if err := contract.DecodeStrict(strings.NewReader(body), &env); err != nil {
 		return Envelope{}, fmt.Errorf("%w: %w", ErrInvalidMessage, err)
-	}
-	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return Envelope{}, fmt.Errorf("%w: body must contain a single JSON object", ErrInvalidMessage)
 	}
 	return env, nil
 }
@@ -71,13 +64,7 @@ func DecodeMessage(consumer, body string) (app.InboundMessage, error) {
 	if env.MessageID == "" || env.Type != MessageType {
 		return app.InboundMessage{}, fmt.Errorf("%w: messageId is required and type must be %s", ErrInvalidMessage, MessageType)
 	}
-	d := env.Data
-	cmd, err := app.NewSubmitCommand(app.SubmitInput{
-		ProviderID: d.ProviderID, ExternalTransactionID: d.ExternalTransactionID, IdempotencyKey: d.IdempotencyKey,
-		PlayerID: d.PlayerID, WalletID: d.WalletID, RoundID: d.RoundID, GameID: d.GameID, Kind: d.Kind,
-		Amount: d.Money.Amount, Currency: d.Money.Currency, ReferenceExternalTransactionID: d.ReferenceExternalTransactionID,
-		CorrelationID: env.MessageID, CausationID: env.MessageID,
-	})
+	cmd, err := app.NewSubmitCommand(env.Data.ToInput(env.Data.IdempotencyKey, env.MessageID, env.MessageID))
 	if err != nil {
 		return app.InboundMessage{}, fmt.Errorf("%w: %w", ErrInvalidMessage, err)
 	}

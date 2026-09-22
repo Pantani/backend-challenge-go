@@ -11,13 +11,14 @@ import (
 
 	"github.com/Pantani/backend-challenge-go/internal/domain/money"
 	"github.com/Pantani/backend-challenge-go/internal/domain/wallet"
+	"github.com/Pantani/backend-challenge-go/internal/testutil"
 )
 
 func entryParams(t *testing.T, dir wallet.Direction, amount, before, after string) wallet.LedgerEntryParams {
 	t.Helper()
 	return wallet.LedgerEntryParams{
 		ID: uuid.New(), WalletID: uuid.New(), TransactionID: uuid.New(), Direction: dir,
-		Amount: brl(t, amount), BalanceBefore: brl(t, before), BalanceAfter: brl(t, after), CreatedAt: now,
+		Amount: testutil.BRL(t, amount), BalanceBefore: testutil.BRL(t, before), BalanceAfter: testutil.BRL(t, after), CreatedAt: now,
 	}
 }
 
@@ -48,10 +49,10 @@ func TestLedgerEntryInvalid(t *testing.T) {
 		"nil tx":          func(p *wallet.LedgerEntryParams) { p.TransactionID = uuid.Nil },
 		"bad direction":   func(p *wallet.LedgerEntryParams) { p.Direction = "SIDEWAYS" },
 		"zero time":       func(p *wallet.LedgerEntryParams) { p.CreatedAt = time.Time{} },
-		"zero amount":     func(p *wallet.LedgerEntryParams) { p.Amount = brl(t, "0.00") },
+		"zero amount":     func(p *wallet.LedgerEntryParams) { p.Amount = testutil.BRL(t, "0.00") },
 		"negative before": func(p *wallet.LedgerEntryParams) { p.BalanceBefore = neg },
 		"negative after":  func(p *wallet.LedgerEntryParams) { p.BalanceAfter = neg },
-		"wrong after":     func(p *wallet.LedgerEntryParams) { p.BalanceAfter = brl(t, "16.00") },
+		"wrong after":     func(p *wallet.LedgerEntryParams) { p.BalanceAfter = testutil.BRL(t, "16.00") },
 		"wrong direction": func(p *wallet.LedgerEntryParams) { p.Direction = wallet.Debit },
 		"overflowing sum": func(p *wallet.LedgerEntryParams) { p.BalanceBefore = maxM },
 		"uninit after":    func(p *wallet.LedgerEntryParams) { p.BalanceAfter = money.Money{} },

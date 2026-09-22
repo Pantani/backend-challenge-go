@@ -25,10 +25,10 @@ O compose sobe, nesta ordem:
 
 1. `postgres`, `localstack` (SQS) e `keycloak` (realm `wallet` importado de `deploy/keycloak/realm-wallet.json`);
 2. `migrate`: executa `wallet migrate up`;
-3. `provision-queues`: executa `wallet provision-queues`, que cria `wager-transactions.fifo`, `wager-transactions-dlq.fifo` (com redrive `maxReceiveCount=5`) e `wallet-events.fifo` (destino da outbox);
+3. `provision-queues` (em paralelo com `migrate`): executa `wallet provision-queues`, que cria `wager-transactions.fifo`, `wager-transactions-dlq.fifo` (com redrive `maxReceiveCount=5`) e `wallet-events.fifo` (destino da outbox);
 4. `app-1`, `app-2` e `app-3`: três processos independentes do mesmo serviço, em `localhost:8080`, `:8081` e `:8082`.
 
-`make up`, `make down` e `make logs` são atalhos.
+`make up`, `make down` (para os containers e preserva os volumes), `make clean` (remove também os volumes) e `make logs` são atalhos.
 
 ### Migrations
 
@@ -40,7 +40,9 @@ wallet migrate down [n]    # reverte n (padrão 1)
 wallet migrate version     # versão atual
 ```
 
-Com o compose: `make migrate-up` / `make migrate-down`. Fora do Docker: `go run ./cmd/wallet migrate up`, com `DATABASE_URL` apontando para o banco.
+Com o compose: `make migrate-up` / `make migrate-down`. Fora do Docker: `go run ./cmd/wallet migrate up`, com `DATABASE_URL` apontando para o banco. Os comandos `migrate` e `provision-queues` validam apenas as variáveis que usam (banco e SQS, respectivamente); só `serve` exige a configuração completa.
+
+O binário devolve `0` em sucesso, `2` para comando ou argumentos inválidos (imprime o uso) e `1` para qualquer outra falha; erros vão para `stderr`, os logs JSON para `stdout`.
 
 ### Filas
 
@@ -48,24 +50,27 @@ Com o compose: `make migrate-up` / `make migrate-down`. Fora do Docker: `go run 
 
 ## Variáveis de ambiente
 
-Todas têm padrão local. Veja [`.env.example`](.env.example), que o compose carrega. As principais:
+Todas têm padrão local, exceto `AWS_ENDPOINT_URL`, que vazio significa a AWS real (a lista completa está em [`.env.example`](.env.example), que o compose carrega). As principais:
 
 | Variável | Padrão | Descrição |
 | --- | --- | --- |
+| `INSTANCE_ID` | hostname | identifica o processo (dono dos leases da outbox e atributo `instance` dos logs) |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn` ou `error` |
 | `DATABASE_URL` | `postgres://wallet:wallet@localhost:5432/wallet?sslmode=disable` | PostgreSQL |
 | `DB_LOCK_TIMEOUT` / `DB_STATEMENT_TIMEOUT` | `5s` / `10s` | espera máxima por lock de carteira / por comando |
 | `OIDC_ISSUER` | `http://localhost:8180/realms/wallet` | `iss` esperado nos tokens |
 | `OIDC_JWKS_URL` | `…/protocol/openid-connect/certs` | onde buscar as chaves (no compose, `http://keycloak:8080/…`) |
 | `OIDC_AUDIENCE` | `wallet-api` | `aud` exigido |
-| `AWS_ENDPOINT_URL`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | LocalStack | cliente SQS |
+| `AWS_ENDPOINT_URL`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | vazio (AWS real; o `.env.example` aponta para o LocalStack), `us-east-1` | cliente SQS |
 | `SQS_INPUT_QUEUE`, `SQS_DLQ`, `SQS_EVENTS_QUEUE` | nomes acima | filas |
 | `SQS_SENDER_PROVIDERS` | `000000000000=*` | vínculo `SenderId` do SQS → provedores permitidos (`id=provider-a\|provider-b;outroId=*`) |
-| `SQS_CONSUMERS`, `SQS_VISIBILITY_TIMEOUT`, `SQS_PROCESS_TIMEOUT`, `SQS_RETRY_BASE/MAX`, `SQS_MAX_RECEIVE_COUNT` | `2`, `30s`, `20s`, `2s/60s`, `5` | consumidor |
-| `PENDING_*` | `1s` base, `60s` máx., `10` tentativas | referências pendentes |
-| `OUTBOX_*` | `500ms`, lote `50`, lease `30s`, `OUTBOX_MAX_ATTEMPTS=20` | publisher da outbox |
-| `SHUTDOWN_TIMEOUT` | `25s` | prazo do encerramento |
+| `SQS_CONSUMERS`, `SQS_WAIT_TIME`, `SQS_VISIBILITY_TIMEOUT`, `SQS_PROCESS_TIMEOUT`, `SQS_ACK_TIMEOUT`, `SQS_RETRY_BASE/MAX`, `SQS_MAX_RECEIVE_COUNT` | `2`, `10s`, `30s`, `20s`, `5s`, `2s/60s`, `5` | consumidor |
+| `PENDING_INTERVAL`, `PENDING_BASE_DELAY`, `PENDING_MAX_DELAY`, `PENDING_MAX_ATTEMPTS`, `PENDING_BATCH` | `1s`, `1s`, `60s`, `10`, `50` | referências pendentes |
+| `OUTBOX_INTERVAL`, `OUTBOX_BATCH`, `OUTBOX_LEASE`, `OUTBOX_RETRY_BASE/MAX`, `OUTBOX_PUBLISH_TIMEOUT`, `OUTBOX_MAX_ATTEMPTS` | `500ms`, `50`, `30s`, `1s/60s`, `10s`, `20` | publisher da outbox |
+| `CONFLICT_RETRIES` | `5` | novas tentativas de uma transação SQL que perdeu uma disputa |
+| `SHUTDOWN_TIMEOUT` | `30s` | prazo do encerramento (maior que `SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT` e que `OUTBOX_PUBLISH_TIMEOUT`) |
 
-A configuração é validada na inicialização (valores inválidos, intervalos e timeouts não positivos, e relações como `SQS_PROCESS_TIMEOUT < SQS_VISIBILITY_TIMEOUT`). O start também falha se PostgreSQL, SQS ou as filas estiverem indisponíveis.
+A configuração é validada na inicialização: valores inválidos, `LOG_LEVEL` desconhecido, intervalos e timeouts não positivos, `SQS_MAX_MESSAGES` fora de 1–10, `SQS_WAIT_TIME` acima de 20 s, `SQS_VISIBILITY_TIMEOUT` e `SQS_RETRY_MAX` acima de 12 h (limite do SQS), `*_RETRY_BASE > *_RETRY_MAX`, `PENDING_BASE_DELAY` fora de `(0, PENDING_MAX_DELAY]`, `SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT >= SQS_VISIBILITY_TIMEOUT`, `OUTBOX_PUBLISH_TIMEOUT >= OUTBOX_LEASE` e `SHUTDOWN_TIMEOUT` menor ou igual a `SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT` ou a `OUTBOX_PUBLISH_TIMEOUT`. O start também falha se PostgreSQL, SQS ou as filas estiverem indisponíveis.
 
 ## Autenticação
 
@@ -77,7 +82,7 @@ O Keycloak é provisionado automaticamente com clients `client_credentials`:
 | `provider-a` | `provider-a-secret` | `wager-provider` | `provider-a` |
 | `provider-b` | `provider-b-secret` | `wager-provider` | `provider-b` |
 | `provider-a-short-lived` | `provider-a-short-lived-secret` | `wager-provider` (token de 3 s, para testes de expiração) | `provider-a` |
-| `no-role-client` | `no-role-client-secret` | nenhum | — |
+| `no-role-client` | `no-role-client-secret` | nenhum | — (sem claim `provider_id`) |
 
 ```sh
 token() {
@@ -123,16 +128,19 @@ awslocal sqs send-message --queue-url http://localhost:4566/000000000000/wager-t
   --message-body '{"messageId":"msg-123","type":"WagerTransactionRequested","occurredAt":"2026-09-08T12:00:00.000Z","data":{"providerId":"provider-a","externalTransactionId":"transaction-124","idempotencyKey":"provider-a:transaction-124","playerId":"0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1","walletId":"'$WALLET'","roundId":"round-987","gameId":"fortune-chimp","kind":"BET","money":{"amount":"25.00","currency":"BRL"}}}'
 ```
 
-Os códigos HTTP, os corpos de erro e os `failureCode` estão em [`ARCHITECTURE.md`](ARCHITECTURE.md#contrato-http).
+Os códigos HTTP, os corpos de erro e os `failureCode` estão em [`ARCHITECTURE.md`](ARCHITECTURE.md#13-contrato-http).
 
 ## Testes
 
 ```sh
 go test ./...          # unitários (sem Docker)
 go test -race ./...
-go vet ./...
+make vet               # go vet, também com as tags integration e e2e
 make lint              # gofmt/goimports, gocyclo ≤ 6, gocognit ≤ 8 (código e testes)
+make                   # vet + lint + testes unitários com -race
 ```
+
+O CI (`.github/workflows/ci.yml`) roda tidy, gofmt, vet com todas as tags, build, testes unitários com `-race`, `golangci-lint` v2 fixado e `govulncheck` em todo push/PR; os testes de integração e e2e (que precisam de Docker) rodam num job à parte, disparado manualmente (`workflow_dispatch`) ou toda noite.
 
 ### Integração e e2e
 
@@ -149,13 +157,13 @@ make test-integration   # go test -race -count=1 -tags integration ./test/integr
 # O binário compilado roda como 3 processos independentes: duplicidade e disputa entre instâncias,
 # HTTP + SQS para a mesma operação, REFUND antes da BET, SIGKILL das três instâncias com reinício
 # (idempotência e pendências preservadas) e reconciliação de todas as carteiras ao final.
-make test-e2e           # go test -count=1 -tags e2e ./test/e2e/...
+make test-e2e           # go test -count=1 -timeout 15m -tags e2e ./test/e2e/...
 
 # Cobertura combinada unidade + integração + e2e (binário compilado com -cover).
 make coverage
 ```
 
-Resultado atual de `make coverage`: **100,0%** das instruções de `cmd/` e `internal/`.
+`make coverage` combina as três suítes (o e2e roda o binário real sem `-race`) e cobre `cmd/` e `internal/`; só os testes unitários (`go test ./...`) já cobrem 100% de `app`, `config`, `domain/*`, `observability` e `worker`, e o restante dos adaptadores, `bootstrap` e `cli` depende dos containers.
 
 ### Simulações de falha cobertas
 

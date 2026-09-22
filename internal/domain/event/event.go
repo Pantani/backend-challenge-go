@@ -21,6 +21,7 @@ import (
 const (
 	TypeWagerTransactionProcessed        = "WagerTransactionProcessed"
 	TypeWagerTransactionRejected         = "WagerTransactionRejected"
+	TypeWagerTransactionFailed           = "WagerTransactionFailed"
 	TypeWalletBalanceChanged             = "WalletBalanceChanged"
 	TypeWagerTransactionPendingReference = "WagerTransactionPendingReference"
 )
@@ -40,43 +41,32 @@ type Money struct {
 	Currency string `json:"currency"`
 }
 
-// NewMoney converts a domain amount to its wire representation.
-func NewMoney(m money.Money) Money {
+// newMoney converts a domain amount to its wire representation.
+func newMoney(m money.Money) Money {
 	return Money{Amount: m.Amount(), Currency: string(m.Currency())}
 }
 
 // Envelope wraps a typed payload with routing and tracing metadata.
 type Envelope[T any] struct {
-	EventID       string  `json:"eventId"`
-	EventType     string  `json:"eventType"`
-	AggregateType string  `json:"aggregateType"`
-	AggregateID   string  `json:"aggregateId"`
-	CorrelationID string  `json:"correlationId"`
-	CausationID   *string `json:"causationId,omitempty"`
-	OccurredAt    string  `json:"occurredAt"`
-	Version       int     `json:"version"`
-	Data          T       `json:"data"`
+	EventID       string `json:"eventId"`
+	EventType     string `json:"eventType"`
+	AggregateType string `json:"aggregateType"`
+	AggregateID   string `json:"aggregateId"`
+	CorrelationID string `json:"correlationId"`
+	CausationID   string `json:"causationId,omitempty"`
+	OccurredAt    string `json:"occurredAt"`
+	Version       int    `json:"version"`
+	Data          T      `json:"data"`
 }
 
-// Meta carries the tracing metadata shared by the events of one operation.
+// Meta carries the tracing metadata of one event. EventID must be fresh for
+// every event; CorrelationID, CausationID and OccurredAt are shared by all the
+// events emitted for the same operation.
 type Meta struct {
 	EventID       uuid.UUID
 	CorrelationID string
 	CausationID   string
 	OccurredAt    time.Time
-}
-
-func newEnvelope[T any](m Meta, eventType, aggregateType string, aggregateID uuid.UUID, data T) Envelope[T] {
-	var causation *string
-	if m.CausationID != "" {
-		c := m.CausationID
-		causation = &c
-	}
-	return Envelope[T]{
-		EventID: m.EventID.String(), EventType: eventType, AggregateType: aggregateType,
-		AggregateID: aggregateID.String(), CorrelationID: m.CorrelationID, CausationID: causation,
-		OccurredAt: FormatTime(m.OccurredAt), Version: SchemaVersion, Data: data,
-	}
 }
 
 // FormatTime renders an instant as UTC RFC 3339 with millisecond precision.
@@ -93,13 +83,18 @@ type Record struct {
 	Payload       []byte
 }
 
-// ToRecord serializes an envelope. partitionKey groups events that must keep
-// their relative order (the wallet id).
-func ToRecord[T any](e Envelope[T], m Meta, aggregateID uuid.UUID, partitionKey string) Record {
+// newRecord wraps data in its envelope and serializes it. partitionKey groups
+// events that must keep their relative order (the wallet id).
+func newRecord[T any](m Meta, eventType, aggregateType string, aggregateID uuid.UUID, partitionKey string, data T) Record {
+	env := Envelope[T]{
+		EventID: m.EventID.String(), EventType: eventType, AggregateType: aggregateType,
+		AggregateID: aggregateID.String(), CorrelationID: m.CorrelationID, CausationID: m.CausationID,
+		OccurredAt: FormatTime(m.OccurredAt), Version: SchemaVersion, Data: data,
+	}
 	// Payloads only hold strings, ints and bools: Marshal cannot fail.
-	payload, _ := json.Marshal(e)
+	payload, _ := json.Marshal(env)
 	return Record{
-		EventID: m.EventID, EventType: e.EventType, AggregateType: e.AggregateType,
+		EventID: m.EventID, EventType: eventType, AggregateType: aggregateType,
 		AggregateID: aggregateID, PartitionKey: partitionKey, OccurredAt: m.OccurredAt.UTC(), Payload: payload,
 	}
 }
@@ -125,7 +120,7 @@ func newTransactionData(t *wager.Transaction) TransactionData {
 	return TransactionData{
 		TransactionID: t.ID().String(), Origin: string(t.Origin()), Kind: string(t.Kind()),
 		Status: string(t.Status()), WalletID: t.WalletID().String(), PlayerID: t.PlayerID().String(),
-		Money: NewMoney(t.Amount()), ProviderID: ext.ProviderID, ExternalTransactionID: ext.ExternalID,
+		Money: newMoney(t.Amount()), ProviderID: ext.ProviderID, ExternalTransactionID: ext.ExternalID,
 		RoundID: ext.RoundID, GameID: ext.GameID, ReferenceExternalTransactionID: ext.ReferenceExternalID,
 	}
 }
@@ -138,13 +133,14 @@ type WagerTransactionProcessed struct {
 }
 
 // NewWagerTransactionProcessed builds the event for a processed transaction.
+// t must be in StatusProcessed: its result balance and reference are copied
+// as they are.
 func NewWagerTransactionProcessed(m Meta, t *wager.Transaction) Record {
-	data := WagerTransactionProcessed{TransactionData: newTransactionData(t), Balance: NewMoney(t.ResultBalance())}
+	data := WagerTransactionProcessed{TransactionData: newTransactionData(t), Balance: newMoney(t.ResultBalance())}
 	if t.ReferenceTxID() != uuid.Nil {
 		data.ReferenceTransactionID = t.ReferenceTxID().String()
 	}
-	env := newEnvelope(m, TypeWagerTransactionProcessed, AggregateTransaction, t.ID(), data)
-	return ToRecord(env, m, t.ID(), t.WalletID().String())
+	return newRecord(m, TypeWagerTransactionProcessed, AggregateTransaction, t.ID(), t.WalletID().String(), data)
 }
 
 // WagerTransactionRejected is emitted for definitive business rejections.
@@ -154,10 +150,25 @@ type WagerTransactionRejected struct {
 }
 
 // NewWagerTransactionRejected builds the event for a rejected transaction.
+// t must be in StatusRejected so that its failure code is set.
 func NewWagerTransactionRejected(m Meta, t *wager.Transaction) Record {
 	data := WagerTransactionRejected{TransactionData: newTransactionData(t), FailureCode: string(t.FailureCode())}
-	env := newEnvelope(m, TypeWagerTransactionRejected, AggregateTransaction, t.ID(), data)
-	return ToRecord(env, m, t.ID(), t.WalletID().String())
+	return newRecord(m, TypeWagerTransactionRejected, AggregateTransaction, t.ID(), t.WalletID().String(), data)
+}
+
+// WagerTransactionFailed is emitted when an operation is abandoned after a
+// permanent, non-business failure (for example a resolution attempt that
+// kept hitting an internal error). The balance was never touched.
+type WagerTransactionFailed struct {
+	TransactionData
+	FailureCode string `json:"failureCode"`
+}
+
+// NewWagerTransactionFailed builds the event for a failed transaction. t
+// must be in StatusFailed so that its failure code is set.
+func NewWagerTransactionFailed(m Meta, t *wager.Transaction) Record {
+	data := WagerTransactionFailed{TransactionData: newTransactionData(t), FailureCode: string(t.FailureCode())}
+	return newRecord(m, TypeWagerTransactionFailed, AggregateTransaction, t.ID(), t.WalletID().String(), data)
 }
 
 // WagerTransactionPendingReference is emitted when an operation starts waiting.
@@ -166,11 +177,11 @@ type WagerTransactionPendingReference struct {
 	NextAttemptAt string `json:"nextAttemptAt"`
 }
 
-// NewWagerTransactionPendingReference builds the event for a deferred operation.
+// NewWagerTransactionPendingReference builds the event for a deferred
+// operation. t must be in StatusPendingReference so that NextAttemptAt is set.
 func NewWagerTransactionPendingReference(m Meta, t *wager.Transaction) Record {
 	data := WagerTransactionPendingReference{TransactionData: newTransactionData(t), NextAttemptAt: FormatTime(t.NextAttemptAt())}
-	env := newEnvelope(m, TypeWagerTransactionPendingReference, AggregateTransaction, t.ID(), data)
-	return ToRecord(env, m, t.ID(), t.WalletID().String())
+	return newRecord(m, TypeWagerTransactionPendingReference, AggregateTransaction, t.ID(), t.WalletID().String(), data)
 }
 
 // WalletBalanceChanged is emitted for every effective balance change.
@@ -188,10 +199,9 @@ type WalletBalanceChanged struct {
 func NewWalletBalanceChanged(m Meta, e wallet.LedgerEntry, walletVersion int64) Record {
 	data := WalletBalanceChanged{
 		WalletID: e.WalletID().String(), TransactionID: e.TransactionID().String(),
-		Direction: string(e.Direction()), Money: NewMoney(e.Amount()),
-		BalanceBefore: NewMoney(e.BalanceBefore()), BalanceAfter: NewMoney(e.BalanceAfter()),
+		Direction: string(e.Direction()), Money: newMoney(e.Amount()),
+		BalanceBefore: newMoney(e.BalanceBefore()), BalanceAfter: newMoney(e.BalanceAfter()),
 		WalletVersion: walletVersion,
 	}
-	env := newEnvelope(m, TypeWalletBalanceChanged, AggregateWallet, e.WalletID(), data)
-	return ToRecord(env, m, e.WalletID(), e.WalletID().String())
+	return newRecord(m, TypeWalletBalanceChanged, AggregateWallet, e.WalletID(), e.WalletID().String(), data)
 }
