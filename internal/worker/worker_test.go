@@ -87,6 +87,7 @@ type fakeStore struct {
 	oldestErr    error
 	claimedOwner string
 	rounds       int
+	dead         []uuid.UUID
 }
 
 // Claim hands out the queued messages once, like a drained outbox.
@@ -110,6 +111,11 @@ func (s *fakeStore) MarkFailed(_ context.Context, id uuid.UUID, _ string, next t
 	return s.markFailErr
 }
 
+func (s *fakeStore) MarkDead(_ context.Context, id uuid.UUID, _ string, _ time.Time, _ string) error {
+	s.dead = append(s.dead, id)
+	return s.markFailErr
+}
+
 func (s *fakeStore) OldestPending(context.Context) (time.Time, bool, error) {
 	return s.oldest, s.hasOldest, s.oldestErr
 }
@@ -126,6 +132,7 @@ func (p fakePublisher) Publish(_ context.Context, m app.OutboxMessage) error {
 func newRelay(store *fakeStore, pub fakePublisher, logs *syncWriter) *worker.Relay {
 	return worker.NewRelay(store, pub, clock{t0}, worker.RelayConfig{
 		Owner: "instance-1", BatchSize: 10, Lease: time.Minute, RetryBase: time.Second, RetryMax: 30 * time.Second, PublishTime: time.Second,
+		MaxAttempts: 50,
 	}, observability.NewLogger(logs, "debug", "t"), observability.NewMetrics(prometheus.NewRegistry()))
 }
 
@@ -158,7 +165,7 @@ func TestRelayFailurePaths(t *testing.T) {
 	id := uuid.New()
 	store := &fakeStore{failed: map[uuid.UUID]time.Time{}, msgs: []app.OutboxMessage{{EventID: id}}, markFailErr: errBoom, oldestErr: errBoom}
 	newRelay(store, fakePublisher{fail: map[uuid.UUID]bool{id: true}}, logs).Tick(context.Background())
-	assert.Contains(t, logs.String(), "lease expiry will release it")
+	assert.Contains(t, logs.String(), "failure not recorded; lease expiry will release it")
 
 	lost := &fakeStore{msgs: []app.OutboxMessage{{EventID: uuid.New()}}, markOK: false}
 	newRelay(lost, fakePublisher{}, logs).Tick(context.Background())
@@ -198,4 +205,14 @@ func TestRelayRunsRoundsUntilDrainedOrCancelled(t *testing.T) {
 	cancelled := &fakeStore{markOK: true, msgs: []app.OutboxMessage{{EventID: uuid.New()}}}
 	newRelay(cancelled, fakePublisher{}, &syncWriter{w: &bytes.Buffer{}}).Tick(ctx)
 	assert.Equal(t, 1, cancelled.rounds, "shutdown stops further rounds")
+}
+
+func TestRelayDeadLettersPoisonEvents(t *testing.T) {
+	poison := uuid.New()
+	store := &fakeStore{failed: map[uuid.UUID]time.Time{}, msgs: []app.OutboxMessage{{EventID: poison, Attempts: 50}}}
+	logs := &syncWriter{w: &bytes.Buffer{}}
+	newRelay(store, fakePublisher{fail: map[uuid.UUID]bool{poison: true}}, logs).Tick(context.Background())
+	assert.Equal(t, []uuid.UUID{poison}, store.dead)
+	assert.NotContains(t, store.failed, poison, "a dead-lettered event is not rescheduled")
+	assert.Contains(t, logs.String(), "dead-lettered after exhausting its attempts")
 }

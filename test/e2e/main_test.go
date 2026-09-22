@@ -35,7 +35,7 @@ var (
 	sqsClient sqsadapter.API
 	queues    sqsadapter.Queues
 	instances []*instance
-	tokens    = tokenCache{values: map[string]string{}}
+	tokens    = tokenCache{values: map[string]cachedToken{}}
 )
 
 func TestMain(m *testing.M) {
@@ -120,8 +120,26 @@ type instance struct {
 	name string
 	port int
 	cmd  *exec.Cmd
-	// logs receives stdout and stderr through a single pipe.
-	logs bytes.Buffer
+	// logs is written by the exec copier goroutine while the process runs.
+	logs syncBuffer
+}
+
+// syncBuffer is a log sink safe for concurrent writes and reads.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
 }
 
 func (i *instance) base() string { return fmt.Sprintf("http://127.0.0.1:%d", i.port) }
@@ -198,23 +216,32 @@ func stopAll() {
 	}
 }
 
-type tokenCache struct {
-	mu     sync.Mutex
-	values map[string]string
+// tokenRefresh renews cached tokens well before their 5-minute lifetime.
+const tokenRefresh = 4 * time.Minute
+
+type cachedToken struct {
+	value    string
+	issuedAt time.Time
 }
 
-// get returns a cached token (provider tokens last 5 minutes).
-func (c *tokenCache) get(t *testing.T, client string) string {
-	t.Helper()
+type tokenCache struct {
+	mu     sync.Mutex
+	values map[string]cachedToken
+}
+
+// get returns a cached token, fetching a new one when it is about to expire.
+func (c *tokenCache) get(client string) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if tok, ok := c.values[client]; ok {
-		return tok
+	if tok, ok := c.values[client]; ok && time.Since(tok.issuedAt) < tokenRefresh {
+		return tok.value, nil
 	}
-	tok, err := env.Token(context.Background(), client)
-	require.NoError(t, err)
-	c.values[client] = tok
-	return tok
+	value, err := env.Token(context.Background(), client)
+	if err != nil {
+		return "", err
+	}
+	c.values[client] = cachedToken{value: value, issuedAt: time.Now()}
+	return value, nil
 }
 
 type response struct {
@@ -222,19 +249,35 @@ type response struct {
 	body   map[string]any
 }
 
-// call sends a request to one instance.
+// call sends a request to one instance, failing the test on transport errors.
+// It must run on the test goroutine; concurrent code uses callE.
 func call(t *testing.T, inst *instance, method, path, client, body string, headers map[string]string) response {
 	t.Helper()
-	req, err := http.NewRequestWithContext(context.Background(), method, inst.base()+path, strings.NewReader(body))
+	res, err := callE(inst, method, path, client, body, headers)
 	require.NoError(t, err)
-	req.Header.Set("Authorization", "Bearer "+tokens.get(t, client))
+	return res
+}
+
+// callE sends a request and returns transport errors instead of failing, so
+// it is safe from worker goroutines.
+func callE(inst *instance, method, path, client, body string, headers map[string]string) (response, error) {
+	tok, err := tokens.get(client)
+	if err != nil {
+		return response{}, err
+	}
+	req, err := http.NewRequestWithContext(context.Background(), method, inst.base()+path, strings.NewReader(body))
+	if err != nil {
+		return response{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
 	resp, err := http.DefaultClient.Do(req)
-	require.NoError(t, err)
+	if err != nil {
+		return response{}, err
+	}
 	defer resp.Body.Close()
 	out := response{status: resp.StatusCode}
-	_ = json.NewDecoder(resp.Body).Decode(&out.body)
-	return out
+	return out, json.NewDecoder(resp.Body).Decode(&out.body)
 }

@@ -135,6 +135,7 @@ func TestTransactionConstraints(t *testing.T) {
 		"PROCESSED needs result": {insert("BET", "PROCESSED", 1, "NULL, NULL, NULL, NULL, NULL"), "23514"},
 		"result needs currency":  {insert("BET", "PROCESSED", 1, "NULL, NULL, 1, NULL, NULL"), "23514"},
 		"pending needs schedule": {insert("REFUND", "PENDING_REFERENCE", 1, "'x', NULL, NULL, NULL, NULL"), "23514"},
+		"empty reference":        {insert("REFUND", "PROCESSED", 1, "'', NULL, 1, 'BRL', NULL"), "23514"},
 		"valid LOSS":             {insert("LOSS", "PROCESSED", 0, "NULL, NULL, 1, 'BRL', NULL"), ""},
 	}
 	for name, tc := range cases {
@@ -193,13 +194,13 @@ func TestMigrationsApplyAndRevert(t *testing.T) {
 	require.NoError(t, m.Up(), "no change is not an error")
 	v, _, err = m.Version()
 	require.NoError(t, err)
-	assert.Equal(t, uint(2), v)
+	assert.Equal(t, uint(3), v)
 	assert.True(t, tableExists(t, url, "ledger_entries"))
 
 	require.NoError(t, m.Down(1))
 	v, _, err = m.Version()
 	require.NoError(t, err)
-	assert.Equal(t, uint(1), v)
+	assert.Equal(t, uint(2), v)
 	require.NoError(t, m.Down(5), "reverting more steps than exist stops at zero")
 	assert.False(t, tableExists(t, url, "ledger_entries"))
 	require.NoError(t, m.Up())

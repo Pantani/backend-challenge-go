@@ -32,8 +32,14 @@ func newMetrics() *observability.Metrics { return observability.NewMetrics(prome
 
 func newRelay(t *testing.T, owner string, store app.OutboxStore, pub worker.Publisher) *worker.Relay {
 	t.Helper()
+	return newRelayWithAttempts(t, owner, store, pub, 1000)
+}
+
+func newRelayWithAttempts(t *testing.T, owner string, store app.OutboxStore, pub worker.Publisher, maxAttempts int) *worker.Relay {
+	t.Helper()
 	return worker.NewRelay(store, pub, app.SystemClock{}, worker.RelayConfig{
-		Owner: owner, BatchSize: 500, Lease: time.Second, RetryBase: 50 * time.Millisecond, RetryMax: 200 * time.Millisecond, PublishTime: 5 * time.Second,
+		Owner: owner, BatchSize: 500, Lease: time.Second, RetryBase: 10 * time.Millisecond, RetryMax: 20 * time.Millisecond,
+		PublishTime: 5 * time.Second, MaxAttempts: maxAttempts,
 	}, observability.NewLogger(io.Discard, "error", owner), newMetrics())
 }
 
@@ -412,4 +418,52 @@ func TestOutboxKeepsPerWalletOrderWhenAnEventFails(t *testing.T) {
 	}
 	pub.mu.Unlock()
 	assert.Equal(t, order, published, "the failing head held back the rest of the wallet's events")
+}
+
+// poisonPublisher always fails one event (e.g. a payload the broker refuses).
+type poisonPublisher struct {
+	recordingPublisher
+	poison uuid.UUID
+}
+
+func (p *poisonPublisher) Publish(ctx context.Context, m app.OutboxMessage) error {
+	if m.EventID == p.poison {
+		return fmt.Errorf("broker refuses this event")
+	}
+	return p.recordingPublisher.Publish(ctx, m)
+}
+
+// Not parallel: relays claim the whole (shared) outbox.
+func TestPoisonOutboxEventIsDeadLetteredAndUnblocksItsWallet(t *testing.T) {
+	s := newServices(t, defaultPolicy)
+	w := s.openWallet(t, "10.00")
+	var poison uuid.UUID
+	require.NoError(t, pool.QueryRow(context.Background(),
+		`SELECT event_id FROM outbox_events WHERE partition_key = $1 ORDER BY seq LIMIT 1`, w.ID().String()).Scan(&poison))
+
+	pub := &poisonPublisher{poison: poison}
+	relay := newRelayWithAttempts(t, "poison", postgres.NewOutboxStore(pool), pub, 3)
+	require.Eventually(t, func() bool { relay.Tick(context.Background()); return unpublished(t, w.ID()) == 1 }, 20*time.Second, 50*time.Millisecond,
+		"the event behind the poison one is published once the poison is dead-lettered")
+
+	var dead bool
+	var lastError string
+	require.NoError(t, pool.QueryRow(context.Background(), `SELECT dead_lettered_at IS NOT NULL, last_error FROM outbox_events
+		WHERE event_id = $1`, poison).Scan(&dead, &lastError))
+	assert.True(t, dead)
+	assert.Equal(t, "broker refuses this event", lastError)
+	assert.Zero(t, pub.count(poison))
+}
+
+func TestProvisioningReconcilesChangedAttributes(t *testing.T) {
+	t.Parallel()
+	api, q, names := provisionQueues(t, 3)
+	_, err := sqsadapter.Provision(context.Background(), api, sqsadapter.ProvisionConfig{Names: names, MaxReceiveCount: 7, VisibilityTimeout: 45})
+	require.NoError(t, err, "rerunning with different attributes does not fail with QueueNameExists")
+
+	out, err := api.GetQueueAttributes(context.Background(), &awssqs.GetQueueAttributesInput{QueueUrl: aws.String(q.Input),
+		AttributeNames: []types.QueueAttributeName{types.QueueAttributeNameVisibilityTimeout, types.QueueAttributeNameRedrivePolicy}})
+	require.NoError(t, err)
+	assert.Equal(t, "45", out.Attributes["VisibilityTimeout"])
+	assert.Contains(t, out.Attributes["RedrivePolicy"], "7")
 }

@@ -207,6 +207,7 @@ func newRelay(store app.OutboxStore, pub worker.Publisher, clock app.Clock, cfg 
 	return worker.NewRelay(store, pub, clock, worker.RelayConfig{
 		Owner: cfg.InstanceID, BatchSize: cfg.OutboxBatch, Lease: cfg.OutboxLease,
 		RetryBase: cfg.OutboxRetryBase, RetryMax: cfg.OutboxRetryMax, PublishTime: cfg.SQSProcessTimeout,
+		MaxAttempts: cfg.OutboxMaxTries,
 	}, logger, metrics)
 }
 
@@ -266,8 +267,18 @@ func newHandler(d handlerDeps) http.Handler {
 	})
 }
 
+// HTTP server deadlines: slow clients cannot hold a handler while sending the
+// body, and a blocked response write is bounded. IdleTimeout falls back to
+// ReadTimeout.
+const (
+	readHeaderTimeout = 5 * time.Second
+	readTimeout       = 15 * time.Second
+	writeTimeout      = 30 * time.Second
+)
+
 func newServer(h http.Handler, cfg config.Config) *http.Server {
-	return &http.Server{Addr: cfg.HTTPAddr, Handler: h, ReadHeaderTimeout: 5 * time.Second}
+	return &http.Server{Addr: cfg.HTTPAddr, Handler: h,
+		ReadHeaderTimeout: readHeaderTimeout, ReadTimeout: readTimeout, WriteTimeout: writeTimeout}
 }
 
 // Addr exposes the bound address (useful with ":0" in tests).

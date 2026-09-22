@@ -151,8 +151,8 @@ func principalFrom(ctx context.Context) auth.Principal {
 // Unauthorized calls never reach the use cases, so they have no effect.
 func (h *handler) secured(allowed access, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		raw, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if !ok || raw == "" {
+		raw, ok := bearerToken(r)
+		if !ok {
 			w.Header().Set(headerWWWAuthenticate, bearerChallenge)
 			writeError(w, http.StatusUnauthorized, CodeUnauthorized, "missing bearer token")
 			return
@@ -170,6 +170,14 @@ func (h *handler) secured(allowed access, next http.HandlerFunc) http.HandlerFun
 		ctx := observability.WithAttrs(r.Context(), slog.String("clientId", p.ClientID), slog.String("providerId", p.ProviderID))
 		next(w, r.WithContext(context.WithValue(ctx, principalKey{}, p)))
 	}
+}
+
+// bearerToken extracts the credentials of an Authorization header whose
+// scheme is "Bearer", compared case-insensitively as RFC 6750 requires.
+func bearerToken(r *http.Request) (string, bool) {
+	scheme, raw, found := strings.Cut(r.Header.Get("Authorization"), " ")
+	raw = strings.TrimSpace(raw)
+	return raw, found && strings.EqualFold(scheme, "Bearer") && raw != ""
 }
 
 func (h *handler) fail(w http.ResponseWriter, r *http.Request, err error) {

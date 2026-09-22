@@ -44,7 +44,7 @@ Com o compose: `make migrate-up` / `make migrate-down`. Fora do Docker: `go run 
 
 ### Filas
 
-`wallet provision-queues` cria as filas de forma idempotente (`make provision-queues`). No compose isso roda automaticamente.
+`wallet provision-queues` cria as filas de forma idempotente (`make provision-queues`). Rodar de novo depois de mudar `SQS_MAX_RECEIVE_COUNT` ou `SQS_VISIBILITY_TIMEOUT` reconcilia as filas existentes. No compose isso roda automaticamente.
 
 ## Variáveis de ambiente
 
@@ -62,7 +62,7 @@ Todas têm padrão local. Veja [`.env.example`](.env.example), que o compose car
 | `SQS_SENDER_PROVIDERS` | `000000000000=*` | vínculo `SenderId` do SQS → provedores permitidos (`id=provider-a\|provider-b;outroId=*`) |
 | `SQS_CONSUMERS`, `SQS_VISIBILITY_TIMEOUT`, `SQS_PROCESS_TIMEOUT`, `SQS_RETRY_BASE/MAX`, `SQS_MAX_RECEIVE_COUNT` | `2`, `30s`, `20s`, `2s/60s`, `5` | consumidor |
 | `PENDING_*` | `1s` base, `60s` máx., `10` tentativas | referências pendentes |
-| `OUTBOX_*` | `500ms`, lote `50`, lease `30s` | publisher da outbox |
+| `OUTBOX_*` | `500ms`, lote `50`, lease `30s`, `OUTBOX_MAX_ATTEMPTS=20` | publisher da outbox |
 | `SHUTDOWN_TIMEOUT` | `25s` | prazo do encerramento |
 
 A configuração é validada na inicialização (valores inválidos, intervalos e timeouts não positivos, e relações como `SQS_PROCESS_TIMEOUT < SQS_VISIBILITY_TIMEOUT`). O start também falha se PostgreSQL, SQS ou as filas estiverem indisponíveis.

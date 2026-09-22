@@ -86,18 +86,39 @@ func (c *Consumer) PollOnce(ctx context.Context) {
 		VisibilityTimeout:   int32(c.cfg.VisibilityTimeout.Seconds()),
 		MessageSystemAttributeNames: []types.MessageSystemAttributeName{
 			types.MessageSystemAttributeNameApproximateReceiveCount, types.MessageSystemAttributeNameSenderId,
+			types.MessageSystemAttributeNameMessageGroupId,
 		},
 	})
 	if err != nil {
 		c.receiveFailed(ctx, err)
 		return
 	}
-	for i, m := range out.Messages {
+	c.process(ctx, out.Messages)
+}
+
+// process handles a batch in order. A batch can carry several messages of
+// the same MessageGroupId (the in-order tail of a wallet): once a message is
+// retried, the rest of its group is released instead of processed, so the
+// group is redelivered in order after the retried head.
+func (c *Consumer) process(ctx context.Context, msgs []types.Message) {
+	blocked := map[string]bool{}
+	for i, m := range msgs {
 		if ctx.Err() != nil {
-			c.release(ctx, out.Messages[i:])
+			c.release(ctx, msgs[i:])
 			return
 		}
-		c.handle(ctx, m)
+		c.step(ctx, m, blocked)
+	}
+}
+
+func (c *Consumer) step(ctx context.Context, m types.Message, blocked map[string]bool) {
+	group := m.Attributes[string(types.MessageSystemAttributeNameMessageGroupId)]
+	if blocked[group] {
+		c.release(ctx, []types.Message{m})
+		return
+	}
+	if !c.handle(ctx, m) && group != "" {
+		blocked[group] = true
 	}
 }
 
@@ -119,15 +140,16 @@ func sleep(ctx context.Context, d time.Duration) {
 }
 
 // handle runs detached from the shutdown signal so the message in progress
-// completes (or times out) instead of being aborted mid-way.
-func (c *Consumer) handle(parent context.Context, m types.Message) {
+// completes (or times out) instead of being aborted mid-way. It reports false
+// when the message was left for a retry.
+func (c *Consumer) handle(parent context.Context, m types.Message) bool {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), c.cfg.ProcessTimeout)
 	defer cancel()
 	ctx = observability.WithAttrs(ctx, slog.String("sqsMessageId", aws.ToString(m.MessageId)))
 	msg, err := c.decode(m)
 	if err != nil {
 		c.deadLetter(ctx, m, err)
-		return
+		return true
 	}
 	ctx = observability.WithAttrs(ctx, slog.String("messageId", msg.MessageID), slog.String("correlationId", msg.MessageID),
 		slog.String("providerId", msg.Command.ProviderID), slog.String("walletId", msg.Command.WalletID.String()))
@@ -137,9 +159,11 @@ func (c *Consumer) handle(parent context.Context, m types.Message) {
 		c.ack(ctx, m, res)
 	case app.IsTransient(err):
 		c.retry(ctx, m, err)
+		return false
 	default:
 		c.deadLetter(ctx, m, err)
 	}
+	return true
 }
 
 // decode validates the message and binds its providerId to the sender.

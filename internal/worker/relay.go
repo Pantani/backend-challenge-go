@@ -17,6 +17,7 @@ type Publisher interface {
 type RelayMetrics interface {
 	OutboxPublished()
 	OutboxFailure()
+	OutboxDeadLettered()
 	OutboxLag(d time.Duration)
 }
 
@@ -31,6 +32,8 @@ type RelayConfig struct {
 	RetryBase   time.Duration
 	RetryMax    time.Duration
 	PublishTime time.Duration
+	// MaxAttempts dead-letters a record after that many failed publications.
+	MaxAttempts int
 }
 
 // Relay publishes committed outbox records. Several relays (instances) can
@@ -82,15 +85,28 @@ func (r *Relay) publish(parent context.Context, m app.OutboxMessage) {
 	defer cancel()
 	log := r.logger.With("eventId", m.EventID, "eventType", m.EventType, "aggregateId", m.AggregateID)
 	if err := r.publisher.Publish(ctx, m); err != nil {
-		r.metrics.OutboxFailure()
-		next := r.clock.Now().Add(r.backoff(m.Attempts))
-		log.WarnContext(ctx, "outbox publish failed", "attempts", m.Attempts, "error", err)
-		if err := r.store.MarkFailed(ctx, m.EventID, r.cfg.Owner, next, err.Error()); err != nil {
-			log.WarnContext(ctx, "outbox mark failed errored; lease expiry will release it", "error", err)
-		}
+		r.failed(ctx, log, m, err)
 		return
 	}
 	r.confirm(ctx, log, m)
+}
+
+// failed schedules a retry with backoff, or dead-letters a record that
+// exhausted its attempts so it stops blocking its wallet's later events.
+func (r *Relay) failed(ctx context.Context, log *slog.Logger, m app.OutboxMessage, cause error) {
+	r.metrics.OutboxFailure()
+	var err error
+	if m.Attempts >= r.cfg.MaxAttempts {
+		log.ErrorContext(ctx, "outbox event dead-lettered after exhausting its attempts", "attempts", m.Attempts, "error", cause)
+		r.metrics.OutboxDeadLettered()
+		err = r.store.MarkDead(ctx, m.EventID, r.cfg.Owner, r.clock.Now(), cause.Error())
+	} else {
+		log.WarnContext(ctx, "outbox publish failed", "attempts", m.Attempts, "error", cause)
+		err = r.store.MarkFailed(ctx, m.EventID, r.cfg.Owner, r.clock.Now().Add(r.backoff(m.Attempts)), cause.Error())
+	}
+	if err != nil {
+		log.WarnContext(ctx, "outbox failure not recorded; lease expiry will release it", "error", err)
+	}
 }
 
 // confirm records the publication. If this fails (or the lease was lost) the

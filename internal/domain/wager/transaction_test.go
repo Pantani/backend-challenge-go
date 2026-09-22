@@ -228,12 +228,13 @@ func TestRehydrate(t *testing.T) {
 	assert.Equal(t, wager.StatusProcessed, tx.Status())
 
 	mutations := map[string]func(s *wager.Snapshot){
-		"nil id":           func(s *wager.Snapshot) { s.ID = uuid.Nil },
-		"bad kind":         func(s *wager.Snapshot) { s.Kind = "X" },
-		"bad status":       func(s *wager.Snapshot) { s.Status = "X" },
-		"bad amount":       func(s *wager.Snapshot) { s.Amount = money.Money{} },
-		"internal non-op":  func(s *wager.Snapshot) { s.Origin = wager.OriginInternal },
-		"external opening": func(s *wager.Snapshot) { s.Kind = wager.KindOpening },
+		"nil id":                     func(s *wager.Snapshot) { s.ID = uuid.Nil },
+		"bad kind":                   func(s *wager.Snapshot) { s.Kind = "X" },
+		"bad status":                 func(s *wager.Snapshot) { s.Status = "X" },
+		"bad amount":                 func(s *wager.Snapshot) { s.Amount = money.Money{} },
+		"internal non-op":            func(s *wager.Snapshot) { s.Origin = wager.OriginInternal },
+		"external opening":           func(s *wager.Snapshot) { s.Kind = wager.KindOpening },
+		"reversal without reference": func(s *wager.Snapshot) { s.Kind = wager.KindRollback },
 	}
 	for name, mutate := range mutations {
 		c := s

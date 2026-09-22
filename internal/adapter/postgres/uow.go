@@ -30,6 +30,9 @@ func (u *UnitOfWork) Do(ctx context.Context, fn func(ctx context.Context, r app.
 	if err != nil {
 		return mapError(err)
 	}
+	// Releases the locks and the connection even if fn panics; after a commit
+	// or an explicit rollback it is a no-op (pgx.ErrTxClosed is ignored).
+	defer func() { _ = rollback(ctx, tx) }()
 	if err := fn(ctx, repositories{tx: tx}); err != nil {
 		return errors.Join(err, rollback(ctx, tx))
 	}

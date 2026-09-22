@@ -58,6 +58,7 @@ type Config struct {
 	OutboxLease     time.Duration
 	OutboxRetryBase time.Duration
 	OutboxRetryMax  time.Duration
+	OutboxMaxTries  int
 }
 
 // Lookup reads a variable; os.LookupEnv in production, a map in tests.
@@ -116,6 +117,7 @@ func (r *reader) loadWorkers(c *Config) {
 	c.OutboxInterval, c.OutboxBatch = r.dur("OUTBOX_INTERVAL", 500*time.Millisecond), r.int("OUTBOX_BATCH", 50)
 	c.OutboxLease = r.dur("OUTBOX_LEASE", 30*time.Second)
 	c.OutboxRetryBase, c.OutboxRetryMax = r.dur("OUTBOX_RETRY_BASE", time.Second), r.dur("OUTBOX_RETRY_MAX", time.Minute)
+	c.OutboxMaxTries = r.int("OUTBOX_MAX_ATTEMPTS", 20)
 }
 
 // validate enforces relationships between settings.
@@ -125,13 +127,15 @@ func (c Config) validate() error {
 		msg string
 	}{
 		{nonEmpty(c.DatabaseURL, c.OIDCIssuer, c.OIDCJWKSURL, c.OIDCAudience), "DATABASE_URL, OIDC_ISSUER, OIDC_JWKS_URL and OIDC_AUDIENCE are required"},
-		{positive(c.DBMaxConns, c.SQSConsumers, c.OutboxBatch, c.PendingBatch, c.PendingMaxAttempts), "pool size, consumers, batch sizes and attempts must be positive"},
+		{positive(c.DBMaxConns, c.SQSConsumers, c.OutboxBatch, c.PendingBatch, c.PendingMaxAttempts, c.OutboxMaxTries, c.SQSMaxReceive),
+			"pool size, consumers, batch sizes and attempts must be positive"},
 		{between(c.SQSMaxMessages, 1, 10), "SQS_MAX_MESSAGES must be between 1 and 10"},
-		{c.SQSWaitTime <= 20*time.Second, "SQS_WAIT_TIME must be at most 20s"},
+		{between(int(c.SQSWaitTime), 0, int(20*time.Second)), "SQS_WAIT_TIME must be between 0s and 20s"},
 		{c.SQSProcessTimeout < c.SQSVisibility, "SQS_PROCESS_TIMEOUT must be lower than SQS_VISIBILITY_TIMEOUT"},
 		{between(int(c.PendingBaseDelay), 1, int(c.PendingMaxDelay)), "PENDING_BASE_DELAY must be in (0, PENDING_MAX_DELAY]"},
-		{positiveDurations(c.PendingInterval, c.OutboxInterval, c.OutboxLease, c.OutboxRetryBase, c.SQSRetryBase,
-			c.SQSProcessTimeout, c.ShutdownTimeout, c.ReadyTimeout), "worker intervals, leases, retries and timeouts must be positive"},
+		{positiveDurations(c.PendingInterval, c.OutboxInterval, c.OutboxLease, c.OutboxRetryBase, c.OutboxRetryMax,
+			c.SQSRetryBase, c.SQSRetryMax, c.SQSProcessTimeout, c.ShutdownTimeout, c.ReadyTimeout, c.DBLockTimeout,
+			c.DBStatementTimeout), "worker intervals, leases, retries and timeouts must be positive"},
 	}
 	var errs []error
 	for _, rule := range rules {

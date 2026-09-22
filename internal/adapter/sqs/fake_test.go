@@ -18,6 +18,7 @@ type fakeAPI struct {
 	visibility  map[string]int32
 	sent        []*sqs.SendMessageInput
 	created     []*sqs.CreateQueueInput
+	configured  []*sqs.SetQueueAttributesInput
 	attrQueries int
 }
 
@@ -83,6 +84,16 @@ func (f *fakeAPI) ChangeMessageVisibility(_ context.Context, in *sqs.ChangeMessa
 	defer f.mu.Unlock()
 	f.visibility[aws.ToString(in.ReceiptHandle)] = in.VisibilityTimeout
 	return &sqs.ChangeMessageVisibilityOutput{}, nil
+}
+
+func (f *fakeAPI) SetQueueAttributes(_ context.Context, in *sqs.SetQueueAttributesInput, _ ...func(*sqs.Options)) (*sqs.SetQueueAttributesOutput, error) {
+	if err := f.err("set:" + aws.ToString(in.QueueUrl)); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.configured = append(f.configured, in)
+	return &sqs.SetQueueAttributesOutput{}, nil
 }
 
 func (f *fakeAPI) SendMessage(_ context.Context, in *sqs.SendMessageInput, _ ...func(*sqs.Options)) (*sqs.SendMessageOutput, error) {

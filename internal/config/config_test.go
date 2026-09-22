@@ -27,6 +27,7 @@ func TestDefaults(t *testing.T) {
 	assert.Equal(t, 10, c.PendingMaxAttempts)
 	assert.Equal(t, 30*time.Second, c.SQSVisibility)
 	assert.NotEmpty(t, c.InstanceID)
+	assert.Equal(t, 20, c.OutboxMaxTries)
 	assert.Equal(t, "000000000000=*", c.SQSSenderProviders, "LocalStack reports every sender as the account id")
 }
 
@@ -61,11 +62,25 @@ func TestValidation(t *testing.T) {
 		{"PENDING_INTERVAL": "0s"},
 		{"OUTBOX_INTERVAL": "-1s"},
 		{"OUTBOX_LEASE": "0s"},
+		{"SQS_WAIT_TIME": "-5s"},
+		{"SQS_RETRY_MAX": "0s"},
+		{"OUTBOX_RETRY_MAX": "-1s"},
+		{"DB_LOCK_TIMEOUT": "0s"},
+		{"DB_STATEMENT_TIMEOUT": "-1s"},
+		{"OUTBOX_MAX_ATTEMPTS": "0"},
+		{"SQS_MAX_RECEIVE_COUNT": "0"},
 	}
 	for _, values := range invalid {
 		_, err := config.Load(env(values))
 		assert.Error(t, err, values)
 	}
+}
+
+func TestZeroWaitTimeIsValid(t *testing.T) {
+	t.Parallel()
+	c, err := config.Load(env(map[string]string{"SQS_WAIT_TIME": "0s"}))
+	require.NoError(t, err)
+	assert.Zero(t, c.SQSWaitTime, "short polling is allowed")
 }
 
 func TestFromEnv(t *testing.T) {

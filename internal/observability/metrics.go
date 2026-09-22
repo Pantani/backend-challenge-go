@@ -21,6 +21,7 @@ type Metrics struct {
 	sqsMessages        *prometheus.CounterVec
 	outboxPublished    prometheus.Counter
 	outboxFailures     prometheus.Counter
+	outboxDead         prometheus.Counter
 	outboxLag          prometheus.Gauge
 	httpRequests       *prometheus.CounterVec
 	httpDuration       *prometheus.HistogramVec
@@ -56,6 +57,9 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		outboxFailures: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "outbox_publish_failures_total", Help: "Failed outbox publication attempts (retried with backoff).",
 		}),
+		outboxDead: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "outbox_dead_lettered_total", Help: "Outbox events dead-lettered after exhausting their attempts.",
+		}),
 		outboxLag: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "outbox_lag_seconds", Help: "Age of the oldest unpublished outbox event.",
 		}),
@@ -67,7 +71,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		}, []string{"route"}),
 	}
 	reg.MustRegister(m.transactions, m.duplicates, m.conflicts, m.processing, m.reconciliationDiff, m.pending,
-		m.sqsMessages, m.outboxPublished, m.outboxFailures, m.outboxLag, m.httpRequests, m.httpDuration)
+		m.sqsMessages, m.outboxPublished, m.outboxFailures, m.outboxDead, m.outboxLag, m.httpRequests, m.httpDuration)
 	return m
 }
 
@@ -103,6 +107,9 @@ func (m *Metrics) OutboxPublished() { m.outboxPublished.Inc() }
 
 // OutboxFailure counts a failed publication attempt.
 func (m *Metrics) OutboxFailure() { m.outboxFailures.Inc() }
+
+// OutboxDeadLettered counts a dead-lettered event.
+func (m *Metrics) OutboxDeadLettered() { m.outboxDead.Inc() }
 
 // OutboxLag sets the age of the oldest unpublished event.
 func (m *Metrics) OutboxLag(d time.Duration) { m.outboxLag.Set(d.Seconds()) }

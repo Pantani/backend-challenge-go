@@ -2,6 +2,7 @@ package httpapi_test
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -97,6 +98,7 @@ func (f *fixture) server() http.Handler {
 
 type call struct {
 	method, path, token, body string
+	scheme                    string
 	headers                   map[string]string
 }
 
@@ -104,7 +106,7 @@ func (f *fixture) do(t *testing.T, c call) (*httptest.ResponseRecorder, map[stri
 	t.Helper()
 	req := httptest.NewRequestWithContext(context.Background(), c.method, c.path, strings.NewReader(c.body))
 	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+		req.Header.Set("Authorization", cmp.Or(c.scheme, "Bearer")+" "+c.token)
 	}
 	for k, v := range c.headers {
 		req.Header.Set(k, v)
@@ -180,6 +182,22 @@ func TestAuthentication(t *testing.T) {
 	rec, _ = f.do(t, call{method: http.MethodGet, path: "/wallets/" + uuid.NewString(), token: "forged"})
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 	assert.Contains(t, rec.Header().Get("WWW-Authenticate"), "invalid_token")
+
+	for _, scheme := range []string{"Basic", "Bearer\t"} {
+		rec, _ = f.do(t, call{method: http.MethodGet, path: "/health/ready", token: "admin", scheme: scheme})
+		assert.Equal(t, http.StatusOK, rec.Code, "public route")
+		rec, _ = f.do(t, call{method: http.MethodPost, path: "/wagering/transactions", token: "provider-a", scheme: scheme})
+		assert.Equal(t, http.StatusUnauthorized, rec.Code, scheme)
+	}
+}
+
+func TestBearerSchemeIsCaseInsensitive(t *testing.T) {
+	t.Parallel()
+	f := &fixture{wallets: fakeWallets{get: func(uuid.UUID) (*wallet.Wallet, error) { return sampleWallet(t), nil }}}
+	for _, scheme := range []string{"bearer", "BEARER", "Bearer "} {
+		rec, _ := f.do(t, call{method: http.MethodGet, path: "/wallets/" + uuid.NewString(), token: "admin", scheme: scheme})
+		assert.Equal(t, http.StatusOK, rec.Code, scheme)
+	}
 }
 
 func TestAuthorizationPolicies(t *testing.T) {

@@ -22,6 +22,7 @@ type API interface {
 	DeleteMessage(ctx context.Context, in *sqs.DeleteMessageInput, opts ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error)
 	ChangeMessageVisibility(ctx context.Context, in *sqs.ChangeMessageVisibilityInput, opts ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error)
 	SendMessage(ctx context.Context, in *sqs.SendMessageInput, opts ...func(*sqs.Options)) (*sqs.SendMessageOutput, error)
+	SetQueueAttributes(ctx context.Context, in *sqs.SetQueueAttributesInput, opts ...func(*sqs.Options)) (*sqs.SetQueueAttributesOutput, error)
 }
 
 // ClientConfig configures the SQS client. Credentials come from the default
@@ -83,6 +84,10 @@ type ProvisionConfig struct {
 
 // Provision creates (idempotently) the FIFO input queue, its FIFO DLQ with
 // the redrive policy, and the FIFO events queue that receives the outbox.
+// Queues are created with only the immutable FifoQueue attribute and the
+// mutable ones are then applied with SetQueueAttributes, so rerunning it
+// after changing SQS_MAX_RECEIVE_COUNT or SQS_VISIBILITY_TIMEOUT reconciles
+// existing queues instead of failing with QueueNameExists.
 func Provision(ctx context.Context, api API, cfg ProvisionConfig) (Queues, error) {
 	dlq, err := createFIFO(ctx, api, cfg.Names.DLQ, nil)
 	if err != nil {
@@ -105,15 +110,19 @@ func Provision(ctx context.Context, api API, cfg ProvisionConfig) (Queues, error
 }
 
 func createFIFO(ctx context.Context, api API, name string, attrs map[string]string) (string, error) {
-	all := map[string]string{string(types.QueueAttributeNameFifoQueue): "true"}
-	for k, v := range attrs {
-		all[k] = v
-	}
-	out, err := api.CreateQueue(ctx, &sqs.CreateQueueInput{QueueName: aws.String(name), Attributes: all})
+	out, err := api.CreateQueue(ctx, &sqs.CreateQueueInput{QueueName: aws.String(name),
+		Attributes: map[string]string{string(types.QueueAttributeNameFifoQueue): "true"}})
 	if err != nil {
 		return "", fmt.Errorf("create queue %s: %w", name, err)
 	}
-	return aws.ToString(out.QueueUrl), nil
+	url := aws.ToString(out.QueueUrl)
+	if len(attrs) == 0 {
+		return url, nil
+	}
+	if _, err := api.SetQueueAttributes(ctx, &sqs.SetQueueAttributesInput{QueueUrl: aws.String(url), Attributes: attrs}); err != nil {
+		return "", fmt.Errorf("configure queue %s: %w", name, err)
+	}
+	return url, nil
 }
 
 func queueArn(ctx context.Context, api API, url string) (string, error) {

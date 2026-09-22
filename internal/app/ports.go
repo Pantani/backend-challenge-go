@@ -164,6 +164,9 @@ type OutboxStore interface {
 	MarkPublished(ctx context.Context, eventID uuid.UUID, owner string, now time.Time) (bool, error)
 	// MarkFailed releases the lease and schedules the next attempt.
 	MarkFailed(ctx context.Context, eventID uuid.UUID, owner string, next time.Time, cause string) error
+	// MarkDead dead-letters a record that exhausted its attempts, so it stops
+	// blocking the later records of its partition (kept for audit/replay).
+	MarkDead(ctx context.Context, eventID uuid.UUID, owner string, now time.Time, cause string) error
 	// OldestPending returns the occurrence of the oldest unpublished record.
 	OldestPending(ctx context.Context) (time.Time, bool, error)
 }

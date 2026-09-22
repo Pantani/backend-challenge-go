@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 
 	"github.com/Pantani/backend-challenge-go/internal/app"
 )
@@ -44,15 +45,28 @@ type Envelope struct {
 	Data       messageData `json:"data"`
 }
 
-// DecodeMessage parses and validates a message body with the same rules as
-// HTTP. The envelope messageId is the durable message identity; the inbox
-// hash covers the type, the idempotency key and the business payload hash.
-func DecodeMessage(consumer, body string) (app.InboundMessage, error) {
+// decodeEnvelope reads exactly one JSON object with no unknown fields and
+// nothing after it.
+func decodeEnvelope(body string) (Envelope, error) {
 	var env Envelope
 	dec := json.NewDecoder(bytes.NewReader([]byte(body)))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&env); err != nil {
-		return app.InboundMessage{}, fmt.Errorf("%w: %w", ErrInvalidMessage, err)
+		return Envelope{}, fmt.Errorf("%w: %w", ErrInvalidMessage, err)
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return Envelope{}, fmt.Errorf("%w: body must contain a single JSON object", ErrInvalidMessage)
+	}
+	return env, nil
+}
+
+// DecodeMessage parses and validates a message body with the same rules as
+// HTTP. The envelope messageId is the durable message identity; the inbox
+// hash covers the type, the idempotency key and the business payload hash.
+func DecodeMessage(consumer, body string) (app.InboundMessage, error) {
+	env, err := decodeEnvelope(body)
+	if err != nil {
+		return app.InboundMessage{}, err
 	}
 	if env.MessageID == "" || env.Type != MessageType {
 		return app.InboundMessage{}, fmt.Errorf("%w: messageId is required and type must be %s", ErrInvalidMessage, MessageType)

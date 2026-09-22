@@ -161,22 +161,31 @@ type Snapshot struct {
 	UpdatedAt     time.Time
 }
 
-// Rehydrate rebuilds a transaction without re-running transitions.
+// Rehydrate rebuilds a transaction without re-running transitions. Stored
+// data is validated too, so corrupt rows fail loudly instead of reaching
+// the rules (e.g. a reversal without a reference).
 func Rehydrate(s Snapshot) (*Transaction, error) {
-	if err := validateCore(s.ID, s.WalletID, s.PlayerID, s.CreatedAt); err != nil {
+	if err := s.validate(); err != nil {
 		return nil, err
-	}
-	if !s.Kind.Valid() || !s.Status.Valid() || s.Amount.Validate() != nil {
-		return nil, fmt.Errorf("%w: invalid kind, status or amount in snapshot", ErrInvalidTransaction)
-	}
-	if (s.Origin == OriginInternal) != (s.Kind == KindOpening) {
-		return nil, fmt.Errorf("%w: origin %q does not match kind %s", ErrInvalidTransaction, s.Origin, s.Kind)
 	}
 	return &Transaction{id: s.ID, origin: s.Origin, kind: s.Kind, status: s.Status,
 		walletID: s.WalletID, playerID: s.PlayerID, amount: s.Amount, external: s.External,
 		referenceTxID: s.ReferenceTxID, failureCode: s.FailureCode, resultBalance: s.ResultBalance,
 		attempts: s.Attempts, nextAttemptAt: s.NextAttemptAt.UTC(), correlationID: s.CorrelationID,
 		createdAt: s.CreatedAt.UTC(), updatedAt: s.UpdatedAt.UTC()}, nil
+}
+
+func (s Snapshot) validate() error {
+	if err := validateCore(s.ID, s.WalletID, s.PlayerID, s.CreatedAt); err != nil {
+		return err
+	}
+	if !s.Kind.Valid() || !s.Status.Valid() || s.Amount.Validate() != nil {
+		return fmt.Errorf("%w: invalid kind, status or amount in snapshot", ErrInvalidTransaction)
+	}
+	if (s.Origin == OriginInternal) != (s.Kind == KindOpening) {
+		return fmt.Errorf("%w: origin %q does not match kind %s", ErrInvalidTransaction, s.Origin, s.Kind)
+	}
+	return validateReference(s.Kind, s.External.ReferenceExternalID)
 }
 
 func (t *Transaction) ensureOpen(target Status) error {

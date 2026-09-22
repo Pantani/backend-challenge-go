@@ -96,6 +96,9 @@ func TestWalletRouteErrors(t *testing.T) {
 		get:       func(uuid.UUID) (*wallet.Wallet, error) { return nil, app.ErrWalletNotFound },
 		ledger:    func(uuid.UUID, string, int) (app.LedgerPage, error) { return app.LedgerPage{}, app.ErrUnavailable },
 		reconcile: func(uuid.UUID) (app.Reconciliation, error) { return app.Reconciliation{}, fmt.Errorf("db exploded") },
+		open: func(app.OpenWalletCommand) (*wallet.Wallet, error) {
+			return nil, fmt.Errorf("insert into wallets (secret internals): %w", app.ErrWalletExists)
+		},
 	}}
 	id := uuid.NewString()
 	cases := []struct {
@@ -115,6 +118,9 @@ func TestWalletRouteErrors(t *testing.T) {
 		assert.Equal(t, tc.status, rec.Code, tc.path)
 		assert.NotContains(t, resp["message"], "exploded", "internal errors are not exposed")
 	}
+	_, resp := f.do(t, call{method: http.MethodPost, path: "/wallets", token: "admin",
+		body: `{"playerId":"` + uuid.NewString() + `","initialBalance":{"amount":"1.00","currency":"BRL"}}`})
+	assert.Equal(t, "a wallet already exists for this player and currency", resp["message"], "wrapped context never reaches clients")
 }
 
 const submitBody = `{"providerId":"provider-a","externalTransactionId":"transaction-123",

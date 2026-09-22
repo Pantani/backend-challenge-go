@@ -5,6 +5,7 @@ package e2e_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -45,7 +46,14 @@ func opBody(w testWallet, ext, kind, amount, ref string) string {
 
 func submit(t *testing.T, inst *instance, w testWallet, ext, kind, amount, ref string) response {
 	t.Helper()
-	return call(t, inst, http.MethodPost, "/wagering/transactions", "provider-a", opBody(w, ext, kind, amount, ref),
+	res, err := submitE(inst, w, ext, kind, amount, ref)
+	require.NoError(t, err)
+	return res
+}
+
+// submitE is the goroutine-safe variant of submit.
+func submitE(inst *instance, w testWallet, ext, kind, amount, ref string) (response, error) {
+	return callE(inst, http.MethodPost, "/wagering/transactions", "provider-a", opBody(w, ext, kind, amount, ref),
 		map[string]string{"Idempotency-Key": "provider-a:" + ext})
 }
 
@@ -64,8 +72,12 @@ func debits(t *testing.T, w testWallet) int {
 	return n
 }
 
-// concurrently runs fn n times at once, round-robin across the instances.
-func concurrently(n int, fn func(i int, inst *instance)) {
+// concurrently submits n requests at once, round-robin across the
+// instances, and fails the test on the test goroutine if any request failed
+// (FailNow must never run on a worker goroutine).
+func concurrently(t *testing.T, n int, fn func(i int, inst *instance) (response, error)) []response {
+	t.Helper()
+	results, errs := make([]response, n), make([]error, n)
 	var wg sync.WaitGroup
 	start := make(chan struct{})
 	for i := range n {
@@ -73,24 +85,28 @@ func concurrently(n int, fn func(i int, inst *instance)) {
 		go func() {
 			defer wg.Done()
 			<-start
-			fn(i, instances[i%len(instances)])
+			results[i], errs[i] = fn(i, instances[i%len(instances)])
 		}()
 	}
 	close(start)
 	wg.Wait()
+	require.NoError(t, errors.Join(errs...))
+	return results
+}
+
+func statusCount(results []response) map[int]int {
+	count := map[int]int{}
+	for _, r := range results {
+		count[r.status]++
+	}
+	return count
 }
 
 func TestFiftyIdenticalBetsAcrossThreeInstances(t *testing.T) {
 	w := openWallet(t, "1000.00")
 	ext := uuid.NewString()
-	statuses := make([]int, 50)
-	concurrently(50, func(i int, inst *instance) { statuses[i] = submit(t, inst, w, ext, "BET", "25.00", "").status })
-
-	count := map[int]int{}
-	for _, s := range statuses {
-		count[s]++
-	}
-	assert.Equal(t, map[int]int{http.StatusCreated: 1, http.StatusOK: 49}, count, "one processing, 49 idempotent replays")
+	results := concurrently(t, 50, func(_ int, inst *instance) (response, error) { return submitE(inst, w, ext, "BET", "25.00", "") })
+	assert.Equal(t, map[int]int{http.StatusCreated: 1, http.StatusOK: 49}, statusCount(results), "one processing, 49 idempotent replays")
 	assert.Equal(t, 1, debits(t, w))
 	assert.Equal(t, "975.00", balance(t, w))
 }
@@ -98,8 +114,7 @@ func TestFiftyIdenticalBetsAcrossThreeInstances(t *testing.T) {
 func TestTwoBetsRaceAcrossInstances(t *testing.T) {
 	w := openWallet(t, "100.00")
 	exts := []string{uuid.NewString(), uuid.NewString()}
-	results := make([]response, 2)
-	concurrently(2, func(i int, inst *instance) { results[i] = submit(t, inst, w, exts[i], "BET", "80.00", "") })
+	results := concurrently(t, 2, func(i int, inst *instance) (response, error) { return submitE(inst, w, exts[i], "BET", "80.00", "") })
 
 	statuses := map[string]string{}
 	for _, r := range results {
@@ -109,16 +124,16 @@ func TestTwoBetsRaceAcrossInstances(t *testing.T) {
 	assert.Equal(t, "20.00", balance(t, w))
 	assert.Equal(t, 1, debits(t, w))
 
-	concurrently(4, func(i int, inst *instance) { submit(t, inst, w, exts[i%2], "BET", "80.00", "") })
+	concurrently(t, 4, func(i int, inst *instance) (response, error) { return submitE(inst, w, exts[i%2], "BET", "80.00", "") })
 	assert.Equal(t, "20.00", balance(t, w), "resending does not change the outcome")
 }
 
 func TestDistinctWalletsInParallelAcrossInstances(t *testing.T) {
 	wallets := []testWallet{openWallet(t, "100.00"), openWallet(t, "100.00"), openWallet(t, "100.00"), openWallet(t, "100.00")}
-	concurrently(40, func(i int, inst *instance) {
-		res := submit(t, inst, wallets[i%4], uuid.NewString(), "BET", "10.00", "")
-		assert.Equal(t, http.StatusCreated, res.status)
+	results := concurrently(t, 40, func(i int, inst *instance) (response, error) {
+		return submitE(inst, wallets[i%4], uuid.NewString(), "BET", "10.00", "")
 	})
+	assert.Equal(t, map[int]int{http.StatusCreated: 40}, statusCount(results))
 	for _, w := range wallets {
 		assert.Equal(t, "0.00", balance(t, w))
 	}

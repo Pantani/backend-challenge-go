@@ -118,13 +118,13 @@ func NewOutboxStore(pool *pgxpool.Pool) *OutboxStore { return &OutboxStore{pool:
 func (s *OutboxStore) Claim(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]app.OutboxMessage, error) {
 	rows, err := s.pool.Query(ctx, `WITH heads AS (
 			SELECT DISTINCT ON (partition_key) event_id
-			FROM outbox_events WHERE published_at IS NULL
+			FROM outbox_events WHERE published_at IS NULL AND dead_lettered_at IS NULL
 			ORDER BY partition_key, seq)
 		UPDATE outbox_events
 		SET locked_by = $1, locked_until = $2::timestamptz + ($3::bigint * INTERVAL '1 millisecond'), attempts = attempts + 1
 		WHERE event_id IN (
 			SELECT o.event_id FROM outbox_events o JOIN heads h ON h.event_id = o.event_id
-			WHERE o.published_at IS NULL AND o.next_attempt_at <= $2 AND (o.locked_until IS NULL OR o.locked_until < $2)
+			WHERE o.published_at IS NULL AND o.dead_lettered_at IS NULL AND o.next_attempt_at <= $2 AND (o.locked_until IS NULL OR o.locked_until < $2)
 			ORDER BY o.seq LIMIT $4
 			FOR UPDATE OF o SKIP LOCKED)
 		RETURNING seq, event_id, event_type, aggregate_type, aggregate_id, partition_key, payload::text, occurred_at, attempts`,
@@ -157,10 +157,17 @@ func (s *OutboxStore) MarkFailed(ctx context.Context, eventID uuid.UUID, owner s
 	return mapError(err)
 }
 
+// MarkDead implements app.OutboxStore.
+func (s *OutboxStore) MarkDead(ctx context.Context, eventID uuid.UUID, owner string, now time.Time, cause string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE outbox_events SET dead_lettered_at = $3, locked_by = NULL, locked_until = NULL, last_error = $4
+		WHERE event_id = $1 AND locked_by = $2 AND published_at IS NULL`, eventID, owner, now, cause)
+	return mapError(err)
+}
+
 // OldestPending implements app.OutboxStore.
 func (s *OutboxStore) OldestPending(ctx context.Context) (time.Time, bool, error) {
 	var oldest *time.Time
-	err := s.pool.QueryRow(ctx, `SELECT MIN(occurred_at) FROM outbox_events WHERE published_at IS NULL`).Scan(&oldest)
+	err := s.pool.QueryRow(ctx, `SELECT MIN(occurred_at) FROM outbox_events WHERE published_at IS NULL AND dead_lettered_at IS NULL`).Scan(&oldest)
 	if err != nil || oldest == nil {
 		return time.Time{}, false, mapError(err)
 	}

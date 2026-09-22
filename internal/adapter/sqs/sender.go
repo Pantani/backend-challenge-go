@@ -30,12 +30,21 @@ func ParseSenderPolicy(raw string) (SenderPolicy, error) {
 	policy := SenderPolicy{}
 	for _, entry := range strings.Split(raw, ";") {
 		sender, providers, ok := strings.Cut(strings.TrimSpace(entry), "=")
-		if !ok || sender == "" || providers == "" {
+		list, valid := parseProviders(providers)
+		if !ok || sender == "" || !valid {
 			return nil, fmt.Errorf("%w: %q (expected senderId=provider|provider)", ErrInvalidSenderPolicy, entry)
 		}
-		policy[sender] = append(policy[sender], strings.Split(providers, "|")...)
+		policy[sender] = append(policy[sender], list...)
 	}
 	return policy, nil
+}
+
+// parseProviders splits "a|b", rejecting empty names and names with
+// surrounding whitespace (they would never match exactly).
+func parseProviders(raw string) ([]string, bool) {
+	list := strings.Split(raw, "|")
+	invalid := slices.ContainsFunc(list, func(p string) bool { return p == "" || strings.TrimSpace(p) != p })
+	return list, !invalid
 }
 
 // Authorize checks that sender may submit operations for provider.

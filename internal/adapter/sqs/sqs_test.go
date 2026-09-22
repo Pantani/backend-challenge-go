@@ -65,6 +65,8 @@ func TestDecodeMessageInvalid(t *testing.T) {
 		`{"messageId":"m","type":"WagerTransactionRequested","extra":1}`,
 		strings.Replace(body("m", "25.00"), `"25.00"`, `25.00`, 1),
 		body("m", "1e2"),
+		body("m", "1.00") + `{"messageId":"other"}`,
+		body("m", "1.00") + " garbage",
 	}
 	for _, c := range cases {
 		_, err := sqsadapter.DecodeMessage("consumer", c)
@@ -100,11 +102,16 @@ func sampleTx() *wager.Transaction {
 }
 
 func message(id, bodyText, receiveCount string) types.Message {
+	return groupMessage(id, bodyText, receiveCount, "group-"+id)
+}
+
+func groupMessage(id, bodyText, receiveCount, group string) types.Message {
 	return types.Message{
 		MessageId: aws.String(id), ReceiptHandle: aws.String("rh-" + id), Body: aws.String(bodyText),
 		Attributes: map[string]string{
 			string(types.MessageSystemAttributeNameApproximateReceiveCount): receiveCount,
 			string(types.MessageSystemAttributeNameSenderId):                "AIDA-PROVIDER-A",
+			string(types.MessageSystemAttributeNameMessageGroupId):          group,
 		},
 	}
 }
@@ -256,8 +263,13 @@ func TestProvisionAndResolveQueues(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, sqsadapter.Queues{Input: "http://sqs/in.fifo", DLQ: "http://sqs/dlq.fifo", Events: "http://sqs/events.fifo"}, q)
 	require.Len(t, api.created, 3)
-	assert.Contains(t, api.created[1].Attributes["RedrivePolicy"], `"maxReceiveCount":"5"`)
-	assert.Equal(t, "true", api.created[2].Attributes["FifoQueue"])
+	for _, c := range api.created {
+		assert.Equal(t, map[string]string{"FifoQueue": "true"}, c.Attributes, "only the immutable attribute on create")
+	}
+	require.Len(t, api.configured, 1, "mutable attributes are reconciled on existing queues")
+	assert.Equal(t, "http://sqs/in.fifo", aws.ToString(api.configured[0].QueueUrl))
+	assert.Contains(t, api.configured[0].Attributes["RedrivePolicy"], `"maxReceiveCount":"5"`)
+	assert.Equal(t, "30", api.configured[0].Attributes["VisibilityTimeout"])
 
 	resolved, err := sqsadapter.ResolveQueues(context.Background(), api, names)
 	require.NoError(t, err)
@@ -268,7 +280,7 @@ func TestProvisionAndResolveQueues(t *testing.T) {
 func TestProvisionFailures(t *testing.T) {
 	t.Parallel()
 	names := sqsadapter.QueueNames{Input: "in.fifo", DLQ: "dlq.fifo", Events: "events.fifo"}
-	for _, failing := range []string{"create:dlq.fifo", "attrs", "create:in.fifo", "create:events.fifo"} {
+	for _, failing := range []string{"create:dlq.fifo", "attrs", "create:in.fifo", "set:http://sqs/in.fifo", "create:events.fifo"} {
 		api := newFakeAPI()
 		api.errs[failing] = errBoom
 		_, err := sqsadapter.Provision(context.Background(), api, sqsadapter.ProvisionConfig{Names: names})
@@ -320,8 +332,30 @@ func TestSenderPolicy(t *testing.T) {
 	require.NoError(t, p.Authorize("ROLE2", "anything"))
 	require.ErrorIs(t, p.Authorize("AIDA1", "provider-c"), sqsadapter.ErrUnauthorizedSender)
 	require.ErrorIs(t, p.Authorize("", "provider-a"), sqsadapter.ErrUnauthorizedSender, "a missing SenderId is never trusted")
-	for _, bad := range []string{"", "AIDA1", "=provider-a", "AIDA1=", "AIDA1=p;"} {
+	for _, bad := range []string{"", "AIDA1", "=provider-a", "AIDA1=", "AIDA1=p;", "AIDA1=a | b", "AIDA1=a||b"} {
 		_, err := sqsadapter.ParseSenderPolicy(bad)
 		assert.ErrorIs(t, err, sqsadapter.ErrInvalidSenderPolicy, bad)
 	}
+}
+
+func TestConsumerKeepsGroupOrderAfterARetry(t *testing.T) {
+	t.Parallel()
+	proc := &fakeProcessor{results: []error{app.ErrUnavailable, nil}}
+	f := newConsumer(t, proc,
+		groupMessage("a1", body("m-a1", "1.00"), "1", "wallet-a"),
+		groupMessage("a2", body("m-a2", "1.00"), "1", "wallet-a"),
+		groupMessage("b1", body("m-b1", "1.00"), "1", "wallet-b"))
+	f.c.PollOnce(context.Background())
+
+	assert.Equal(t, 2, proc.calls, "a2 is never processed before its retried head")
+	assert.Equal(t, []string{"rh-b1"}, f.api.deleted, "other groups keep flowing")
+	assert.Equal(t, map[string]int32{"rh-a1": 2, "rh-a2": 0}, f.api.visibility, "the tail is released right away")
+}
+
+func TestConsumerWithoutGroupsDoesNotBlock(t *testing.T) {
+	t.Parallel()
+	proc := &fakeProcessor{results: []error{app.ErrUnavailable, nil}}
+	f := newConsumer(t, proc, groupMessage("x", body("m-x", "1.00"), "1", ""), groupMessage("y", body("m-y", "1.00"), "1", ""))
+	f.c.PollOnce(context.Background())
+	assert.Equal(t, 2, proc.calls, "standard (non-FIFO) messages have no group to protect")
 }

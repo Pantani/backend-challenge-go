@@ -58,12 +58,13 @@ func TestMetrics(t *testing.T) {
 	m.SQSMessage("dlq")
 	m.OutboxPublished()
 	m.OutboxFailure()
+	m.OutboxDeadLettered()
 	m.OutboxLag(3 * time.Second)
 	m.HTTPRequest("GET /x", 200, time.Millisecond)
 
 	count, err := testutil.GatherAndCount(reg)
 	require.NoError(t, err)
-	assert.Equal(t, 13, count)
+	assert.Equal(t, 14, count)
 	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
 # HELP wager_duplicates_total Idempotent replays (duplicate deliveries) by source.
 # TYPE wager_duplicates_total counter
