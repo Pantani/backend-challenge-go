@@ -27,7 +27,7 @@ import (
 type runningApp struct {
 	http   testenv.Client
 	group  *worker.Group
-	app    *fx.App
+	app    *bootstrap.Application
 	api    sqsadapter.API
 	queues sqsadapter.Queues
 }
@@ -36,7 +36,7 @@ func queueVars(names sqsadapter.QueueNames) map[string]string {
 	return map[string]string{"SQS_INPUT_QUEUE": names.Input, "SQS_DLQ": names.DLQ, "SQS_EVENTS_QUEUE": names.Events}
 }
 
-func newApp(t *testing.T, overrides map[string]string) (*fx.App, *bootstrap.Addr, *worker.Group, context.Context, context.CancelFunc) {
+func newApp(t *testing.T, overrides map[string]string) (*bootstrap.Application, *bootstrap.Addr, *worker.Group, context.Context, context.CancelFunc) {
 	t.Helper()
 	cfg, err := env.Config(overrides)
 	require.NoError(t, err)

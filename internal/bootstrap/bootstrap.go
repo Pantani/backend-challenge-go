@@ -12,6 +12,7 @@ package bootstrap
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -50,8 +51,7 @@ type startupContext struct{ context.Context }
 // It is intended for graph validation; New supplies the real startup context.
 func Options(cfg config.Config) fx.Option {
 	owner := &poolOwner{}
-	return fx.Options(options(startupContext{Context: context.Background()}, cfg, owner),
-		fx.Invoke(registerPoolOwnershipTransfer))
+	return options(startupContext{Context: context.Background()}, cfg, owner)
 }
 
 func options(startCtx startupContext, cfg config.Config, owner *poolOwner) fx.Option {
@@ -70,20 +70,75 @@ func newFxLogger(l *slog.Logger) fxevent.Logger {
 	return fl
 }
 
+type lifecycleApplication interface {
+	Err() error
+	Start(context.Context) error
+	Stop(context.Context) error
+	Wait() <-chan fx.ShutdownSignal
+}
+
+// Application owns the Fx application and resources acquired while its graph
+// is constructed. Startup ownership transfers to runtime only after the
+// underlying Fx Start call has returned successfully.
+type Application struct {
+	app             lifecycleApplication
+	owner           *poolOwner
+	shutdownTimeout time.Duration
+}
+
 // New builds the application. ctx is the single startup budget for graph
 // construction and lifecycle start hooks; callers cancel it after Start
 // returns. The stop budget is the configured shutdown timeout. extra options
 // (fx.Replace, fx.Decorate, fx.Populate) let tests adjust the graph.
-func New(ctx context.Context, cfg config.Config, extra ...fx.Option) *fx.App {
+func New(ctx context.Context, cfg config.Config, extra ...fx.Option) *Application {
 	owner := &poolOwner{}
-	application := fx.New(options(startupContext{Context: ctx}, cfg, owner), fx.Options(extra...),
-		fx.Invoke(registerPoolOwnershipTransfer),
+	fxApp := fx.New(options(startupContext{Context: ctx}, cfg, owner), fx.Options(extra...),
 		fx.StartTimeout(cfg.StartupTimeout), fx.StopTimeout(cfg.ShutdownTimeout))
+	application := newApplication(fxApp, owner, cfg.ShutdownTimeout)
 	if application.Err() != nil {
 		owner.Close()
 	}
 	return application
 }
+
+func newApplication(app lifecycleApplication, owner *poolOwner, shutdownTimeout time.Duration) *Application {
+	return &Application{app: app, owner: owner, shutdownTimeout: shutdownTimeout}
+}
+
+// Err reports an error encountered while constructing the Fx graph.
+func (a *Application) Err() error { return a.app.Err() }
+
+// Start starts the Fx lifecycle and transfers startup resources to runtime
+// ownership only after every start hook has completed successfully.
+func (a *Application) Start(ctx context.Context) error {
+	if err := a.app.Start(ctx); err != nil {
+		a.owner.Close()
+		return err
+	}
+	if err := a.owner.Transfer(ctx); err != nil {
+		return errors.Join(err, a.stopAfterFailedStart(ctx))
+	}
+	return nil
+}
+
+func (a *Application) stopAfterFailedStart(ctx context.Context) error {
+	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), a.shutdownTimeout)
+	defer cancel()
+	err := a.app.Stop(stopCtx)
+	a.owner.Close()
+	return err
+}
+
+// Stop stops the Fx lifecycle and closes startup resources even when a stop
+// hook fails or times out.
+func (a *Application) Stop(ctx context.Context) error {
+	err := a.app.Stop(ctx)
+	a.owner.Close()
+	return err
+}
+
+// Wait reports Fx shutdown signals and exit codes.
+func (a *Application) Wait() <-chan fx.ShutdownSignal { return a.app.Wait() }
 
 // ObservabilityModule provides logging and metrics.
 var ObservabilityModule = fx.Module("observability",
@@ -134,33 +189,107 @@ func openPool(ctx context.Context, cfg postgres.Config) (poolHandle, error) {
 	}, nil
 }
 
-// poolOwner closes its handle exactly once. The startup-context watcher owns
-// cleanup until a successful ping transfers ownership to the lifecycle hook.
+type poolOwnership uint8
+
+const (
+	poolUnclaimed poolOwnership = iota
+	poolStartupOwned
+	poolRuntimeOwned
+	poolClosed
+)
+
+var errStartupOwnershipLost = errors.New("startup resource ownership was lost before application start completed")
+
+// poolOwner serializes the startup watchdog, runtime transfer, and close. In
+// particular, Transfer waits when context.AfterFunc reports a callback already
+// in flight, so a closed pool can never be reported as a healthy runtime.
 type poolOwner struct {
+	mu               sync.Mutex
 	handle           poolHandle
-	closeOnce        sync.Once
+	state            poolOwnership
 	stopStartupWatch func() bool
+	startupWatchDone chan struct{}
+	closeDone        chan struct{}
 }
 
 func (o *poolOwner) Claim(ctx context.Context, handle poolHandle) {
+	o.mu.Lock()
 	o.handle = handle
-	o.stopStartupWatch = context.AfterFunc(ctx, o.Close)
+	o.state = poolStartupOwned
+	o.startupWatchDone = make(chan struct{})
+	o.closeDone = make(chan struct{})
+	o.mu.Unlock()
+
+	stop := context.AfterFunc(ctx, func() {
+		o.Close()
+		close(o.startupWatchDone)
+	})
+	o.mu.Lock()
+	o.stopStartupWatch = stop
+	o.mu.Unlock()
 }
 
 func (o *poolOwner) Ping(ctx context.Context) error { return o.handle.ping(ctx) }
 
-func (o *poolOwner) TransferToLifecycle() {
-	if o.stopStartupWatch != nil {
-		o.stopStartupWatch()
+func (o *poolOwner) Transfer(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		o.waitStartupWatch()
+		return err
+	}
+	o.mu.Lock()
+	stop, watchDone, state := o.stopStartupWatch, o.startupWatchDone, o.state
+	o.mu.Unlock()
+	if state == poolClosed {
+		return startupOwnershipError(ctx)
+	}
+	if stop != nil && !stop() {
+		<-watchDone
+		return startupOwnershipError(ctx)
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.state == poolClosed {
+		return startupOwnershipError(ctx)
+	}
+	o.state = poolRuntimeOwned
+	return nil
+}
+
+func startupOwnershipError(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return errStartupOwnershipLost
+}
+
+func (o *poolOwner) waitStartupWatch() {
+	o.mu.Lock()
+	done := o.startupWatchDone
+	o.mu.Unlock()
+	if done != nil {
+		<-done
 	}
 }
 
 func (o *poolOwner) Close() {
-	o.closeOnce.Do(func() {
-		if o.handle.close != nil {
-			o.handle.close()
+	o.mu.Lock()
+	if o.state == poolClosed {
+		done := o.closeDone
+		o.mu.Unlock()
+		if done != nil {
+			<-done
 		}
-	})
+		return
+	}
+	o.state = poolClosed
+	closeFn, done := o.handle.close, o.closeDone
+	o.mu.Unlock()
+	if closeFn != nil {
+		closeFn()
+	}
+	if done != nil {
+		close(done)
+	}
 }
 
 // newPool validates the database on start and closes the pool last.
@@ -189,13 +318,6 @@ func newPool(lc fx.Lifecycle, startCtx startupContext, cfg config.Config, owner 
 		},
 	})
 	return handle.pool, nil
-}
-
-// registerPoolOwnershipTransfer appends the final startup hook. New places its
-// invoke after all caller options, so the startup-context watchdog is canceled
-// only after every earlier hook has succeeded.
-func registerPoolOwnershipTransfer(lc fx.Lifecycle, owner *poolOwner) {
-	lc.Append(fx.StartHook(owner.TransferToLifecycle))
 }
 
 // SQSModule provides the SQS client, queues, publisher and consumer.

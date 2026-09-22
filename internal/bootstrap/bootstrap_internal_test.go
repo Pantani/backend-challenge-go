@@ -220,6 +220,22 @@ func (s *poolSpy) open(context.Context, postgresadapter.Config) (poolHandle, err
 
 type failedPoolConsumer struct{}
 
+type lifecycleAppStub struct {
+	start func(context.Context) error
+	stops atomic.Int32
+}
+
+func (*lifecycleAppStub) Err() error { return nil }
+
+func (a *lifecycleAppStub) Start(ctx context.Context) error { return a.start(ctx) }
+
+func (a *lifecycleAppStub) Stop(context.Context) error {
+	a.stops.Add(1)
+	return nil
+}
+
+func (*lifecycleAppStub) Wait() <-chan fx.ShutdownSignal { return make(chan fx.ShutdownSignal) }
+
 func TestPoolOwnershipClosesExactlyOnce(t *testing.T) {
 	t.Run("downstream construction failure", func(t *testing.T) {
 		spy := &poolSpy{}
@@ -283,6 +299,40 @@ func TestPoolOwnershipClosesExactlyOnce(t *testing.T) {
 		assert.EqualValues(t, 1, spy.closes.Load())
 	})
 
+	t.Run("watchdog wins after underlying start success", func(t *testing.T) {
+		spy := &poolSpy{}
+		owner := &poolOwner{}
+		ctx, cancel := context.WithCancel(context.Background())
+		handle, err := spy.open(ctx, postgresadapter.Config{})
+		require.NoError(t, err)
+		closeStarted := make(chan struct{})
+		releaseClose := make(chan struct{})
+		handle.close = func() {
+			close(closeStarted)
+			<-releaseClose
+			spy.closes.Add(1)
+		}
+		owner.Claim(ctx, handle)
+		underlying := &lifecycleAppStub{start: func(context.Context) error {
+			cancel()
+			<-closeStarted
+			return nil
+		}}
+		app := newApplication(underlying, owner, time.Second)
+		result := make(chan error, 1)
+		go func() { result <- app.Start(ctx) }()
+
+		select {
+		case err := <-result:
+			require.Fail(t, "Start returned while watchdog close was in flight", "error: %v", err)
+		case <-time.After(20 * time.Millisecond):
+		}
+		close(releaseClose)
+		assert.ErrorIs(t, <-result, context.Canceled)
+		assert.EqualValues(t, 1, spy.closes.Load())
+		assert.EqualValues(t, 1, underlying.stops.Load())
+	})
+
 	t.Run("successful full start transfers ownership to stop", func(t *testing.T) {
 		spy := &poolSpy{}
 		ctx, cancel := context.WithCancel(context.Background())
@@ -298,7 +348,7 @@ func TestPoolOwnershipClosesExactlyOnce(t *testing.T) {
 	})
 }
 
-func newAppWithPoolSpy(ctx context.Context, t *testing.T, spy *poolSpy) *fx.App {
+func newAppWithPoolSpy(ctx context.Context, t *testing.T, spy *poolSpy) *Application {
 	t.Helper()
 	return New(ctx, testConfig(t),
 		fx.Replace(poolFactory(spy.open)),
@@ -306,7 +356,7 @@ func newAppWithPoolSpy(ctx context.Context, t *testing.T, spy *poolSpy) *fx.App 
 	)
 }
 
-func newPoolLifecycleApp(ctx context.Context, t *testing.T, spy *poolSpy, extra ...fx.Option) *fx.App {
+func newPoolLifecycleApp(ctx context.Context, t *testing.T, spy *poolSpy, extra ...fx.Option) *Application {
 	t.Helper()
 	owner := &poolOwner{}
 	options := []fx.Option{
@@ -315,6 +365,5 @@ func newPoolLifecycleApp(ctx context.Context, t *testing.T, spy *poolSpy, extra 
 		fx.Invoke(func(*pgxpool.Pool) {}),
 	}
 	options = append(options, extra...)
-	options = append(options, fx.Invoke(registerPoolOwnershipTransfer))
-	return fx.New(options...)
+	return newApplication(fx.New(options...), owner, testConfig(t).ShutdownTimeout)
 }
