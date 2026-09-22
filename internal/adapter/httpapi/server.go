@@ -232,16 +232,38 @@ func (h *handler) observe(route string, next http.HandlerFunc) http.Handler {
 		correlation := correlationID(r)
 		w.Header().Set(headerCorrelationID, correlation)
 		ctx := observability.WithAttrs(r.Context(), slog.String("correlationId", correlation))
+		fields := &logFields{}
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		defer func() {
 			if p := recover(); p != nil {
 				h.recovered(ctx, rec, p)
 			}
 			h.Metrics.HTTPRequest(route, rec.status, time.Since(start))
-			h.Logger.InfoContext(ctx, "http request", "route", route, "status", rec.status, "durationMs", time.Since(start).Milliseconds())
+			args := append([]any{"route", route, "status", rec.status, "durationMs", time.Since(start).Milliseconds()}, fields.attrs...)
+			h.Logger.InfoContext(ctx, "http request", args...)
 		}()
-		next(rec, r.WithContext(context.WithValue(ctx, correlationKey{}, correlation)))
+		ctx = context.WithValue(context.WithValue(ctx, correlationKey{}, correlation), logFieldsKey{}, fields)
+		next(rec, r.WithContext(ctx))
 	})
+}
+
+// logFields collects what the inner handlers learn about a request (caller,
+// wallet, transaction) so the access log written by observe carries it too.
+// A request is served by a single goroutine, so it needs no lock.
+type logFields struct{ attrs []any }
+
+// logFieldsKey carries the request's *logFields in its context.
+type logFieldsKey struct{}
+
+// annotate returns a request context whose log records carry attrs, and adds
+// them to the request's access log.
+func annotate(ctx context.Context, attrs ...slog.Attr) context.Context {
+	if f, ok := ctx.Value(logFieldsKey{}).(*logFields); ok {
+		for _, a := range attrs {
+			f.attrs = append(f.attrs, a)
+		}
+	}
+	return observability.WithAttrs(ctx, attrs...)
 }
 
 // recovered turns a handler panic into a 500 unless the response already
@@ -306,7 +328,7 @@ func (h *handler) secured(allowed access, next http.HandlerFunc) http.HandlerFun
 			writeError(w, http.StatusForbidden, CodeForbidden, "operation not allowed for this client")
 			return
 		}
-		ctx := observability.WithAttrs(r.Context(), slog.String("clientId", p.ClientID), slog.String("providerId", p.ProviderID))
+		ctx := annotate(r.Context(), slog.String("clientId", p.ClientID), slog.String("providerId", p.ProviderID))
 		next(w, r.WithContext(context.WithValue(ctx, principalKey{}, p)))
 	}
 }
