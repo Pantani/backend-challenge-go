@@ -49,7 +49,9 @@ type startupContext struct{ context.Context }
 // Options returns every module of the service for the given configuration.
 // It is intended for graph validation; New supplies the real startup context.
 func Options(cfg config.Config) fx.Option {
-	return options(startupContext{Context: context.Background()}, cfg, &poolOwner{})
+	owner := &poolOwner{}
+	return fx.Options(options(startupContext{Context: context.Background()}, cfg, owner),
+		fx.Invoke(registerPoolOwnershipTransfer))
 }
 
 func options(startCtx startupContext, cfg config.Config, owner *poolOwner) fx.Option {
@@ -75,6 +77,7 @@ func newFxLogger(l *slog.Logger) fxevent.Logger {
 func New(ctx context.Context, cfg config.Config, extra ...fx.Option) *fx.App {
 	owner := &poolOwner{}
 	application := fx.New(options(startupContext{Context: ctx}, cfg, owner), fx.Options(extra...),
+		fx.Invoke(registerPoolOwnershipTransfer),
 		fx.StartTimeout(cfg.StartupTimeout), fx.StopTimeout(cfg.ShutdownTimeout))
 	if application.Err() != nil {
 		owner.Close()
@@ -178,7 +181,6 @@ func newPool(lc fx.Lifecycle, startCtx startupContext, cfg config.Config, owner 
 				owner.Close()
 				return err
 			}
-			owner.TransferToLifecycle()
 			return nil
 		},
 		OnStop: func(context.Context) error {
@@ -187,6 +189,13 @@ func newPool(lc fx.Lifecycle, startCtx startupContext, cfg config.Config, owner 
 		},
 	})
 	return handle.pool, nil
+}
+
+// registerPoolOwnershipTransfer appends the final startup hook. New places its
+// invoke after all caller options, so the startup-context watchdog is canceled
+// only after every earlier hook has succeeded.
+func registerPoolOwnershipTransfer(lc fx.Lifecycle, owner *poolOwner) {
+	lc.Append(fx.StartHook(owner.TransferToLifecycle))
 }
 
 // SQSModule provides the SQS client, queues, publisher and consumer.

@@ -265,19 +265,34 @@ func TestPoolOwnershipClosesExactlyOnce(t *testing.T) {
 		assert.EqualValues(t, 1, spy.closes.Load())
 	})
 
-	t.Run("successful start transfers ownership to stop", func(t *testing.T) {
+	t.Run("later hook canceled", func(t *testing.T) {
 		spy := &poolSpy{}
-		owner := &poolOwner{}
+		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+		defer cancel()
+		app := newPoolLifecycleApp(ctx, t, spy, fx.Invoke(func(lc fx.Lifecycle) {
+			lc.Append(fx.StartHook(func(ctx context.Context) error {
+				<-ctx.Done()
+				return ctx.Err()
+			}))
+		}))
+
+		assert.ErrorIs(t, app.Start(ctx), context.DeadlineExceeded)
+		require.Eventually(t, func() bool { return spy.closes.Load() == 1 }, time.Second, time.Millisecond)
+		require.NoError(t, app.Stop(context.Background()))
+		assert.EqualValues(t, 1, spy.pings.Load())
+		assert.EqualValues(t, 1, spy.closes.Load())
+	})
+
+	t.Run("successful full start transfers ownership to stop", func(t *testing.T) {
+		spy := &poolSpy{}
 		ctx, cancel := context.WithCancel(context.Background())
-		lc := fxtest.NewLifecycle(t)
-		_, err := newPool(lc, startupContext{Context: ctx}, testConfig(t), owner, poolFactory(spy.open))
-		require.NoError(t, err)
-		require.NoError(t, lc.Start(ctx))
+		app := newPoolLifecycleApp(ctx, t, spy)
+		require.NoError(t, app.Start(ctx))
 
 		cancel()
 		assert.Zero(t, spy.closes.Load(), "startup cancellation no longer owns a successfully started pool")
-		require.NoError(t, lc.Stop(context.Background()))
-		require.NoError(t, lc.Stop(context.Background()))
+		require.NoError(t, app.Stop(context.Background()))
+		require.NoError(t, app.Stop(context.Background()))
 		assert.EqualValues(t, 1, spy.pings.Load())
 		assert.EqualValues(t, 1, spy.closes.Load())
 	})
@@ -289,4 +304,17 @@ func newAppWithPoolSpy(ctx context.Context, t *testing.T, spy *poolSpy) *fx.App 
 		fx.Replace(poolFactory(spy.open)),
 		fx.Replace(fx.Annotate(fakeQueueAPI{}, fx.As(new(sqsadapter.API)))),
 	)
+}
+
+func newPoolLifecycleApp(ctx context.Context, t *testing.T, spy *poolSpy, extra ...fx.Option) *fx.App {
+	t.Helper()
+	owner := &poolOwner{}
+	options := []fx.Option{
+		fx.Supply(startupContext{Context: ctx}, testConfig(t), owner, poolFactory(spy.open)),
+		fx.Provide(newPool),
+		fx.Invoke(func(*pgxpool.Pool) {}),
+	}
+	options = append(options, extra...)
+	options = append(options, fx.Invoke(registerPoolOwnershipTransfer))
+	return fx.New(options...)
 }
