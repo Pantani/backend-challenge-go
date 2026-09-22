@@ -42,14 +42,10 @@ wallet migrate version     # versão atual
 
 Com o compose: `make migrate-up` / `make migrate-down`. Fora do Docker: `go run ./cmd/wallet migrate up`, com `DATABASE_URL` apontando para o banco. Os comandos `migrate` e `provision-queues` validam apenas as variáveis que usam (banco e SQS, respectivamente); só `serve` exige a configuração completa.
 
-Migration 5 changes the outbox fencing-token contract. Stop every relay before
-running either its `up` or `down` direction: both directions deliberately
-invalidate active outbox claims. After the migration finishes, restart only a
-binary compatible with the resulting schema version.
-The migration commits its structural change before validating the new check
-constraint so the validation scan does not hold the earlier write-blocking lock.
-If validation fails, inspect the partially applied schema and migration state
-before repairing the dirty version or retrying.
+The challenge currently uses one initial migration containing the complete
+schema. Reverting it removes the entire schema, so use `migrate down` only with
+a disposable database. After the schema is released to production, keep this
+initial migration unchanged and add versioned migrations for later changes.
 
 O binário devolve `0` em sucesso, `2` para comando ou argumentos inválidos (imprime o uso) e `1` para qualquer outra falha; erros vão para `stderr`, os logs JSON para `stdout`.
 
