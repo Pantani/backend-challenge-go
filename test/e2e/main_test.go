@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/semaphore"
 
 	sqsadapter "github.com/Pantani/backend-challenge-go/internal/adapter/sqs"
 	"github.com/Pantani/backend-challenge-go/internal/testutil"
@@ -34,7 +35,7 @@ var (
 	sqsClient sqsadapter.API
 	queues    sqsadapter.Queues
 	instances []*instance
-	tokens    = tokenCache{values: map[string]cachedToken{}}
+	tokens    = newTokenCache(func(ctx context.Context, client string) (string, error) { return env.Token(ctx, client) })
 	fixture   = &e2eFixture{}
 )
 
@@ -72,6 +73,7 @@ type e2eFixture struct {
 	instances []*instance
 	closeOnce sync.Once
 	closeErr  error
+	poolDone  chan struct{}
 }
 
 func (f *e2eFixture) Close(ctx context.Context) error {
@@ -85,7 +87,12 @@ func (f *e2eFixture) closeResources(ctx context.Context) error {
 		errs = append(errs, inst.stop(ctx))
 	}
 	if f.pool != nil {
-		f.pool.Close()
+		f.poolDone = make(chan struct{})
+		go func() {
+			f.pool.Close()
+			close(f.poolDone)
+		}()
+		errs = append(errs, waitDone(ctx, f.poolDone))
 	}
 	if f.tempDir != "" {
 		errs = append(errs, os.RemoveAll(f.tempDir))
@@ -158,12 +165,20 @@ func command(ctx context.Context, args ...string) *exec.Cmd {
 
 // instance is one independent wallet process.
 type instance struct {
+	*processRun
 	name    string
 	address string
-	cmd     *exec.Cmd
-	done    chan struct{}
-	waitErr error
-	stopped bool
+}
+
+// processRun is immutable ownership of one successfully started execution.
+type processRun struct {
+	cmd      *exec.Cmd
+	done     chan struct{}
+	waitErr  error
+	stopped  bool
+	killOnce sync.Once
+	killDone chan struct{}
+	killErr  error
 	// logs is written by the exec copier goroutine while the process runs.
 	logs testutil.SyncBuffer
 }
@@ -182,17 +197,17 @@ func (i *instance) startWith(ctx context.Context) error {
 }
 
 func (i *instance) startCommand(ctx context.Context, cmd *exec.Cmd, owner *e2eFixture) error {
-	i.cmd, i.done, i.stopped, i.address = cmd, make(chan struct{}), false, ""
-	i.logs = testutil.SyncBuffer{}
-	i.cmd.WaitDelay = time.Second
-	i.cmd.Stdout, i.cmd.Stderr = &i.logs, &i.logs
-	if err := i.cmd.Start(); err != nil {
+	run := &processRun{cmd: cmd, done: make(chan struct{}), killDone: make(chan struct{})}
+	cmd.WaitDelay = time.Second
+	cmd.Stdout, cmd.Stderr = &run.logs, &run.logs
+	if err := cmd.Start(); err != nil {
 		return err
 	}
-	owner.instances = append(owner.instances, i)
+	i.processRun, i.address = run, ""
+	owner.instances = append(owner.instances, &instance{name: i.name, processRun: run})
 	go func() {
-		i.waitErr = cmd.Wait()
-		close(i.done)
+		run.waitErr = cmd.Wait()
+		close(run.done)
 	}()
 	return i.waitReady(ctx)
 }
@@ -256,21 +271,23 @@ func get(ctx context.Context, url string) (int, error) {
 }
 
 // kill simulates an abrupt crash and reaps the child before restart.
-func (i *instance) kill() error {
-	err := i.cmd.Process.Kill()
-	<-i.done
-	i.stopped = true
+func (i *instance) kill(ctx context.Context) error {
+	if err := i.processRun.kill(ctx); err != nil {
+		return err
+	}
+	err := waitDone(ctx, i.done)
+	i.stopped = err == nil
 	return err
 }
 
-// stop escalates TERM to Kill at the caller's deadline and always reaps.
+// stop bounds every wait; the sole Wait owner keeps tracking a late reap.
 func (i *instance) stop(ctx context.Context) error {
 	if i.stopped {
 		return nil
 	}
-	i.stopped = true
 	select {
 	case <-i.done:
+		i.stopped = true
 		return i.waitErr
 	default:
 	}
@@ -279,13 +296,37 @@ func (i *instance) stop(ctx context.Context) error {
 }
 
 func (i *instance) awaitStop(ctx context.Context) error {
+	if err := waitDone(ctx, i.done); err != nil {
+		return errors.Join(err, i.processRun.kill(ctx), waitDone(ctx, i.done))
+	}
+	i.stopped = true
+	return i.waitErr
+}
+
+func (r *processRun) kill(ctx context.Context) error {
+	r.killOnce.Do(func() {
+		go func() {
+			r.killErr = processSignalError(r.cmd.Process.Kill())
+			close(r.killDone)
+		}()
+	})
+	if err := waitDone(ctx, r.killDone); err != nil {
+		return err
+	}
+	return r.killErr
+}
+
+func waitDone(ctx context.Context, done <-chan struct{}) error {
 	select {
-	case <-i.done:
-		return i.waitErr
+	case <-done:
+		return nil
+	default:
+	}
+	select {
+	case <-done:
+		return nil
 	case <-ctx.Done():
-		err := i.cmd.Process.Kill()
-		<-i.done
-		return errors.Join(ctx.Err(), processSignalError(err))
+		return ctx.Err()
 	}
 }
 
@@ -305,18 +346,25 @@ type cachedToken struct {
 }
 
 type tokenCache struct {
-	mu     sync.Mutex
+	mu     *semaphore.Weighted
 	values map[string]cachedToken
+	fetch  func(context.Context, string) (string, error)
+}
+
+func newTokenCache(fetch func(context.Context, string) (string, error)) *tokenCache {
+	return &tokenCache{mu: semaphore.NewWeighted(1), values: make(map[string]cachedToken), fetch: fetch}
 }
 
 // get returns a cached token, fetching a new one when it is about to expire.
-func (c *tokenCache) get(client string) (string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (c *tokenCache) get(ctx context.Context, client string) (string, error) {
+	if err := c.mu.Acquire(ctx, 1); err != nil {
+		return "", err
+	}
+	defer c.mu.Release(1)
 	if tok, ok := c.values[client]; ok && time.Since(tok.issuedAt) < tokenRefresh {
 		return tok.value, nil
 	}
-	value, err := env.Token(context.Background(), client)
+	value, err := c.fetch(ctx, client)
 	if err != nil {
 		return "", err
 	}

@@ -16,6 +16,19 @@ import (
 	"github.com/Pantani/backend-challenge-go/test/testenv"
 )
 
+// Register first so logs include failures from later scenario cleanups too.
+func logScenarioFailure(t *testing.T) {
+	t.Helper()
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		for _, inst := range fixture.instances {
+			t.Logf("instance %s pid=%d logs:\n%s", inst.name, inst.cmd.Process.Pid, inst.logs.String())
+		}
+	})
+}
+
 func openWallet(t *testing.T, amount string) testenv.Wallet {
 	t.Helper()
 	w := instances[0].client().OpenWallet(t, amount)
@@ -72,6 +85,7 @@ func statusCount(results []testenv.Response) map[int]int {
 }
 
 func TestFiftyIdenticalBetsAcrossThreeInstances(t *testing.T) {
+	logScenarioFailure(t)
 	w := openWallet(t, "1000.00")
 	ext := uuid.NewString()
 	results := concurrently(t, 50, func(_ int, inst *instance) (testenv.Response, error) {
@@ -83,6 +97,7 @@ func TestFiftyIdenticalBetsAcrossThreeInstances(t *testing.T) {
 }
 
 func TestTwoBetsRaceAcrossInstances(t *testing.T) {
+	logScenarioFailure(t)
 	w := openWallet(t, "100.00")
 	exts := []string{uuid.NewString(), uuid.NewString()}
 	results := concurrently(t, 2, func(i int, inst *instance) (testenv.Response, error) {
@@ -104,6 +119,7 @@ func TestTwoBetsRaceAcrossInstances(t *testing.T) {
 }
 
 func TestDistinctWalletsInParallelAcrossInstances(t *testing.T) {
+	logScenarioFailure(t)
 	wallets := []testenv.Wallet{openWallet(t, "100.00"), openWallet(t, "100.00"), openWallet(t, "100.00"), openWallet(t, "100.00")}
 	results := concurrently(t, 40, func(i int, inst *instance) (testenv.Response, error) {
 		return submitE(inst, wallets[i%4], uuid.NewString(), "BET", "10.00", "")
@@ -123,6 +139,7 @@ func sendMessage(t *testing.T, messageID string, w testenv.Wallet, ext, kind, am
 }
 
 func TestSameOperationThroughHTTPAndSQSAcrossInstances(t *testing.T) {
+	logScenarioFailure(t)
 	w := openWallet(t, "100.00")
 	ext := uuid.NewString()
 	sendMessage(t, "msg-"+ext, w, ext, "BET", "10.00")
@@ -146,6 +163,7 @@ func TestSameOperationThroughHTTPAndSQSAcrossInstances(t *testing.T) {
 }
 
 func TestRefundBeforeBetAcrossInstances(t *testing.T) {
+	logScenarioFailure(t)
 	w := openWallet(t, "100.00")
 	bet, refund := uuid.NewString(), uuid.NewString()
 	pending := submit(t, instances[0], w, refund, "REFUND", "40.00", bet)
@@ -170,6 +188,7 @@ func TestRefundBeforeBetAcrossInstances(t *testing.T) {
 // TestCrashAndRestart kills every instance (no graceful shutdown) and
 // verifies that idempotency, pending references and balances survive.
 func TestCrashAndRestart(t *testing.T) {
+	logScenarioFailure(t)
 	w := openWallet(t, "100.00")
 	bet, refund, lateBet := uuid.NewString(), uuid.NewString(), uuid.NewString()
 	first := submit(t, instances[0], w, bet, "BET", "30.00", "")
@@ -177,7 +196,10 @@ func TestCrashAndRestart(t *testing.T) {
 	require.Equal(t, http.StatusAccepted, submit(t, instances[1], w, refund, "REFUND", "20.00", lateBet).Status)
 
 	for _, inst := range instances {
-		require.NoError(t, inst.kill())
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		err := inst.kill(ctx)
+		cancel()
+		require.NoError(t, err)
 	}
 	for _, inst := range instances {
 		require.NoError(t, inst.startWith(t.Context()))

@@ -368,7 +368,7 @@ func TestSameOperationThroughHTTPAndSQS(t *testing.T) {
 	require.NoError(t, err)
 	in := s.input(w, "provider-a", "cross", "BET", "10.00", "")
 	messageID := uuid.NewString()
-	responses, err := crossTransportSubmit(ctx, flowClient(ctx, r.http.Base, env), r.api, r.queues.Input, in, messageID)
+	responses, err := crossTransportSubmit(ctx, flowClient(r.http.Base, env), r.api, r.queues.Input, in, messageID)
 	require.NoError(t, err)
 	require.Contains(t, []int{http.StatusOK, http.StatusCreated}, responses[0].Status, responses[0].Body)
 	require.Equal(t, "PROCESSED", responses[0].Body["status"])
@@ -417,7 +417,7 @@ func TestCrossTransportSubmissionHonorsDeadline(t *testing.T) {
 	defer server.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	client := testenv.Client{Base: server.URL, Token: func(string) (string, error) { return "test", nil }}
+	client := testenv.Client{Base: server.URL, Token: func(context.Context, string) (string, error) { return "test", nil }}
 	in := testenv.SubmitInput(testenv.Wallet{ID: uuid.NewString(), PlayerID: uuid.NewString()}, "provider-a", uuid.NewString(), "BET", "1.00", "")
 	deadline, _ := ctx.Deadline()
 	_, err := crossTransportSubmit(ctx, client, deadlineSendAPI{deadline: deadline}, "input", in, uuid.NewString())
@@ -438,13 +438,13 @@ func TestCrossTransportTokenHonorsDeadline(t *testing.T) {
 	defer server.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	client := flowClient(ctx, server.URL, &testenv.Env{KeycloakURL: server.URL})
-	_, err := client.Token("provider-a")
+	client := flowClient(server.URL, &testenv.Env{KeycloakURL: server.URL})
+	_, err := client.Token(ctx, "provider-a")
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
-func flowClient(ctx context.Context, base string, environment *testenv.Env) testenv.Client {
-	return testenv.Client{Base: base, Token: func(provider string) (string, error) {
+func flowClient(base string, environment *testenv.Env) testenv.Client {
+	return testenv.Client{Base: base, Token: func(ctx context.Context, provider string) (string, error) {
 		tokenCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		return environment.Token(tokenCtx, provider)

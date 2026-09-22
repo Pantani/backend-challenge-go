@@ -6,17 +6,48 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 )
+
+func TestClientDeadlineCancelsAuthenticationBeforeAPICall(t *testing.T) {
+	cancelled := make(chan bool, 1)
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		select {
+		case <-r.Context().Done():
+			cancelled <- true
+		case <-time.After(300 * time.Millisecond):
+			cancelled <- false
+			fmt.Fprint(w, `{"access_token":"late-token"}`)
+		}
+	}))
+	defer tokenServer.Close()
+	var calls atomic.Int32
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		fmt.Fprint(w, `{}`)
+	}))
+	defer api.Close()
+	env := Env{KeycloakURL: tokenServer.URL}
+	c := Client{Base: api.URL, Token: env.Token}
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Millisecond)
+	defer cancel()
+	_, err := c.Do(ctx, http.MethodGet, "/", "provider-a", "", nil)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.True(t, <-cancelled, "authentication must observe the caller cancellation")
+	require.Zero(t, calls.Load(), "API request must not start after auth timeout")
+}
 
 func TestRepoRootWalksUpToGoMod(t *testing.T) {
 	root, err := RepoRoot(filepath.Join("..", "e2e"))

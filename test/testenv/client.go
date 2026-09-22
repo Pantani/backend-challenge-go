@@ -41,20 +41,22 @@ type Wallet struct {
 // Authorization header.
 type Client struct {
 	Base  string
-	Token func(client string) (string, error)
+	Token func(ctx context.Context, client string) (string, error)
 	HTTP  http.Client
 }
 
 // Do sends a request and returns transport errors instead of failing, so it
 // is safe from worker goroutines.
 func (c Client) Do(ctx context.Context, method, path, client, body string, headers map[string]string) (Response, error) {
-	req, err := c.request(ctx, method, path, client, body, headers)
-	if err != nil {
-		return Response{}, err
-	}
 	httpClient := c.HTTP
 	if httpClient.Timeout <= 0 {
 		httpClient.Timeout = 10 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, httpClient.Timeout)
+	defer cancel()
+	req, err := c.request(ctx, method, path, client, body, headers)
+	if err != nil {
+		return Response{}, err
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -74,7 +76,7 @@ func (c Client) request(ctx context.Context, method, path, client, body string, 
 		return nil, err
 	}
 	if client != "" {
-		tok, err := c.Token(client)
+		tok, err := c.Token(ctx, client)
 		if err != nil {
 			return nil, err
 		}

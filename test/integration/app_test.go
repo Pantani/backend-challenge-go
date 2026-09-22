@@ -63,7 +63,7 @@ func startApp(t *testing.T) runningApp {
 
 // client drives the API at base, authenticating with Keycloak tokens.
 func client(base string) testenv.Client {
-	return testenv.Client{Base: base, Token: func(c string) (string, error) { return env.Token(context.Background(), c) }}
+	return testenv.Client{Base: base, Token: env.Token}
 }
 
 func (r runningApp) wallet(t *testing.T, id string) map[string]any {
