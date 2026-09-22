@@ -43,10 +43,21 @@ func DecodeStrict(r io.Reader, dst any) error {
 	if err := dec.Decode(dst); err != nil {
 		return describe(err)
 	}
-	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+	return trailing(dec.Decode(&struct{}{}))
+}
+
+// trailing interprets the result of decoding past the first object: EOF is
+// the only success, a decoded token or a syntax error is trailing data, and
+// any other failure (a body limit, a transport error) keeps its real cause so
+// callers can still classify it.
+func trailing(err error) error {
+	switch {
+	case errors.Is(err, io.EOF):
+		return nil
+	case err == nil, errors.As(err, new(*json.SyntaxError)), errors.As(err, new(*json.UnmarshalTypeError)):
 		return &DecodeError{Message: ErrTrailingData.Error(), Cause: ErrTrailingData}
 	}
-	return nil
+	return &DecodeError{Message: ErrTrailingData.Error(), Cause: err}
 }
 
 // describe maps encoding/json errors to client-facing messages.

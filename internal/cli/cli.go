@@ -86,13 +86,21 @@ func run(ctx context.Context, args []string, lookup config.Lookup, stdout io.Wri
 	}
 	switch cmd {
 	case "serve":
-		return serveCmd(ctx, lookup)
+		return noArgs(rest, func() error { return serveCmd(ctx, lookup) })
 	case "migrate":
 		return migrateCmd(lookup, rest, stdout)
 	case "provision-queues":
-		return provision(ctx, lookup, stdout)
+		return noArgs(rest, func() error { return provision(ctx, lookup, stdout) })
 	}
 	return ErrUsage
+}
+
+// noArgs runs fn only when the command received no surplus arguments.
+func noArgs(rest []string, fn func() error) error {
+	if len(rest) > 0 {
+		return ErrUsage
+	}
+	return fn()
 }
 
 func serveCmd(ctx context.Context, lookup config.Lookup) error {
@@ -137,7 +145,7 @@ func parseMigration(args []string) (migration, error) {
 	}
 	switch args[0] {
 	case "up", "version":
-		return migration{op: args[0]}, nil
+		return migration{op: args[0]}, noArgs(args[1:], func() error { return nil })
 	case "down":
 		steps, err := parseSteps(args[1:])
 		return migration{op: "down", steps: steps}, err
@@ -151,7 +159,7 @@ func parseSteps(args []string) (int, error) {
 		return 1, nil
 	}
 	n, err := strconv.Atoi(args[0])
-	if err != nil || n < 1 {
+	if err != nil || n < 1 || len(args) > 1 {
 		return 0, ErrUsage
 	}
 	return n, nil

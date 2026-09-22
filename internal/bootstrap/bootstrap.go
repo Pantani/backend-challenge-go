@@ -171,7 +171,8 @@ func newConsumer(api sqsadapter.API, q sqsadapter.Queues, cfg config.Config, svc
 	return sqsadapter.NewConsumer(api, sqsadapter.ConsumerConfig{
 		Name: cfg.SQSConsumerName, QueueURL: q.Input, DLQURL: q.DLQ, MaxMessages: int32(cfg.SQSMaxMessages),
 		WaitTime: cfg.SQSWaitTime, VisibilityTimeout: cfg.SQSVisibilityTimeout, ProcessTimeout: cfg.SQSProcessTimeout,
-		RetryBase: cfg.SQSRetryBase, RetryMax: cfg.SQSRetryMax, Senders: senders,
+		AckTimeout: cfg.SQSAckTimeout,
+		RetryBase:  cfg.SQSRetryBase, RetryMax: cfg.SQSRetryMax, Senders: senders,
 	}, svc, logger, metrics), nil
 }
 

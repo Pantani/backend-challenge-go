@@ -166,14 +166,17 @@ func CountDebits(ctx context.Context, pool *pgxpool.Pool, walletID string) (int,
 // and collects the results in call order.
 func Parallel[T any](n int, fn func(i int) T) []T {
 	out := make([]T, n)
-	var wg sync.WaitGroup
+	var wg, ready sync.WaitGroup
+	ready.Add(n)
 	start := make(chan struct{})
 	for i := range n {
 		wg.Go(func() {
+			ready.Done()
 			<-start
 			out[i] = fn(i)
 		})
 	}
+	ready.Wait()
 	close(start)
 	wg.Wait()
 	return out

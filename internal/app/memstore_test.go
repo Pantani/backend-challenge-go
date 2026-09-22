@@ -221,6 +221,9 @@ var rowChecks = map[string]func(s wager.Snapshot) bool{
 	"reference required for reversals": func(s wager.Snapshot) bool {
 		return s.Kind.IsReversal() && s.External.ReferenceExternalID == ""
 	},
+	"PENDING is never stored": func(s wager.Snapshot) bool {
+		return s.Status == wager.StatusPending
+	},
 }
 
 // checkRow rejects rows the database CHECK constraints would reject.

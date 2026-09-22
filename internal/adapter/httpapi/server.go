@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"path"
 	"regexp"
 	"strings"
 	"time"
@@ -98,6 +99,9 @@ func providerOrInternal(p auth.Principal) bool { return p.IsInternal() || p.IsPr
 // arbitrary paths never create new label values.
 const routeUnmatched = "unmatched"
 
+// routeRedirect is the metrics label of the mux's path-cleaning redirects.
+const routeRedirect = "redirect"
+
 // NewHandler builds the router. Business routes require a valid bearer token;
 // health checks and metrics are public. Every response, including 404 and
 // 405, is JSON, carries the correlation id and is logged and measured.
@@ -117,11 +121,19 @@ func NewHandler(d Deps) http.Handler {
 		h.secured(providerOrInternal, h.getTransactionByExternal))
 	unmatched := h.observe(routeUnmatched, h.unmatched(mux))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if _, pattern := mux.Handler(r); pattern == "" {
+		next, pattern := mux.Handler(r)
+		switch {
+		case pattern == "":
 			unmatched.ServeHTTP(w, r)
-			return
+		case path.Clean(r.URL.Path) != r.URL.Path:
+			// The mux answers unclean paths with a redirect handler of its
+			// own, which is not one of the observed routes.
+			h.observe(routeRedirect, next.ServeHTTP).ServeHTTP(w, r)
+		default:
+			// Only the mux itself binds path values, so registered routes
+			// must be served through it.
+			mux.ServeHTTP(w, r)
 		}
-		mux.ServeHTTP(w, r)
 	})
 }
 

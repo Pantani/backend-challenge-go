@@ -34,7 +34,7 @@ func TestDefaults(t *testing.T) {
 		{"OIDC_JWKS_URL", c.OIDCJWKSURL, "http://localhost:8180/realms/wallet/protocol/openid-connect/certs"},
 		{"OIDC_AUDIENCE", c.OIDCAudience, "wallet-api"},
 		{"AWS_REGION", c.AWSRegion, "us-east-1"},
-		{"AWS_ENDPOINT_URL", c.AWSEndpoint, "http://localhost:4566"},
+		{"AWS_ENDPOINT_URL", c.AWSEndpoint, ""},
 		{"SQS_INPUT_QUEUE", c.SQSInputQueue, "wager-transactions.fifo"},
 		{"SQS_DLQ", c.SQSDLQ, "wager-transactions-dlq.fifo"},
 		{"SQS_EVENTS_QUEUE", c.SQSEventsQueue, "wallet-events.fifo"},
@@ -44,6 +44,7 @@ func TestDefaults(t *testing.T) {
 		{"SQS_WAIT_TIME", c.SQSWaitTime, 10 * time.Second},
 		{"SQS_VISIBILITY_TIMEOUT", c.SQSVisibilityTimeout, 30 * time.Second},
 		{"SQS_PROCESS_TIMEOUT", c.SQSProcessTimeout, 20 * time.Second},
+		{"SQS_ACK_TIMEOUT", c.SQSAckTimeout, 5 * time.Second},
 		{"SQS_RETRY_BASE", c.SQSRetryBase, 2 * time.Second},
 		{"SQS_RETRY_MAX", c.SQSRetryMax, 60 * time.Second},
 		{"SQS_MAX_RECEIVE_COUNT", c.SQSMaxReceiveCount, 5},
@@ -115,6 +116,9 @@ func TestValidation(t *testing.T) {
 		"sqs retry max > 12h":       {"SQS_RETRY_MAX": "13h"},
 		"shutdown <= process":       {"SHUTDOWN_TIMEOUT": "20s"},
 		"zero publish timeout":      {"OUTBOX_PUBLISH_TIMEOUT": "0s"},
+		"publish timeout >= lease":  {"OUTBOX_PUBLISH_TIMEOUT": "30s"},
+		"process + ack >= visible":  {"SQS_ACK_TIMEOUT": "10s"},
+		"zero ack timeout":          {"SQS_ACK_TIMEOUT": "0s"},
 	}
 	for name, values := range invalid {
 		_, err := config.Load(config.MapLookup(values))

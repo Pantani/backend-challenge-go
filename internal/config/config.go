@@ -34,7 +34,7 @@ type Database struct {
 // `wallet provision-queues`.
 type SQS struct {
 	// AWSRegion is the SQS region; AWSEndpoint overrides the endpoint
-	// (LocalStack locally, empty for AWS).
+	// (LocalStack locally; empty, the default, means real AWS).
 	AWSRegion   string
 	AWSEndpoint string
 	// SQSInputQueue, SQSDLQ and SQSEventsQueue are FIFO queue names.
@@ -50,9 +50,13 @@ type SQS struct {
 	// SQSWaitTime is the long-polling wait (0..20s).
 	SQSWaitTime time.Duration
 	// SQSVisibilityTimeout hides a received message from other consumers;
-	// SQSProcessTimeout bounds one message and must stay below it.
+	// SQSProcessTimeout bounds the handling of one message and
+	// SQSAckTimeout the broker follow-up (delete, retry visibility, DLQ
+	// copy). Their sum must stay below the visibility timeout so a message is
+	// never handled twice at once.
 	SQSVisibilityTimeout time.Duration
 	SQSProcessTimeout    time.Duration
+	SQSAckTimeout        time.Duration
 	// SQSRetryBase and SQSRetryMax bound the visibility backoff of a retried
 	// message.
 	SQSRetryBase time.Duration
@@ -184,15 +188,15 @@ func (r *reader) database() Database {
 
 func (r *reader) sqs() SQS {
 	return SQS{
-		AWSRegion: r.str("AWS_REGION", "us-east-1"), AWSEndpoint: r.str("AWS_ENDPOINT_URL", "http://localhost:4566"),
+		AWSRegion: r.str("AWS_REGION", "us-east-1"), AWSEndpoint: r.str("AWS_ENDPOINT_URL", ""),
 		SQSInputQueue:   r.str("SQS_INPUT_QUEUE", "wager-transactions.fifo"),
 		SQSDLQ:          r.str("SQS_DLQ", "wager-transactions-dlq.fifo"),
 		SQSEventsQueue:  r.str("SQS_EVENTS_QUEUE", "wallet-events.fifo"),
 		SQSConsumerName: r.str("SQS_CONSUMER_NAME", "wager-transactions-consumer"),
 		SQSConsumers:    r.int("SQS_CONSUMERS", 2), SQSMaxMessages: r.int("SQS_MAX_MESSAGES", 10),
 		SQSWaitTime: r.dur("SQS_WAIT_TIME", 10*time.Second), SQSVisibilityTimeout: r.dur("SQS_VISIBILITY_TIMEOUT", 30*time.Second),
-		SQSProcessTimeout: r.dur("SQS_PROCESS_TIMEOUT", 20*time.Second),
-		SQSRetryBase:      r.dur("SQS_RETRY_BASE", 2*time.Second), SQSRetryMax: r.dur("SQS_RETRY_MAX", 60*time.Second),
+		SQSProcessTimeout: r.dur("SQS_PROCESS_TIMEOUT", 20*time.Second), SQSAckTimeout: r.dur("SQS_ACK_TIMEOUT", 5*time.Second),
+		SQSRetryBase: r.dur("SQS_RETRY_BASE", 2*time.Second), SQSRetryMax: r.dur("SQS_RETRY_MAX", 60*time.Second),
 		SQSMaxReceiveCount: r.int("SQS_MAX_RECEIVE_COUNT", 5),
 		// LocalStack reports every sender as the account id 000000000000.
 		SQSSenderProviders: r.str("SQS_SENDER_PROVIDERS", "000000000000=*"),
@@ -240,9 +244,10 @@ func (s SQS) validate() error {
 		{positive(s.SQSConsumers, s.SQSMaxReceiveCount), "SQS_CONSUMERS and SQS_MAX_RECEIVE_COUNT must be positive"},
 		{between(s.SQSMaxMessages, 1, 10), "SQS_MAX_MESSAGES must be between 1 and 10"},
 		{between(int(s.SQSWaitTime), 0, int(20*time.Second)), "SQS_WAIT_TIME must be between 0s and 20s"},
-		{positiveDurations(s.SQSVisibilityTimeout, s.SQSProcessTimeout, s.SQSRetryBase, s.SQSRetryMax),
-			"SQS visibility, process and retry durations must be positive"},
-		{s.SQSProcessTimeout < s.SQSVisibilityTimeout, "SQS_PROCESS_TIMEOUT must be lower than SQS_VISIBILITY_TIMEOUT"},
+		{positiveDurations(s.SQSVisibilityTimeout, s.SQSProcessTimeout, s.SQSAckTimeout, s.SQSRetryBase, s.SQSRetryMax),
+			"SQS visibility, process, ack and retry durations must be positive"},
+		{s.SQSProcessTimeout+s.SQSAckTimeout < s.SQSVisibilityTimeout,
+			"SQS_PROCESS_TIMEOUT plus SQS_ACK_TIMEOUT must be lower than SQS_VISIBILITY_TIMEOUT"},
 		{s.SQSRetryBase <= s.SQSRetryMax, "SQS_RETRY_BASE must not exceed SQS_RETRY_MAX"},
 		{s.SQSVisibilityTimeout <= maxSQSDuration && s.SQSRetryMax <= maxSQSDuration,
 			"SQS_VISIBILITY_TIMEOUT and SQS_RETRY_MAX must not exceed 12h"},
@@ -262,6 +267,7 @@ func (c Config) validate() error {
 		{positiveDurations(c.PendingInterval, c.OutboxInterval, c.OutboxLease, c.OutboxRetryBase, c.OutboxRetryMax,
 			c.OutboxPublishTimeout, c.ShutdownTimeout, c.ReadyTimeout), "worker intervals, leases, retries and timeouts must be positive"},
 		{c.OutboxRetryBase <= c.OutboxRetryMax, "OUTBOX_RETRY_BASE must not exceed OUTBOX_RETRY_MAX"},
+		{c.OutboxPublishTimeout < c.OutboxLease, "OUTBOX_PUBLISH_TIMEOUT must be lower than OUTBOX_LEASE"},
 		{c.ShutdownTimeout > c.SQSProcessTimeout, "SHUTDOWN_TIMEOUT must exceed SQS_PROCESS_TIMEOUT"},
 	}))
 }

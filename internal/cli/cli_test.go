@@ -19,7 +19,8 @@ func run(vars map[string]string, args ...string) (code int, stdout, stderr strin
 
 func TestUsageErrorsExitWithTwo(t *testing.T) {
 	t.Parallel()
-	for _, args := range [][]string{{"bogus"}, {"migrate"}, {"migrate", "sideways"}, {"migrate", "down", "zero"}} {
+	for _, args := range [][]string{{"bogus"}, {"migrate"}, {"migrate", "sideways"}, {"migrate", "down", "zero"},
+		{"serve", "extra"}, {"provision-queues", "extra"}, {"migrate", "up", "extra"}, {"migrate", "version", "extra"}, {"migrate", "down", "1", "extra"}} {
 		code, stdout, stderr := run(map[string]string{"SQS_CONSUMERS": "0"}, args...)
 		assert.Equal(t, cli.ExitUsage, code, args)
 		assert.Empty(t, stdout, args)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -322,14 +323,16 @@ func (c *Consumer) deadLetter(parent context.Context, m types.Message, cause err
 	return true
 }
 
-// truncate cuts s to at most n bytes without splitting a multi-byte rune,
-// since SQS rejects attributes that are not valid UTF-8.
+// truncate replaces invalid bytes and cuts s to at most n bytes without
+// splitting a multi-byte rune, since SQS rejects attributes that are not
+// valid UTF-8.
 func truncate(s string, n int) string {
+	s = strings.ToValidUTF8(s, "\uFFFD")
 	if len(s) <= n {
 		return s
 	}
 	cut := n
-	for cut > 0 && !utf8.ValidString(s[:cut]) {
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
 		cut--
 	}
 	return s[:cut]

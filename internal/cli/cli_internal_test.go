@@ -66,6 +66,7 @@ func TestParseSteps(t *testing.T) {
 		{[]string{"0"}, 0, ErrUsage},
 		{[]string{"-2"}, 0, ErrUsage},
 		{[]string{"two"}, 0, ErrUsage},
+		{[]string{"2", "typo"}, 0, ErrUsage},
 	}
 	for _, tc := range cases {
 		got, err := parseSteps(tc.args)
@@ -86,6 +87,7 @@ func TestParseMigration(t *testing.T) {
 		{[]string{"down"}, migration{op: "down", steps: 1}, nil},
 		{[]string{"down", "4"}, migration{op: "down", steps: 4}, nil},
 		{[]string{"down", "x"}, migration{op: "down"}, ErrUsage},
+		{[]string{"up", "extra"}, migration{op: "up"}, ErrUsage},
 		{[]string{"sideways"}, migration{}, ErrUsage},
 		{nil, migration{}, ErrUsage},
 	}

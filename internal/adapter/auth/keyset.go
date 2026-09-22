@@ -26,7 +26,10 @@ type keySet struct {
 	interval time.Duration
 	algs     []jose.SignatureAlgorithm
 
+	// mu guards the cache; fetchMu serialises refreshes so concurrent misses
+	// share one request without blocking readers of the cache.
 	mu        sync.Mutex
+	fetchMu   sync.Mutex
 	keys      []jose.JSONWebKey
 	lastFetch time.Time
 }
@@ -80,18 +83,36 @@ func (k *keySet) cached() []jose.JSONWebKey {
 // callers share a single fetch. Failed fetches also count against the
 // interval so an unavailable IdP is not hammered.
 func (k *keySet) refresh(ctx context.Context) ([]jose.JSONWebKey, error) {
+	if keys, ok := k.fresh(); ok {
+		return keys, nil
+	}
+	k.fetchMu.Lock()
+	defer k.fetchMu.Unlock()
+	// A caller that queued behind an in-flight fetch reuses its result.
+	if keys, ok := k.fresh(); ok {
+		return keys, nil
+	}
+	keys, err := k.fetch(ctx)
+	// The interval starts when the fetch ends, so an in-flight fetch never
+	// makes an empty or stale cache look fresh to other verifications.
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	if !k.lastFetch.IsZero() && time.Since(k.lastFetch) < k.interval {
-		return k.keys, nil
-	}
 	k.lastFetch = time.Now()
-	keys, err := k.fetch(ctx)
 	if err != nil {
 		return nil, err
 	}
 	k.keys = keys
 	return keys, nil
+}
+
+// fresh returns the cached keys when a fetch happened within the interval.
+func (k *keySet) fresh() ([]jose.JSONWebKey, bool) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.lastFetch.IsZero() || time.Since(k.lastFetch) >= k.interval {
+		return nil, false
+	}
+	return k.keys, true
 }
 
 // fetch downloads and parses the JWKS document.

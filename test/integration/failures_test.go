@@ -132,22 +132,26 @@ func TestStatementTimeoutIsUnavailable(t *testing.T) {
 
 	release := make(chan struct{})
 	locked := make(chan error, 1)
+	acquired := make(chan struct{})
 	go func() {
 		locked <- postgres.NewUnitOfWork(pool).Do(ctx, func(ctx context.Context, r app.Repositories) error {
 			if _, err := r.Wallets().GetForUpdate(ctx, w.ID()); err != nil {
 				return err
 			}
+			close(acquired)
 			<-release
 			return nil
 		})
 	}()
 	defer func() { close(release); require.NoError(t, <-locked) }()
-	require.Eventually(t, func() bool {
-		var n int
-		require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
-			WHERE l.locktype = 'transactionid' AND a.state = 'idle in transaction'`).Scan(&n))
-		return n > 0
-	}, 5*time.Second, 20*time.Millisecond, "the wallet is locked by an open transaction")
+	select {
+	case <-acquired:
+	case err := <-locked:
+		locked <- err
+		require.NoError(t, err, "the wallet lock was never taken")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the wallet was not locked by the open transaction")
+	}
 
 	err = postgres.NewUnitOfWork(slow).Do(ctx, func(ctx context.Context, r app.Repositories) error {
 		_, err := r.Wallets().GetForUpdate(ctx, w.ID())

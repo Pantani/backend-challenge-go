@@ -252,6 +252,22 @@ func TestUnknownKidRefreshIsRateLimited(t *testing.T) {
 	assert.NoError(t, err, "known keys keep working while refreshes are throttled")
 }
 
+func TestColdCacheServesConcurrentTokensWithOneFetch(t *testing.T) {
+	t.Parallel()
+	i := newIDP(t)
+	v := i.verifier(time.Hour)
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	for range 50 {
+		wg.Go(func() {
+			_, err := v.Verify(ctx, i.sign(t, "k1", claims(nil)))
+			assert.NoError(t, err, "callers queued behind the first fetch reuse its keys")
+		})
+	}
+	wg.Wait()
+	assert.EqualValues(t, 1, i.hits.Load(), "concurrent misses share one fetch")
+}
+
 func TestJWKSServerErrorIsUnauthenticated(t *testing.T) {
 	t.Parallel()
 	i := newIDP(t)

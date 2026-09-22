@@ -289,6 +289,19 @@ func TestUnmatchedRoutesAreJSON(t *testing.T) {
 	assert.Contains(t, f.logs.String(), `"correlationId":"c-404"`)
 }
 
+func TestPathCleaningRedirectsAreObserved(t *testing.T) {
+	t.Parallel()
+	f := &fixture{}
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/health/../health/live", nil)
+	req.Header.Set("X-Correlation-Id", "c-redirect")
+	rec := httptest.NewRecorder()
+	f.server().ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusTemporaryRedirect, rec.Code)
+	assert.Equal(t, "/health/live", rec.Header().Get("Location"))
+	assert.Equal(t, "c-redirect", rec.Header().Get("X-Correlation-Id"), "the mux redirect goes through the middleware")
+	assert.Contains(t, f.logs.String(), `"route":"redirect"`)
+}
+
 func TestPanicAbortHandlerIsRethrown(t *testing.T) {
 	t.Parallel()
 	f := &fixture{wallets: fakeWallets{get: func(uuid.UUID) (*wallet.Wallet, error) { panic(http.ErrAbortHandler) }}}

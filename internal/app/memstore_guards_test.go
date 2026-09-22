@@ -3,6 +3,7 @@ package app_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -19,12 +20,13 @@ import (
 
 func TestMemStoreCheckRow(t *testing.T) {
 	t.Parallel()
-	base := wager.Snapshot{Kind: wager.KindBet, Status: wager.StatusPending}
+	base := wager.Snapshot{Kind: wager.KindBet, Status: wager.StatusPendingReference, NextAttemptAt: time.Now()}
 	cases := map[string]func(s *wager.Snapshot){
 		"rejected without code": func(s *wager.Snapshot) { s.Status = wager.StatusRejected },
 		"failed without code":   func(s *wager.Snapshot) { s.Status = wager.StatusFailed },
 		"processed no balance":  func(s *wager.Snapshot) { s.Status = wager.StatusProcessed },
-		"pending no schedule":   func(s *wager.Snapshot) { s.Status = wager.StatusPendingReference },
+		"pending no schedule":   func(s *wager.Snapshot) { s.NextAttemptAt = time.Time{} },
+		"stored PENDING":        func(s *wager.Snapshot) { s.Status = wager.StatusPending },
 		"refund no reference":   func(s *wager.Snapshot) { s.Kind = wager.KindRefund },
 	}
 	for name, mutate := range cases {

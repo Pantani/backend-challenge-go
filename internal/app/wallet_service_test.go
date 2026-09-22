@@ -157,7 +157,7 @@ func TestReconcileOverflow(t *testing.T) {
 		{Stored: testutil.BRL(t, "0.00"), Credits: math.MaxInt64, Debits: -math.MaxInt64},
 	}
 	for i, snap := range snaps {
-		svc := app.NewWalletService(app.WalletDeps{Queries: reconcileStub{newMemStore(), snap}})
+		svc := app.NewWalletService(app.WalletDeps{Deps: app.Deps{Queries: reconcileStub{newMemStore(), snap}}})
 		_, err := svc.Reconcile(context.Background(), uuid.New())
 		assert.ErrorIs(t, err, money.ErrOverflow, "case %d", i)
 	}

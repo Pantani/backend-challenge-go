@@ -184,10 +184,10 @@ func (e *Env) Vars(overrides map[string]string) map[string]string {
 		"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test",
 		"OIDC_ISSUER": e.Issuer(), "OIDC_JWKS_URL": e.JWKSURL(), "OIDC_AUDIENCE": "wallet-api",
 		"HTTP_ADDR": "127.0.0.1:0", "LOG_LEVEL": "warn",
-		"SQS_WAIT_TIME": "1s", "SQS_VISIBILITY_TIMEOUT": "5s", "SQS_PROCESS_TIMEOUT": "4s",
+		"SQS_WAIT_TIME": "1s", "SQS_VISIBILITY_TIMEOUT": "5s", "SQS_PROCESS_TIMEOUT": "4s", "SQS_ACK_TIMEOUT": "500ms",
 		"SQS_RETRY_BASE": "1s", "SQS_RETRY_MAX": "2s", "SQS_MAX_RECEIVE_COUNT": "3",
 		"PENDING_INTERVAL": "100ms", "PENDING_BASE_DELAY": "200ms", "PENDING_MAX_DELAY": "1s", "PENDING_MAX_ATTEMPTS": "5",
-		"OUTBOX_INTERVAL": "100ms", "OUTBOX_LEASE": "2s", "OUTBOX_RETRY_BASE": "200ms", "OUTBOX_RETRY_MAX": "1s",
+		"OUTBOX_INTERVAL": "100ms", "OUTBOX_LEASE": "2s", "OUTBOX_PUBLISH_TIMEOUT": "1s", "OUTBOX_RETRY_BASE": "200ms", "OUTBOX_RETRY_MAX": "1s",
 		"SHUTDOWN_TIMEOUT": "15s",
 	}
 	for k, v := range overrides {
