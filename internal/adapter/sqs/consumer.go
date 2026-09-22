@@ -2,6 +2,7 @@ package sqs
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -73,11 +74,12 @@ type ConsumerConfig struct {
 	WaitTime time.Duration
 	// VisibilityTimeout overrides the queue attribute for every receive. It
 	// must agree with the provisioned queue value (SQS_VISIBILITY_TIMEOUT)
-	// and exceed ProcessTimeout + AckTimeout so a message is never processed
-	// twice concurrently.
+	// and exceed MaxMessages * (ProcessTimeout + AckTimeout), because this
+	// consumer handles a received batch serially.
 	VisibilityTimeout time.Duration
-	// ProcessTimeout bounds one message; it must stay below the visibility
-	// timeout so a message is never processed twice concurrently.
+	// ProcessTimeout bounds one message. Together with AckTimeout and
+	// MaxMessages it forms the full-batch budget that VisibilityTimeout must
+	// exceed; the per-message relationship alone does not prevent overlap.
 	ProcessTimeout time.Duration
 	// AckTimeout bounds the broker follow-up of a message (delete, retry
 	// visibility change, DLQ copy). It is a budget of its own, so a message
@@ -142,7 +144,7 @@ func (c *Consumer) PollOnce(ctx context.Context) {
 		VisibilityTimeout:   int32(c.cfg.VisibilityTimeout.Seconds()),
 		MessageSystemAttributeNames: []types.MessageSystemAttributeName{
 			types.MessageSystemAttributeNameApproximateReceiveCount, types.MessageSystemAttributeNameSenderId,
-			types.MessageSystemAttributeNameMessageGroupId,
+			types.MessageSystemAttributeNameMessageGroupId, types.MessageSystemAttributeNameMessageDeduplicationId,
 		},
 	})
 	if err != nil {
@@ -156,9 +158,10 @@ func (c *Consumer) PollOnce(ctx context.Context) {
 	c.process(ctx, out.Messages)
 }
 
-// process handles a batch in order. A batch can carry several messages of
-// the same MessageGroupId (the in-order tail of a wallet): once a message is
-// left in the queue, the rest of its group is released instead of processed,
+// process handles a batch in order. The receive visibility protects the
+// worst-case budget of the complete batch. A batch can carry several messages
+// of the same MessageGroupId (the in-order tail of a wallet): once a message
+// is left in the queue, the rest of its group is released instead of processed,
 // so the group is redelivered in order after its head.
 func (c *Consumer) process(ctx context.Context, msgs []types.Message) {
 	blocked := map[string]bool{}
@@ -225,8 +228,23 @@ func (c *Consumer) decode(m types.Message) (app.InboundMessage, error) {
 	if err != nil {
 		return app.InboundMessage{}, err
 	}
+	if err := validateFIFOIdentity(m, msg); err != nil {
+		return app.InboundMessage{}, err
+	}
 	sender := m.Attributes[string(types.MessageSystemAttributeNameSenderId)]
 	return msg, c.cfg.Senders.Authorize(sender, msg.Command.ProviderID)
+}
+
+func validateFIFOIdentity(m types.Message, msg app.InboundMessage) error {
+	// SQS orders by the group string, so every spelling of a wallet UUID must
+	// use the same canonical group even when the JSON walletId is uppercase.
+	if groupID(m) != msg.Command.WalletID.String() {
+		return fmt.Errorf("%w: MessageGroupId must be the canonical walletId", ErrInvalidMessage)
+	}
+	if dedupID(m) != msg.MessageID {
+		return fmt.Errorf("%w: MessageDeduplicationId must equal messageId", ErrInvalidMessage)
+	}
+	return nil
 }
 
 // ack deletes a handled message within the ack budget.
@@ -244,12 +262,15 @@ func (c *Consumer) ack(parent context.Context, m types.Message, res app.ConsumeR
 	c.delete(ctx, m)
 }
 
-func (c *Consumer) delete(ctx context.Context, m types.Message) {
+func (c *Consumer) delete(ctx context.Context, m types.Message) bool {
 	_, err := c.api.DeleteMessage(ctx, &sqs.DeleteMessageInput{QueueUrl: aws.String(c.cfg.QueueURL), ReceiptHandle: m.ReceiptHandle})
 	if err != nil {
-		// The handling is committed; a redelivery is absorbed by the inbox.
-		c.logger.WarnContext(ctx, "sqs delete failed; redelivery will be deduplicated", "error", err)
+		// The source message remains available regardless of whether this path
+		// followed a committed operation or a copy to the DLQ.
+		c.logger.WarnContext(ctx, "sqs delete failed; message remains available for redelivery", "error", err)
+		return false
 	}
+	return true
 }
 
 // retry hides the message for an exponential backoff based on its receive
@@ -283,6 +304,10 @@ func groupID(m types.Message) string {
 	return m.Attributes[string(types.MessageSystemAttributeNameMessageGroupId)]
 }
 
+func dedupID(m types.Message) string {
+	return m.Attributes[string(types.MessageSystemAttributeNameMessageDeduplicationId)]
+}
+
 func (c *Consumer) changeVisibility(ctx context.Context, m types.Message, d time.Duration) {
 	_, err := c.api.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{
 		QueueUrl: aws.String(c.cfg.QueueURL), ReceiptHandle: m.ReceiptHandle, VisibilityTimeout: int32(d.Seconds()),
@@ -295,8 +320,8 @@ func (c *Consumer) changeVisibility(ctx context.Context, m types.Message, d time
 // deadLetter copies the message to the DLQ with the failure reason, keeping
 // its MessageGroupId (so a DLQ replay preserves the wallet order), then
 // removes it from the input queue. It reports whether the message left the
-// input queue: if the copy fails the message stays, its group tail is
-// released and the redrive policy eventually moves it.
+// input queue: if the copy or source deletion fails the message stays, its
+// group tail is released and the redrive policy eventually moves it.
 func (c *Consumer) deadLetter(parent context.Context, m types.Message, cause error) bool {
 	ctx, cancel := worker.Detach(parent, c.cfg.ackTimeout())
 	defer cancel()
@@ -319,8 +344,7 @@ func (c *Consumer) deadLetter(parent context.Context, m types.Message, cause err
 		return false
 	}
 	c.metrics.SQSMessage(OutcomeDLQ)
-	c.delete(ctx, m)
-	return true
+	return c.delete(ctx, m)
 }
 
 // truncate replaces invalid bytes and cuts s to at most n bytes without

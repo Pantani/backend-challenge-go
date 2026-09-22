@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
@@ -143,8 +145,8 @@ func TestProvisionWithFakeClient(t *testing.T) {
 
 // Not parallel: it swaps the package-level constructors.
 func TestServeFailsFastWhenCancelled(t *testing.T) {
-	newApp = func(cfg config.Config) *fx.App {
-		return bootstrap.New(cfg, fx.Replace(fx.Annotate(fakeAPI{}, fx.As(new(sqsadapter.API)))),
+	newApp = func(ctx context.Context, cfg config.Config) application {
+		return bootstrap.New(ctx, cfg, fx.Replace(fx.Annotate(fakeAPI{}, fx.As(new(sqsadapter.API)))),
 			fx.Replace(bootstrap.LogOutput{Writer: &bytes.Buffer{}}))
 	}
 	t.Cleanup(func() { newApp = defaultApp })
@@ -157,6 +159,74 @@ func TestServeFailsFastWhenCancelled(t *testing.T) {
 
 	cfg.SQSSenderProviders = "missing-equals"
 	require.ErrorContains(t, serve(context.Background(), cfg), "build application", "a construction error is reported before Start")
+}
+
+type blockingStartApp struct {
+	mu       sync.Mutex
+	deadline time.Time
+}
+
+func (*blockingStartApp) Err() error { return nil }
+
+func (a *blockingStartApp) Start(ctx context.Context) error {
+	a.mu.Lock()
+	a.deadline, _ = ctx.Deadline()
+	a.mu.Unlock()
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (*blockingStartApp) Stop(context.Context) error { return nil }
+
+func (*blockingStartApp) Wait() <-chan fx.ShutdownSignal {
+	return make(chan fx.ShutdownSignal)
+}
+
+func (a *blockingStartApp) startDeadline() time.Time {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.deadline
+}
+
+// Not parallel: it swaps the package-level application constructor.
+func TestServeAppliesStartupDeadline(t *testing.T) {
+	fake := &blockingStartApp{}
+	newApp = func(context.Context, config.Config) application { return fake }
+	t.Cleanup(func() { newApp = defaultApp })
+	cfg, err := config.Load(config.MapLookup(nil))
+	require.NoError(t, err)
+	cfg.StartupTimeout = 40 * time.Millisecond
+	started := time.Now()
+
+	err = serve(context.Background(), cfg)
+
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.WithinDuration(t, started.Add(cfg.StartupTimeout), fake.startDeadline(), 20*time.Millisecond)
+	assert.Less(t, time.Since(started), time.Second)
+}
+
+// Not parallel: it swaps every external constructor.
+func TestMalformedConfigurationAllocatesNoResources(t *testing.T) {
+	var migrators, sqsClients, applications int
+	newMigrator = func(string) (migrator, error) { migrators++; return &fakeMigrator{}, nil }
+	newSQSClient = func(context.Context, config.SQS) (sqsadapter.API, error) { sqsClients++; return fakeAPI{}, nil }
+	newApp = func(context.Context, config.Config) application { applications++; return &blockingStartApp{} }
+	t.Cleanup(func() {
+		newMigrator = defaultMigrator
+		newSQSClient = bootstrap.NewSQSClient
+		newApp = defaultApp
+	})
+
+	require.Error(t, serveCmd(context.Background(), config.MapLookup(map[string]string{"DB_MAX_CONNS": "0"})))
+	require.Error(t, migrateCmd(config.MapLookup(map[string]string{"DB_MAX_CONNS": "0"}), []string{"up"}, &bytes.Buffer{}))
+	require.Error(t, provision(context.Background(), config.MapLookup(map[string]string{"SQS_MAX_MESSAGES": "0"}), &bytes.Buffer{}))
+	require.ErrorContains(t,
+		serveCmd(context.Background(), config.MapLookup(map[string]string{"SQS_SENDER_PROVIDERS": "missing-equals"})),
+		"SQS_SENDER_PROVIDERS",
+	)
+	assert.Zero(t, migrators)
+	assert.Zero(t, sqsClients)
+	assert.Zero(t, applications)
 }
 
 func TestDefaultMigratorRejectsBadURL(t *testing.T) {

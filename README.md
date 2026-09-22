@@ -42,6 +42,15 @@ wallet migrate version     # versão atual
 
 Com o compose: `make migrate-up` / `make migrate-down`. Fora do Docker: `go run ./cmd/wallet migrate up`, com `DATABASE_URL` apontando para o banco. Os comandos `migrate` e `provision-queues` validam apenas as variáveis que usam (banco e SQS, respectivamente); só `serve` exige a configuração completa.
 
+Migration 5 changes the outbox fencing-token contract. Stop every relay before
+running either its `up` or `down` direction: both directions deliberately
+invalidate active outbox claims. After the migration finishes, restart only a
+binary compatible with the resulting schema version.
+The migration commits its structural change before validating the new check
+constraint so the validation scan does not hold the earlier write-blocking lock.
+If validation fails, inspect the partially applied schema and migration state
+before repairing the dirty version or retrying.
+
 O binário devolve `0` em sucesso, `2` para comando ou argumentos inválidos (imprime o uso) e `1` para qualquer outra falha; erros vão para `stderr`, os logs JSON para `stdout`.
 
 ### Filas
@@ -57,20 +66,22 @@ Todas têm padrão local, exceto `AWS_ENDPOINT_URL`, que vazio significa a AWS r
 | `INSTANCE_ID` | hostname | identifica o processo (dono dos leases da outbox e atributo `instance` dos logs) |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` ou `error` |
 | `DATABASE_URL` | `postgres://wallet:wallet@localhost:5432/wallet?sslmode=disable` | PostgreSQL |
-| `DB_LOCK_TIMEOUT` / `DB_STATEMENT_TIMEOUT` | `5s` / `10s` | espera máxima por lock de carteira / por comando |
+| `DB_MAX_CONNS` | `20` | pool limit, from 1 through the adapter's `int32` maximum (`2147483647`) |
+| `DB_LOCK_TIMEOUT` / `DB_STATEMENT_TIMEOUT` | `5s` / `10s` | positive timeouts with exact millisecond precision; smaller or fractional-millisecond values are rejected |
 | `OIDC_ISSUER` | `http://localhost:8180/realms/wallet` | `iss` esperado nos tokens |
 | `OIDC_JWKS_URL` | `…/protocol/openid-connect/certs` | onde buscar as chaves (no compose, `http://keycloak:8080/…`) |
 | `OIDC_AUDIENCE` | `wallet-api` | `aud` exigido |
 | `AWS_ENDPOINT_URL`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | vazio (AWS real; o `.env.example` aponta para o LocalStack), `us-east-1` | cliente SQS |
 | `SQS_INPUT_QUEUE`, `SQS_DLQ`, `SQS_EVENTS_QUEUE` | nomes acima | filas |
 | `SQS_SENDER_PROVIDERS` | `000000000000=*` | vínculo `SenderId` do SQS → provedores permitidos (`id=provider-a\|provider-b;outroId=*`) |
-| `SQS_CONSUMERS`, `SQS_WAIT_TIME`, `SQS_VISIBILITY_TIMEOUT`, `SQS_PROCESS_TIMEOUT`, `SQS_ACK_TIMEOUT`, `SQS_RETRY_BASE/MAX`, `SQS_MAX_RECEIVE_COUNT` | `2`, `10s`, `30s`, `20s`, `5s`, `2s/60s`, `5` | consumidor |
+| `SQS_CONSUMERS`, `SQS_MAX_MESSAGES`, `SQS_WAIT_TIME`, `SQS_VISIBILITY_TIMEOUT`, `SQS_PROCESS_TIMEOUT`, `SQS_ACK_TIMEOUT`, `SQS_RETRY_BASE/MAX`, `SQS_MAX_RECEIVE_COUNT` | `2`, `10`, `10s`, `5m`, `20s`, `5s`, `2s/60s`, `5` | consumer; broker durations use whole seconds, wait is 0–20s, visibility/retries are at most 12h, and visibility covers the worst-case serial budget of the whole batch |
 | `PENDING_INTERVAL`, `PENDING_BASE_DELAY`, `PENDING_MAX_DELAY`, `PENDING_MAX_ATTEMPTS`, `PENDING_BATCH` | `1s`, `1s`, `60s`, `10`, `50` | referências pendentes |
-| `OUTBOX_INTERVAL`, `OUTBOX_BATCH`, `OUTBOX_LEASE`, `OUTBOX_RETRY_BASE/MAX`, `OUTBOX_PUBLISH_TIMEOUT`, `OUTBOX_MAX_ATTEMPTS` | `500ms`, `50`, `30s`, `1s/60s`, `10s`, `20` | publisher da outbox |
+| `OUTBOX_INTERVAL`, `OUTBOX_BATCH`, `OUTBOX_LEASE`, `OUTBOX_RETRY_BASE/MAX`, `OUTBOX_PUBLISH_TIMEOUT`, `OUTBOX_FINALIZE_TIMEOUT`, `OUTBOX_MAX_ATTEMPTS` | `500ms`, `50`, `30s`, `1s/60s`, `10s`, `5s`, `20` | outbox publisher; attempt accounting and its terminal mutation share the total finalization budget |
 | `CONFLICT_RETRIES` | `5` | novas tentativas de uma transação SQL que perdeu uma disputa |
-| `SHUTDOWN_TIMEOUT` | `30s` | prazo do encerramento (maior que `SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT` e que `OUTBOX_PUBLISH_TIMEOUT`) |
+| `STARTUP_TIMEOUT` | `25s` | positive startup budget; deliberately short positive values remain valid for cancellation testing |
+| `SHUTDOWN_TIMEOUT` | `61s` | total stop budget; HTTP drains before workers, and the final 5s are reserved for cleanup |
 
-A configuração é validada na inicialização: valores inválidos, `LOG_LEVEL` desconhecido, intervalos e timeouts não positivos, `SQS_MAX_MESSAGES` fora de 1–10, `SQS_WAIT_TIME` acima de 20 s, `SQS_VISIBILITY_TIMEOUT` e `SQS_RETRY_MAX` acima de 12 h (limite do SQS), `*_RETRY_BASE > *_RETRY_MAX`, `PENDING_BASE_DELAY` fora de `(0, PENDING_MAX_DELAY]`, `SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT >= SQS_VISIBILITY_TIMEOUT`, `OUTBOX_PUBLISH_TIMEOUT >= OUTBOX_LEASE` e `SHUTDOWN_TIMEOUT` menor ou igual a `SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT` ou a `OUTBOX_PUBLISH_TIMEOUT`. O start também falha se PostgreSQL, SQS ou as filas estiverem indisponíveis.
+Configuration is validated at startup: invalid values, an unknown `LOG_LEVEL`, non-positive intervals and timeouts, `DB_MAX_CONNS` outside the adapter's positive `int32` range, PostgreSQL timeouts that cannot be represented exactly in milliseconds, `SQS_MAX_MESSAGES` outside 1–10, `SQS_WAIT_TIME` outside 0–20s, fractional `SQS_WAIT_TIME`, `SQS_VISIBILITY_TIMEOUT`, or SQS retry durations, `SQS_VISIBILITY_TIMEOUT` or either SQS retry bound above 12h, `*_RETRY_BASE > *_RETRY_MAX`, `PENDING_BASE_DELAY` outside `(0, PENDING_MAX_DELAY]`, `SQS_VISIBILITY_TIMEOUT <= SQS_MAX_MESSAGES * (SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT)`, and `OUTBOX_PUBLISH_TIMEOUT + OUTBOX_FINALIZE_TIMEOUT >= OUTBOX_LEASE`. Fractional adapter values are rejected rather than rounded so the validated budget is exactly the budget sent to PostgreSQL or SQS. Duration relationships reject overflow. The shutdown drain reserves 5s for cleanup and must exceed the serial sum of the HTTP 30s write bound and the longest SQS processing plus acknowledgement, outbox publication plus finalization, or database statement operation. Outbox lease validation applies to one singular claim immediately before publication; it is not multiplied by `OUTBOX_BATCH`. Startup also fails when PostgreSQL, SQS, or the queues are unavailable.
 
 ## Autenticação
 
@@ -128,6 +139,10 @@ awslocal sqs send-message --queue-url http://localhost:4566/000000000000/wager-t
   --message-body '{"messageId":"msg-123","type":"WagerTransactionRequested","occurredAt":"2026-09-08T12:00:00.000Z","data":{"providerId":"provider-a","externalTransactionId":"transaction-124","idempotencyKey":"provider-a:transaction-124","playerId":"0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1","walletId":"'$WALLET'","roundId":"round-987","gameId":"fortune-chimp","kind":"BET","money":{"amount":"25.00","currency":"BRL"}}}'
 ```
 
+For FIFO ordering, `MessageGroupId` must be the lowercase, hyphenated UUID of
+`walletId`. The JSON `walletId` may use uppercase letters, but the group ID
+must use its canonical spelling.
+
 Os códigos HTTP, os corpos de erro e os `failureCode` estão em [`ARCHITECTURE.md`](ARCHITECTURE.md#13-contrato-http).
 
 ## Testes
@@ -140,7 +155,7 @@ make lint              # gofmt/goimports, gocyclo ≤ 6, gocognit ≤ 8 (código
 make                   # vet + lint + testes unitários com -race
 ```
 
-O CI (`.github/workflows/ci.yml`) roda tidy, gofmt, vet com todas as tags, build, testes unitários com `-race`, `golangci-lint` v2 fixado e `govulncheck` em todo push/PR; os testes de integração e e2e (que precisam de Docker) rodam num job à parte, disparado manualmente (`workflow_dispatch`) ou toda noite.
+O CI (`.github/workflows/ci.yml`) roda tidy, gofmt, vet com todas as tags, build, testes unitários com `-race`, `golangci-lint` v2 fixado e `govulncheck` em todo push/PR. A cobertura autoritativa, que precisa de Docker, roda num job à parte disparado manualmente (`workflow_dispatch`) ou toda noite; a política de custo mantém esse job fora de pushes e PRs.
 
 ### Integração e e2e
 
@@ -159,11 +174,11 @@ make test-integration   # go test -race -count=1 -tags integration ./test/integr
 # (idempotência e pendências preservadas) e reconciliação de todas as carteiras ao final.
 make test-e2e           # go test -count=1 -timeout 15m -tags e2e ./test/e2e/...
 
-# Cobertura combinada unidade + integração + e2e (binário compilado com -cover).
+# Cobertura combinada unidade + integração + e2e, com mínimo de 90,0% por pacote.
 make coverage
 ```
 
-`make coverage` combina as três suítes (o e2e roda o binário real sem `-race`) e cobre `cmd/` e `internal/`; só os testes unitários (`go test ./...`) já cobrem 100% de `app`, `config`, `domain/*`, `observability` e `worker`, e o restante dos adaptadores, `bootstrap` e `cli` depende dos containers.
+`make coverage` é o gate autoritativo: combina as três suítes (o e2e roda o binário real sem `-race`), instrumenta todos os pacotes com código não-teste em `cmd/`, `internal/` e `test/testenv`, e falha se algum pacote estiver ausente, tiver saída de cobertura inválida ou ficar abaixo de 90,0% de statements. O relatório combinado fica em `coverage/coverage.out` e os percentuais por pacote em `coverage/packages.txt`. Só os testes unitários (`go test ./...`) já cobrem 100% de `app`, `config`, `domain/*`, `observability` e `worker`; o restante dos adaptadores, `bootstrap` e `cli` depende dos containers.
 
 ### Simulações de falha cobertas
 

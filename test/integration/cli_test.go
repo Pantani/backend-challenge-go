@@ -14,9 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	sqsadapter "github.com/Pantani/backend-challenge-go/internal/adapter/sqs"
 	"github.com/Pantani/backend-challenge-go/internal/cli"
 	"github.com/Pantani/backend-challenge-go/internal/config"
 	"github.com/Pantani/backend-challenge-go/test/testenv"
@@ -47,9 +49,7 @@ func runCLI(ctx context.Context, vars map[string]string, args ...string) (code i
 
 func TestCLIMigrations(t *testing.T) {
 	t.Parallel()
-	_, err := pool.Exec(context.Background(), `CREATE DATABASE cli_check`)
-	require.NoError(t, err)
-	db := map[string]string{"DATABASE_URL": strings.Replace(env.DatabaseURL, "/wallet?", "/cli_check?", 1)}
+	db := map[string]string{"DATABASE_URL": databaseForTest(t, "cli_check")}
 	ctx := context.Background()
 
 	code, out, stderr := runCLI(ctx, db, "migrate", "up")
@@ -88,13 +88,17 @@ func TestCLIMigrations(t *testing.T) {
 
 func TestCLIProvisionQueues(t *testing.T) {
 	t.Parallel()
-	vars := map[string]string{"SQS_INPUT_QUEUE": "cli-in.fifo", "SQS_DLQ": "cli-dlq.fifo", "SQS_EVENTS_QUEUE": "cli-events.fifo"}
+	prefix := uuid.NewString()
+	names := sqsadapter.QueueNames{Input: prefix + "-in.fifo", DLQ: prefix + "-dlq.fifo", Events: prefix + "-events.fifo"}
+	cleanupCLIQueues(t, names)
+	vars := queueVars(names)
 	vars["DB_MAX_CONNS"] = "0"
 	code, out, stderr := runCLI(context.Background(), vars, "provision-queues")
 	require.Zero(t, code, "provision reads only the AWS variables: %s", stderr)
-	assert.Contains(t, out, "cli-dlq.fifo")
+	assert.Contains(t, out, names.DLQ)
 
-	code, _, stderr = runCLI(context.Background(), map[string]string{"SQS_INPUT_QUEUE": "not-fifo"}, "provision-queues")
+	vars["SQS_INPUT_QUEUE"] = prefix + "-not-fifo"
+	code, _, stderr = runCLI(context.Background(), vars, "provision-queues")
 	assert.Equal(t, cli.ExitError, code, "a FIFO queue name must end in .fifo")
 	assert.Contains(t, stderr, "error:")
 }

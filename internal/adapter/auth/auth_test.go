@@ -274,6 +274,7 @@ func TestJWKSServerErrorIsUnauthenticated(t *testing.T) {
 	i.fail.Store(true)
 	_, err := i.verifier(0).Verify(context.Background(), i.sign(t, "k1", claims(nil)))
 	assert.ErrorIs(t, err, auth.ErrUnauthenticated)
+	assert.NotErrorIs(t, err, auth.ErrJWKSUnavailable, "go-oidc keeps key-set diagnostics behind the public auth boundary")
 	assert.EqualValues(t, 1, i.hits.Load())
 }
 

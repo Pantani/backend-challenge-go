@@ -115,8 +115,15 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Integration tests (PostgreSQL, LocalStack, Keycloak via testcontainers)
-        run: make test-integration
+      - name: Combined per-package coverage (unit, integration and end-to-end)
+        run: make coverage
 
-      - name: End-to-end tests (compiled binary, 3 instances)
-        run: make test-e2e
+      - name: Upload authoritative coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: authoritative-coverage-report
+          path: |
+            coverage/coverage.out
+            coverage/packages.txt
+          if-no-files-found: ignore

@@ -302,6 +302,32 @@ func TestPathCleaningRedirectsAreObserved(t *testing.T) {
 	assert.Contains(t, f.logs.String(), `"route":"redirect"`)
 }
 
+func TestEmptyPatternPathCleaningRedirectsFollowServeMux(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name, method, path string
+	}{
+		{"method mismatch after cleaning", http.MethodPut, "/health/../health/live"},
+		{"unknown path after cleaning", http.MethodGet, "/unknown/../still-missing"},
+	}
+	for _, tc := range tests {
+		reference := http.NewServeMux()
+		reference.HandleFunc("GET /health/live", func(http.ResponseWriter, *http.Request) {})
+		want := httptest.NewRecorder()
+		reference.ServeHTTP(want, httptest.NewRequestWithContext(context.Background(), tc.method, tc.path, nil))
+		require.Contains(t, []int{http.StatusMovedPermanently, http.StatusTemporaryRedirect}, want.Code, tc.name)
+		require.NotEmpty(t, want.Header().Get("Location"), tc.name)
+
+		f := &fixture{}
+		got := httptest.NewRecorder()
+		f.server().ServeHTTP(got, httptest.NewRequestWithContext(context.Background(), tc.method, tc.path, nil))
+		assert.Equal(t, want.Code, got.Code, tc.name)
+		assert.Equal(t, want.Header().Get("Location"), got.Header().Get("Location"), tc.name)
+		assert.Contains(t, f.logs.String(), `"route":"redirect"`, tc.name)
+		assert.NotContains(t, f.logs.String(), `"route":"unmatched"`, tc.name)
+	}
+}
+
 func TestPanicAbortHandlerIsRethrown(t *testing.T) {
 	t.Parallel()
 	f := &fixture{wallets: fakeWallets{get: func(uuid.UUID) (*wallet.Wallet, error) { panic(http.ErrAbortHandler) }}}

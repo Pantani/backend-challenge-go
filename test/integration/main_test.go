@@ -6,14 +6,19 @@ package integration_test
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
+	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
@@ -32,25 +37,33 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	var err error
 	env, err = testenv.Start(ctx)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "start containers:", err)
+		cancel()
 		os.Exit(1)
 	}
 	code := runWithDatabase(ctx, m)
-	env.Stop(ctx)
+	cleanup, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
+	if err := env.Stop(cleanup); err != nil {
+		fmt.Fprintln(os.Stderr, "cleanup:", err)
+		code = 1
+	}
+	cleanupCancel()
+	cancel()
 	os.Exit(code)
 }
 
 func runWithDatabase(ctx context.Context, m *testing.M) int {
-	migrator, err := postgres.NewMigrator(env.DatabaseURL)
+	err := migrateDatabase()
 	if err == nil {
-		err = migrator.Up()
-	}
-	if err == nil {
-		pool, err = postgres.NewPool(ctx, postgres.Config{URL: env.DatabaseURL, MaxConns: 60, LockTimeout: 5 * time.Second, StatementTimeout: 10 * time.Second})
+		var databaseURL string
+		databaseURL, err = boundedDatabaseURL(env.DatabaseURL)
+		if err == nil {
+			pool, err = postgres.NewPool(ctx, postgres.Config{URL: databaseURL, MaxConns: 60, LockTimeout: 5 * time.Second, StatementTimeout: 10 * time.Second})
+		}
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "database:", err)
@@ -58,6 +71,59 @@ func runWithDatabase(ctx context.Context, m *testing.M) int {
 	}
 	defer pool.Close()
 	return m.Run()
+}
+
+func migrateDatabase() (err error) {
+	databaseURL, err := boundedDatabaseURL(env.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	migrator, err := postgres.NewMigrator(databaseURL)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, migrator.Close()) }()
+	return migrator.Up()
+}
+
+// Server-side bounds also cover golang-migrate's context-free metadata and
+// advisory-lock queries; its outer lock timer alone cannot cancel those calls.
+func boundedDatabaseURL(databaseURL string) (string, error) {
+	u, err := url.Parse(databaseURL)
+	if err != nil {
+		return "", err
+	}
+	query := u.Query()
+	query.Set("connect_timeout", "3")
+	query.Set("statement_timeout", "5000")
+	query.Set("lock_timeout", "2000")
+	u.RawQuery = query.Encode()
+	return u.String(), nil
+}
+
+func databaseForTest(t *testing.T, prefix string) string {
+	t.Helper()
+	name := prefix + "_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	identifier := pgx.Identifier{name}.Sanitize()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := pool.Exec(ctx, "CREATE DATABASE "+identifier)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cleanupCancel()
+		_, err := pool.Exec(cleanupCtx, "DROP DATABASE "+identifier)
+		require.NoError(t, err)
+		var count int
+		require.NoError(t, pool.QueryRow(cleanupCtx, `SELECT count(*) FROM pg_database WHERE datname = $1`, name).Scan(&count))
+		require.Zero(t, count, "temporary database removed")
+	})
+	u, err := url.Parse(env.DatabaseURL)
+	require.NoError(t, err)
+	u.Path = "/" + name
+	boundedURL, err := boundedDatabaseURL(u.String())
+	require.NoError(t, err)
+	return boundedURL
 }
 
 // services wires the use cases on the real database.
@@ -81,7 +147,7 @@ func newServices(t *testing.T, policy app.PendingPolicy) services {
 			Metrics: metrics, Logger: logger}, Policy: policy, ConflictRetries: 10}),
 		wallets: app.NewWalletService(app.WalletDeps{Deps: app.Deps{UoW: uow, Queries: queries, Clock: app.SystemClock{}, IDs: app.UUIDv7{},
 			Metrics: metrics, Logger: logger}}),
-		metrics: metrics, logs: logs, prefix: uuid.NewString()[:8] + "-",
+		metrics: metrics, logs: logs, prefix: uuid.NewString() + "-",
 	}
 }
 
@@ -142,13 +208,59 @@ func (s services) debits(t *testing.T, w *wallet.Wallet) int {
 // provisionQueues creates a private set of FIFO queues for one test.
 func provisionQueues(t *testing.T, maxReceive int) (sqsadapter.API, sqsadapter.Queues, sqsadapter.QueueNames) {
 	t.Helper()
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	client, err := sqsadapter.NewClient(ctx, sqsadapter.ClientConfig{Region: "us-east-1", Endpoint: env.SQSEndpoint})
 	require.NoError(t, err)
-	sum := sha256.Sum256([]byte(t.Name()))
-	prefix := hex.EncodeToString(sum[:6])
+	prefix := uuid.NewString()
 	names := sqsadapter.QueueNames{Input: prefix + "-in.fifo", DLQ: prefix + "-dlq.fifo", Events: prefix + "-events.fifo"}
-	q, err := sqsadapter.Provision(ctx, client, sqsadapter.ProvisionConfig{Names: names, MaxReceiveCount: maxReceive, VisibilityTimeout: 2})
+	api := cleanupQueues{Client: client, t: t}
+	q, err := sqsadapter.Provision(ctx, api, sqsadapter.ProvisionConfig{Names: names, MaxReceiveCount: maxReceive, VisibilityTimeout: 2})
 	require.NoError(t, err)
 	return client, q, names
+}
+
+// cleanupQueues registers each successful acquisition, including partial provisioning.
+type cleanupQueues struct {
+	*awssqs.Client
+	t *testing.T
+}
+
+func (c cleanupQueues) CreateQueue(ctx context.Context, in *awssqs.CreateQueueInput, opts ...func(*awssqs.Options)) (*awssqs.CreateQueueOutput, error) {
+	out, err := c.Client.CreateQueue(ctx, in, opts...)
+	if err == nil {
+		c.t.Cleanup(func() { c.removeQueue(context.WithoutCancel(ctx), aws.ToString(in.QueueName), out.QueueUrl) })
+	}
+	return out, err
+}
+
+func (c cleanupQueues) removeQueue(ctx context.Context, name string, queueURL *string) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	_, err := c.DeleteQueue(ctx, &awssqs.DeleteQueueInput{QueueUrl: queueURL})
+	require.NoError(c.t, err)
+	_, err = c.GetQueueUrl(ctx, &awssqs.GetQueueUrlInput{QueueName: aws.String(name)})
+	var missing *types.QueueDoesNotExist
+	require.ErrorAs(c.t, err, &missing, "deleted queue %s must not resolve", name)
+}
+
+// The CLI owns its client, so register by name before it can acquire resources.
+func cleanupCLIQueues(t *testing.T, names sqsadapter.QueueNames) {
+	t.Helper()
+	client, err := sqsadapter.NewClient(context.Background(), sqsadapter.ClientConfig{Region: "us-east-1", Endpoint: env.SQSEndpoint})
+	require.NoError(t, err)
+	c := cleanupQueues{Client: client, t: t}
+	for _, name := range []string{names.DLQ, names.Input, names.Events} {
+		t.Cleanup(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			out, err := client.GetQueueUrl(ctx, &awssqs.GetQueueUrlInput{QueueName: aws.String(name)})
+			var missing *types.QueueDoesNotExist
+			if errors.As(err, &missing) {
+				return
+			}
+			require.NoError(t, err)
+			c.removeQueue(ctx, name, out.QueueUrl)
+		})
+	}
 }

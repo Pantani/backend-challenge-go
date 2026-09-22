@@ -27,6 +27,12 @@ const (
 // ErrUnauthenticated reports a missing, malformed, invalid or expired token.
 var ErrUnauthenticated = errors.New("unauthenticated")
 
+// ErrJWKSUnavailable classifies failures to refresh the remote signing keys.
+// go-oidc deliberately converts key-set errors to text, so this sentinel is
+// available to the auth adapter's internal refresh paths but is not exposed by
+// Verifier.Verify; callers continue to receive ErrUnauthenticated.
+var ErrJWKSUnavailable = errors.New("JWKS unavailable")
+
 // Principal is the authenticated caller.
 type Principal struct {
 	// Subject is the "sub" claim.
@@ -84,11 +90,13 @@ type Verifier struct {
 // lazily with a bounded timeout and cached; a token matching no cached key
 // refreshes them at most once per Config.JWKSRefreshInterval.
 func NewVerifier(_ context.Context, cfg Config) *Verifier {
+	fetchTimeout := cmp.Or(cfg.JWKSTimeout, DefaultJWKSTimeout)
 	keys := &keySet{
-		url:      cfg.JWKSURL,
-		client:   &http.Client{Timeout: cmp.Or(cfg.JWKSTimeout, DefaultJWKSTimeout)},
-		interval: cmp.Or(cfg.JWKSRefreshInterval, DefaultJWKSRefreshInterval),
-		algs:     []jose.SignatureAlgorithm{jose.RS256},
+		url:          cfg.JWKSURL,
+		client:       &http.Client{Timeout: fetchTimeout},
+		fetchTimeout: fetchTimeout,
+		interval:     cmp.Or(cfg.JWKSRefreshInterval, DefaultJWKSRefreshInterval),
+		algs:         []jose.SignatureAlgorithm{jose.RS256},
 	}
 	return &Verifier{verifier: oidc.NewVerifier(cfg.Issuer, keys, &oidc.Config{
 		ClientID:             cfg.Audience,
