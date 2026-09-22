@@ -19,7 +19,7 @@ type budgetStore struct {
 	advance func(time.Duration)
 }
 
-func (s budgetStore) StartAttempt(context.Context, uuid.UUID, uuid.UUID) (int, bool, error) {
+func (s budgetStore) StartAttempt(context.Context, uuid.UUID, uuid.UUID, time.Time, time.Duration) (int, bool, error) {
 	s.advance(4 * time.Second)
 	return 1, true, nil
 }

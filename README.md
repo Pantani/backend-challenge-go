@@ -42,6 +42,11 @@ wallet migrate version     # versão atual
 
 Com o compose: `make migrate-up` / `make migrate-down`. Fora do Docker: `go run ./cmd/wallet migrate up`, com `DATABASE_URL` apontando para o banco. Os comandos `migrate` e `provision-queues` validam apenas as variáveis que usam (banco e SQS, respectivamente); só `serve` exige a configuração completa.
 
+Migration 5 changes the outbox fencing-token contract. Stop every relay before
+running either its `up` or `down` direction: both directions deliberately
+invalidate active outbox claims. After the migration finishes, restart only a
+binary compatible with the resulting schema version.
+
 O binário devolve `0` em sucesso, `2` para comando ou argumentos inválidos (imprime o uso) e `1` para qualquer outra falha; erros vão para `stderr`, os logs JSON para `stdout`.
 
 ### Filas
@@ -70,7 +75,7 @@ Todas têm padrão local, exceto `AWS_ENDPOINT_URL`, que vazio significa a AWS r
 | `CONFLICT_RETRIES` | `5` | novas tentativas de uma transação SQL que perdeu uma disputa |
 | `SHUTDOWN_TIMEOUT` | `30s` | prazo do encerramento (maior que `SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT` e que `OUTBOX_PUBLISH_TIMEOUT`) |
 
-Configuration is validated at startup: invalid values, an unknown `LOG_LEVEL`, non-positive intervals and timeouts, `SQS_MAX_MESSAGES` outside 1–10, `SQS_WAIT_TIME` above 20s, `SQS_VISIBILITY_TIMEOUT` or `SQS_RETRY_MAX` above the SQS 12h limit, `*_RETRY_BASE > *_RETRY_MAX`, `PENDING_BASE_DELAY` outside `(0, PENDING_MAX_DELAY]`, `SQS_VISIBILITY_TIMEOUT <= SQS_MAX_MESSAGES * (SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT)`, `OUTBOX_PUBLISH_TIMEOUT + OUTBOX_FINALIZE_TIMEOUT >= OUTBOX_LEASE`, and a `SHUTDOWN_TIMEOUT` no greater than either `SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT` or `OUTBOX_PUBLISH_TIMEOUT`. Both budget calculations reject overflow. Outbox lease validation applies to one singular claim immediately before publication; it is not multiplied by `OUTBOX_BATCH`. Startup also fails when PostgreSQL, SQS, or the queues are unavailable.
+Configuration is validated at startup: invalid values, an unknown `LOG_LEVEL`, non-positive intervals and timeouts, `SQS_MAX_MESSAGES` outside 1–10, `SQS_WAIT_TIME` above 20s, fractional `SQS_WAIT_TIME`, `SQS_VISIBILITY_TIMEOUT`, or SQS retry durations that the integer-seconds SQS API would truncate, `SQS_VISIBILITY_TIMEOUT` or `SQS_RETRY_MAX` above the SQS 12h limit, `*_RETRY_BASE > *_RETRY_MAX`, `PENDING_BASE_DELAY` outside `(0, PENDING_MAX_DELAY]`, `SQS_VISIBILITY_TIMEOUT <= SQS_MAX_MESSAGES * (SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT)`, `OUTBOX_PUBLISH_TIMEOUT + OUTBOX_FINALIZE_TIMEOUT >= OUTBOX_LEASE`, and a `SHUTDOWN_TIMEOUT` no greater than either `SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT` or `OUTBOX_PUBLISH_TIMEOUT`. Both budget calculations reject overflow. Outbox lease validation applies to one singular claim immediately before publication; it is not multiplied by `OUTBOX_BATCH`. Startup also fails when PostgreSQL, SQS, or the queues are unavailable.
 
 ## Autenticação
 

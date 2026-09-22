@@ -97,7 +97,10 @@ func TestQueriesFailOnCancelledContext(t *testing.T) {
 		"reconcile": func() error { _, err := q.Reconcile(ctx, uuid.New()); return err },
 		"due":       func() error { _, err := q.ListDuePending(ctx, time.Now(), 1); return err },
 		"claim":     func() error { _, _, err := store.Claim(ctx, "o", claimID, time.Now(), time.Second); return err },
-		"attempt":   func() error { _, _, err := store.StartAttempt(ctx, uuid.New(), claimID); return err },
+		"attempt": func() error {
+			_, _, err := store.StartAttempt(ctx, uuid.New(), claimID, time.Now(), time.Second)
+			return err
+		},
 		"published": func() error { _, err := store.MarkPublished(ctx, uuid.New(), claimID, time.Now()); return err },
 		"failed":    func() error { _, err := store.MarkFailed(ctx, uuid.New(), claimID, time.Now(), "x"); return err },
 		"dead":      func() error { _, err := store.MarkDead(ctx, uuid.New(), claimID, time.Now(), "x"); return err },

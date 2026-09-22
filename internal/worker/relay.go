@@ -161,7 +161,7 @@ func (r *Relay) startAttempt(
 ) (int, bool) {
 	ctx, cancel := finalize.context(parent)
 	defer cancel()
-	attempts, ok, err := r.store.StartAttempt(ctx, m.EventID, m.ClaimID)
+	attempts, ok, err := r.store.StartAttempt(ctx, m.EventID, m.ClaimID, r.clock.Now(), r.cfg.Lease)
 	if err != nil || !ok {
 		log.WarnContext(ctx, "outbox publication attempt not started; claim was lost", "error", err)
 		return 0, false

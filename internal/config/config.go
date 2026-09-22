@@ -50,17 +50,18 @@ type SQS struct {
 	SQSConsumers int
 	// SQSMaxMessages is the batch size of one receive (1..10).
 	SQSMaxMessages int
-	// SQSWaitTime is the long-polling wait (0..20s).
+	// SQSWaitTime is the long-polling wait (0..20s, in whole seconds).
 	SQSWaitTime time.Duration
 	// SQSVisibilityTimeout hides a received batch from other consumers;
 	// SQSProcessTimeout bounds one message and SQSAckTimeout its broker
 	// follow-up. Visibility must exceed their sum multiplied by the maximum
-	// batch size because messages are handled serially.
+	// batch size because messages are handled serially. The SQS API represents
+	// visibility in whole seconds, so this value must not have a fraction.
 	SQSVisibilityTimeout time.Duration
 	SQSProcessTimeout    time.Duration
 	SQSAckTimeout        time.Duration
 	// SQSRetryBase and SQSRetryMax bound the visibility backoff of a retried
-	// message.
+	// message. Both values must use whole seconds, matching the SQS API.
 	SQSRetryBase time.Duration
 	SQSRetryMax  time.Duration
 	// SQSMaxReceiveCount is the redrive policy: receives before the DLQ.
@@ -250,6 +251,8 @@ func (s SQS) validate() error {
 		{positive(s.SQSConsumers, s.SQSMaxReceiveCount), "SQS_CONSUMERS and SQS_MAX_RECEIVE_COUNT must be positive"},
 		{between(s.SQSMaxMessages, 1, 10), "SQS_MAX_MESSAGES must be between 1 and 10"},
 		{between(int(s.SQSWaitTime), 0, int(20*time.Second)), "SQS_WAIT_TIME must be between 0s and 20s"},
+		{wholeSeconds(s.SQSWaitTime, s.SQSVisibilityTimeout, s.SQSRetryBase, s.SQSRetryMax),
+			"SQS_WAIT_TIME, SQS_VISIBILITY_TIMEOUT and SQS retry durations must use whole seconds"},
 		{positiveDurations(s.SQSVisibilityTimeout, s.SQSProcessTimeout, s.SQSAckTimeout, s.SQSRetryBase, s.SQSRetryMax),
 			"SQS visibility, process, ack and retry durations must be positive"},
 		{budgetOK && s.SQSVisibilityTimeout > budget,
@@ -313,6 +316,12 @@ func positive(values ...int) bool {
 
 func positiveDurations(values ...time.Duration) bool {
 	return !slices.ContainsFunc(values, func(d time.Duration) bool { return d <= 0 })
+}
+
+// wholeSeconds protects durations that the SQS API represents as integer
+// seconds from being silently truncated by the adapter.
+func wholeSeconds(values ...time.Duration) bool {
+	return !slices.ContainsFunc(values, func(d time.Duration) bool { return d%time.Second != 0 })
 }
 
 func between(v, lo, hi int) bool { return v >= lo && v <= hi }

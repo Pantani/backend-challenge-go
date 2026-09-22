@@ -263,8 +263,9 @@ func (c *Consumer) ack(parent context.Context, m types.Message, res app.ConsumeR
 func (c *Consumer) delete(ctx context.Context, m types.Message) bool {
 	_, err := c.api.DeleteMessage(ctx, &sqs.DeleteMessageInput{QueueUrl: aws.String(c.cfg.QueueURL), ReceiptHandle: m.ReceiptHandle})
 	if err != nil {
-		// The handling is committed; a redelivery is absorbed by the inbox.
-		c.logger.WarnContext(ctx, "sqs delete failed; redelivery will be deduplicated", "error", err)
+		// The source message remains available regardless of whether this path
+		// followed a committed operation or a copy to the DLQ.
+		c.logger.WarnContext(ctx, "sqs delete failed; message remains available for redelivery", "error", err)
 		return false
 	}
 	return true

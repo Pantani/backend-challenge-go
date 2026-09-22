@@ -109,10 +109,15 @@ type fakeStore struct {
 	markFailLost bool
 	markDeadLost bool
 	failedCtxErr error
+	claimHook    func()
+	claimIDs     map[uuid.UUID]uuid.UUID
+	claimUntil   map[uuid.UUID]time.Time
+	startAt      time.Time
+	renewedUntil time.Time
 }
 
 // Claim hands out the queued messages one at a time, like a drained outbox.
-func (s *fakeStore) Claim(_ context.Context, owner string, claimID uuid.UUID, _ time.Time, _ time.Duration) (app.OutboxMessage, bool, error) {
+func (s *fakeStore) Claim(_ context.Context, owner string, claimID uuid.UUID, now time.Time, lease time.Duration) (app.OutboxMessage, bool, error) {
 	s.claimedOwner = owner
 	s.rounds++
 	if s.claimErr != nil || len(s.msgs) == 0 {
@@ -126,13 +131,30 @@ func (s *fakeStore) Claim(_ context.Context, owner string, claimID uuid.UUID, _ 
 		s.attempts = make(map[uuid.UUID]int)
 	}
 	s.attempts[m.EventID] = m.Attempts
+	if s.claimIDs == nil {
+		s.claimIDs = make(map[uuid.UUID]uuid.UUID)
+		s.claimUntil = make(map[uuid.UUID]time.Time)
+	}
+	s.claimIDs[m.EventID] = claimID
+	s.claimUntil[m.EventID] = now.Add(lease)
+	if s.claimHook != nil {
+		s.claimHook()
+	}
 	return m, true, nil
 }
 
-func (s *fakeStore) StartAttempt(_ context.Context, id, _ uuid.UUID) (int, bool, error) {
+func (s *fakeStore) StartAttempt(
+	_ context.Context, id, claimID uuid.UUID, now time.Time, lease time.Duration,
+) (int, bool, error) {
 	if s.startErr != nil || s.startLost {
 		return 0, false, s.startErr
 	}
+	s.startAt = now
+	if s.claimIDs[id] != claimID || !now.Before(s.claimUntil[id]) {
+		return 0, false, nil
+	}
+	s.claimUntil[id] = now.Add(lease)
+	s.renewedUntil = s.claimUntil[id]
 	s.attempts[id]++
 	return s.attempts[id], true, nil
 }
@@ -414,6 +436,55 @@ func TestRelayLostAttemptNeverPublishes(t *testing.T) {
 
 			assert.Zero(t, pub.calls, "publication cannot begin after StartAttempt loses ownership")
 			assert.Zero(t, tt.store.attempts[id])
+		})
+	}
+}
+
+type countingPublisher struct{ calls int }
+
+func (p *countingPublisher) Publish(context.Context, app.OutboxMessage) error {
+	p.calls++
+	return nil
+}
+
+func TestRelayRenewsOnlyALiveClaimImmediatelyBeforePublish(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		delay       time.Duration
+		wantPublish int
+	}{
+		{name: "delayed within original lease", delay: 750 * time.Millisecond, wantPublish: 1},
+		{name: "delay reaches original lease", delay: time.Second, wantPublish: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			clock := testutil.NewFakeClock(t0)
+			id := uuid.New()
+			store := &fakeStore{markOK: true, msgs: []app.OutboxMessage{{EventID: id}}, claimHook: func() {
+				clock.Advance(tt.delay)
+			}}
+			publisher := &countingPublisher{}
+			relay := worker.NewRelay(store, publisher, clock, worker.RelayConfig{
+				Owner: "lease-test", BatchSize: 1, Lease: time.Second, RetryBase: time.Second,
+				RetryMax: time.Second, PublishTime: 100 * time.Millisecond, FinalizeTime: 100 * time.Millisecond,
+				MaxAttempts: 2,
+			}, observability.NewLogger(&testutil.SyncBuffer{}, "debug", "lease-test"), testutil.NewMetrics())
+
+			relay.Tick(context.Background())
+
+			assert.Equal(t, tt.wantPublish, publisher.calls)
+			assert.Equal(t, t0.Add(tt.delay), store.startAt)
+			if tt.wantPublish == 0 {
+				assert.Zero(t, store.attempts[id], "an expired claim consumes no attempt")
+				assert.Empty(t, store.published, "an expired claim cannot reach durable confirmation")
+				assert.Equal(t, t0.Add(time.Second), store.claimUntil[id], "an expired claim is not revived")
+				return
+			}
+			assert.Equal(t, t0.Add(tt.delay+time.Second), store.renewedUntil)
+			assert.Equal(t, 1, store.attempts[id])
+			assert.Equal(t, []uuid.UUID{id}, store.published, "the renewed claim publishes and confirms safely")
 		})
 	}
 }

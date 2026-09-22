@@ -1220,9 +1220,14 @@ func TestOutboxClaimTokenFencesReusedOwner(t *testing.T) {
 	require.Equal(t, firstClaimID, first.ClaimID)
 	require.Zero(t, first.Attempts, "claiming alone is not a publication attempt")
 
-	_, held, err := store.Claim(ctx, owner, secondClaimID, firstNow.Add(30*time.Second), time.Minute)
+	attempts, started, err := store.StartAttempt(ctx, id, firstClaimID, firstNow.Add(30*time.Second), time.Minute)
 	require.NoError(t, err)
-	assert.False(t, held, "a live lease is not taken over")
+	require.True(t, started, "a live delayed claim starts its real publication attempt")
+	require.Equal(t, 1, attempts)
+
+	_, held, err := store.Claim(ctx, owner, secondClaimID, firstNow.Add(70*time.Second), time.Minute)
+	require.NoError(t, err)
+	assert.False(t, held, "StartAttempt renews the lease beyond its original expiry")
 
 	second, ok, err := store.Claim(ctx, owner, secondClaimID, firstNow.Add(2*time.Minute), time.Minute)
 	require.NoError(t, err)
@@ -1239,21 +1244,39 @@ func TestOutboxClaimTokenFencesReusedOwner(t *testing.T) {
 	ok, err = store.MarkDead(ctx, id, firstClaimID, firstNow.Add(3*time.Minute), "late dead letter")
 	require.NoError(t, err)
 	assert.False(t, ok, "the previous claim cannot dead-letter under the reused owner")
-	attempts, started, err := store.StartAttempt(ctx, id, firstClaimID)
+	attempts, started, err = store.StartAttempt(ctx, id, firstClaimID, firstNow.Add(130*time.Second), time.Minute)
 	require.NoError(t, err)
 	assert.False(t, started, "the previous claim cannot start a publication under the reused owner")
 	assert.Zero(t, attempts)
 
-	attempts, started, err = store.StartAttempt(ctx, id, secondClaimID)
+	attempts, started, err = store.StartAttempt(ctx, id, secondClaimID, firstNow.Add(150*time.Second), time.Minute)
 	require.NoError(t, err)
 	require.True(t, started)
-	require.Equal(t, 1, attempts)
+	require.Equal(t, 2, attempts)
 	ok, err = store.MarkPublished(ctx, id, secondClaimID, firstNow.Add(3*time.Minute))
 	require.NoError(t, err)
 	assert.True(t, ok, "the current claim confirms the publication")
 	ok, err = store.MarkPublished(ctx, id, secondClaimID, firstNow.Add(3*time.Minute))
 	require.NoError(t, err)
 	assert.False(t, ok, "a publication is confirmed once")
+
+	expiredID := insertOutboxEvent(t)
+	expiredClaimID := uuid.New()
+	expiredAt := firstNow.Add(4 * time.Minute)
+	expired, ok, err := store.Claim(ctx, owner, expiredClaimID, expiredAt, time.Minute)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, expiredID, expired.EventID)
+	attempts, started, err = store.StartAttempt(ctx, expiredID, expiredClaimID, expiredAt.Add(time.Minute), time.Minute)
+	require.NoError(t, err)
+	assert.False(t, started, "an expired claim cannot be revived by starting an attempt")
+	assert.Zero(t, attempts)
+	var storedAttempts int
+	var lockedUntil time.Time
+	require.NoError(t, pool.QueryRow(ctx, `SELECT attempts, locked_until FROM outbox_events WHERE event_id = $1`, expiredID).
+		Scan(&storedAttempts, &lockedUntil))
+	assert.Zero(t, storedAttempts)
+	assert.True(t, lockedUntil.Equal(expiredAt.Add(time.Minute)), "an expired StartAttempt leaves locked_until unchanged")
 }
 
 // Not parallel: relays claim the whole (shared) outbox.

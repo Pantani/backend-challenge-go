@@ -79,13 +79,18 @@ func scanOutboxMessage(row rowScanner) (app.OutboxMessage, error) {
 	return m, err
 }
 
-// StartAttempt increments the publication count only while claimID still owns
-// eventID. It reports false after another acquisition fences the caller out.
-func (s *OutboxStore) StartAttempt(ctx context.Context, eventID, claimID uuid.UUID) (int, bool, error) {
+// StartAttempt atomically renews a live claim from the beginning of the real
+// broker attempt and increments its publication count. It reports false when
+// the lease expired or another acquisition fenced the caller out.
+func (s *OutboxStore) StartAttempt(
+	ctx context.Context, eventID, claimID uuid.UUID, now time.Time, lease time.Duration,
+) (int, bool, error) {
 	var attempts int
-	err := s.pool.QueryRow(ctx, `UPDATE outbox_events SET attempts = attempts + 1
-		WHERE event_id = $1 AND claim_id = $2 AND published_at IS NULL AND dead_lettered_at IS NULL
-		RETURNING attempts`, eventID, claimID).Scan(&attempts)
+	err := s.pool.QueryRow(ctx, `UPDATE outbox_events
+		SET attempts = attempts + 1, locked_until = $4
+		WHERE event_id = $1 AND claim_id = $2 AND locked_until > $3
+			AND published_at IS NULL AND dead_lettered_at IS NULL
+		RETURNING attempts`, eventID, claimID, now, now.Add(lease)).Scan(&attempts)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, false, nil
 	}

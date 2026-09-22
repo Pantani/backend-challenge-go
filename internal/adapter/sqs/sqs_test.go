@@ -23,7 +23,6 @@ import (
 	"github.com/Pantani/backend-challenge-go/internal/contract"
 	"github.com/Pantani/backend-challenge-go/internal/domain/wager"
 	"github.com/Pantani/backend-challenge-go/internal/observability"
-	"github.com/Pantani/backend-challenge-go/internal/testutil"
 )
 
 func TestMain(m *testing.M) { goleak.VerifyTestMain(m) }
@@ -248,11 +247,16 @@ func envelopeMessageID(bodyText string) string {
 }
 
 type consumerFixture struct {
-	api  *fakeAPI
-	proc *fakeProcessor
-	logs *bytes.Buffer
-	c    *sqsadapter.Consumer
+	api     *fakeAPI
+	proc    *fakeProcessor
+	logs    *bytes.Buffer
+	metrics *fakeConsumerMetrics
+	c       *sqsadapter.Consumer
 }
+
+type fakeConsumerMetrics struct{ outcomes []string }
+
+func (m *fakeConsumerMetrics) SQSMessage(outcome string) { m.outcomes = append(m.outcomes, outcome) }
 
 // consumerConfig is the standard test configuration.
 func consumerConfig() sqsadapter.ConsumerConfig {
@@ -270,11 +274,11 @@ func newConsumer(t *testing.T, proc *fakeProcessor, msgs ...types.Message) *cons
 
 func newConsumerWith(t *testing.T, cfg sqsadapter.ConsumerConfig, proc *fakeProcessor, msgs ...types.Message) *consumerFixture {
 	t.Helper()
-	f := &consumerFixture{api: newFakeAPI(), proc: proc, logs: &bytes.Buffer{}}
+	f := &consumerFixture{api: newFakeAPI(), proc: proc, logs: &bytes.Buffer{}, metrics: &fakeConsumerMetrics{}}
 	f.api.setReceive(func(context.Context) (*awssqs.ReceiveMessageOutput, error) {
 		return &awssqs.ReceiveMessageOutput{Messages: msgs}, nil
 	})
-	f.c = sqsadapter.NewConsumer(f.api, cfg, proc, observability.NewLogger(f.logs, "debug", "t"), testutil.NewMetrics())
+	f.c = sqsadapter.NewConsumer(f.api, cfg, proc, observability.NewLogger(f.logs, "debug", "t"), f.metrics)
 	return f
 }
 
@@ -328,7 +332,7 @@ func TestConsumerToleratesDeleteAndVisibilityFailures(t *testing.T) {
 	f.api.errs["delete"] = errBoom
 	f.api.errs["visibility"] = errBoom
 	f.c.PollOnce(context.Background())
-	assert.Contains(t, f.logs.String(), "redelivery will be deduplicated")
+	assert.Contains(t, f.logs.String(), "message remains available for redelivery")
 	assert.Contains(t, f.logs.String(), "change visibility failed")
 }
 
@@ -469,9 +473,13 @@ func TestDLQDeleteFailureBlocksGroupTail(t *testing.T) {
 	f.c.PollOnce(context.Background())
 
 	require.Len(t, f.api.sent, 1, "the invalid head is copied to the DLQ")
+	assert.Equal(t, []string{"rh-a1"}, f.api.deleteCalls, "only the invalid head has a source deletion attempt")
+	assert.Equal(t, []string{"send:a1", "delete:rh-a1", "visibility:rh-a2"}, f.api.calls,
+		"the source deletion is attempted after the DLQ copy and before the tail is released")
 	assert.Zero(t, proc.calls, "the tail waits until its head leaves the source queue")
 	assert.Equal(t, map[string]int32{"rh-a2": 0}, f.api.visibility, "the unstarted tail is released")
-	assert.Contains(t, f.logs.String(), "sqs delete failed; redelivery will be deduplicated")
+	assert.Equal(t, []string{sqsadapter.OutcomeDLQ, sqsadapter.OutcomeReleased}, f.metrics.outcomes)
+	assert.Contains(t, f.logs.String(), "sqs delete failed; message remains available for redelivery")
 }
 
 func TestDeadLetterKeepsMessageGroup(t *testing.T) {

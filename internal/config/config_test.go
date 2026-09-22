@@ -91,6 +91,34 @@ func TestRejectsVisibilityShorterThanWholeBatch(t *testing.T) {
 	}
 }
 
+func TestRejectsSQSDurationsThatLosePrecisionAtTheAdapter(t *testing.T) {
+	t.Parallel()
+	tests := map[string]map[string]string{
+		"visibility above exact batch budget": {
+			"SQS_MAX_MESSAGES":       "2",
+			"SQS_PROCESS_TIMEOUT":    "2.9s",
+			"SQS_ACK_TIMEOUT":        "50ms",
+			"SQS_VISIBILITY_TIMEOUT": "5.95s",
+		},
+		"subsecond wait": {
+			"SQS_WAIT_TIME": "500ms",
+		},
+		"fractional retry base": {
+			"SQS_RETRY_BASE": "1.5s",
+		},
+		"fractional retry max": {
+			"SQS_RETRY_MAX": "60.5s",
+		},
+	}
+	for name, values := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			_, err := config.LoadSQS(config.MapLookup(values))
+			require.ErrorContains(t, err, "whole seconds")
+		})
+	}
+}
+
 func TestRejectsWholeBatchBudgetOverflow(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
