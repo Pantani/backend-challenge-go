@@ -1,0 +1,15 @@
+# Build artifacts
+/bin/
+*.exe
+*.test
+
+# Coverage
+coverage.out
+coverage.html
+
+# Env files
+.env
+
+# IDE
+.idea/
+.vscode/

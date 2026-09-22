@@ -1,0 +1,16 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - gosec
+    - misspell
+  settings:
+    gosec:
+      excludes:
+        - G404 # math/rand is fine outside of crypto/security contexts
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
