@@ -103,6 +103,12 @@ type fakeStore struct {
 	rounds       int
 	dead         []uuid.UUID
 	attempts     map[uuid.UUID]int
+	claimed      []uuid.UUID
+	startLost    bool
+	startErr     error
+	markFailLost bool
+	markDeadLost bool
+	failedCtxErr error
 }
 
 // Claim hands out the queued messages one at a time, like a drained outbox.
@@ -115,6 +121,7 @@ func (s *fakeStore) Claim(_ context.Context, owner string, claimID uuid.UUID, _ 
 	m := s.msgs[0]
 	s.msgs = s.msgs[1:]
 	m.ClaimID = claimID
+	s.claimed = append(s.claimed, m.EventID)
 	if s.attempts == nil {
 		s.attempts = make(map[uuid.UUID]int)
 	}
@@ -123,6 +130,9 @@ func (s *fakeStore) Claim(_ context.Context, owner string, claimID uuid.UUID, _ 
 }
 
 func (s *fakeStore) StartAttempt(_ context.Context, id, _ uuid.UUID) (int, bool, error) {
+	if s.startErr != nil || s.startLost {
+		return 0, false, s.startErr
+	}
 	s.attempts[id]++
 	return s.attempts[id], true, nil
 }
@@ -134,14 +144,18 @@ func (s *fakeStore) MarkPublished(_ context.Context, id, _ uuid.UUID, _ time.Tim
 	return s.markOK, s.markErr
 }
 
-func (s *fakeStore) MarkFailed(_ context.Context, id, _ uuid.UUID, next time.Time, _ string) (bool, error) {
+func (s *fakeStore) MarkFailed(ctx context.Context, id, _ uuid.UUID, next time.Time, _ string) (bool, error) {
+	s.failedCtxErr = ctx.Err()
+	if s.markFailLost {
+		return false, s.markFailErr
+	}
 	s.failed[id] = next
 	return true, s.markFailErr
 }
 
 func (s *fakeStore) MarkDead(_ context.Context, id, _ uuid.UUID, _ time.Time, _ string) (bool, error) {
 	s.dead = append(s.dead, id)
-	return true, s.markFailErr
+	return !s.markDeadLost, s.markFailErr
 }
 
 func (s *fakeStore) OldestPending(context.Context) (time.Time, bool, error) {
@@ -165,9 +179,36 @@ func (p fakePublisher) Publish(ctx context.Context, m app.OutboxMessage) error {
 
 func newRelay(store *fakeStore, pub fakePublisher, logs *testutil.SyncBuffer) *worker.Relay {
 	return worker.NewRelay(store, pub, testutil.NewFakeClock(t0), worker.RelayConfig{
-		Owner: "instance-1", BatchSize: 10, Lease: time.Minute, RetryBase: time.Second, RetryMax: 30 * time.Second, PublishTime: time.Second,
+		Owner: "instance-1", BatchSize: 10, Lease: time.Minute, RetryBase: time.Second, RetryMax: 30 * time.Second,
+		PublishTime: time.Second, FinalizeTime: time.Second,
 		MaxAttempts: 50,
 	}, observability.NewLogger(logs, "debug", "t"), testutil.NewMetrics())
+}
+
+type relayMetrics struct {
+	published int
+	failures  int
+	dead      int
+}
+
+func (m *relayMetrics) OutboxPublished()      { m.published++ }
+func (m *relayMetrics) OutboxFailure()        { m.failures++ }
+func (m *relayMetrics) OutboxDeadLettered()   { m.dead++ }
+func (*relayMetrics) OutboxLag(time.Duration) {}
+
+func deadlineRelay(store *fakeStore, pub worker.Publisher, metrics worker.RelayMetrics) *worker.Relay {
+	return worker.NewRelay(store, pub, testutil.NewFakeClock(t0), worker.RelayConfig{
+		Owner: "deadline", BatchSize: 2, Lease: time.Second, RetryBase: time.Second, RetryMax: time.Second,
+		PublishTime: 10 * time.Millisecond, FinalizeTime: time.Second, MaxAttempts: 2,
+	}, observability.NewLogger(&testutil.SyncBuffer{}, "debug", "deadline"), metrics)
+}
+
+type deadlinePublisher struct{ calls int }
+
+func (p *deadlinePublisher) Publish(ctx context.Context, _ app.OutboxMessage) error {
+	p.calls++
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 func TestRelayPublishesAndRetries(t *testing.T) {
@@ -238,7 +279,7 @@ func TestRelayRunsRoundsUntilDrainedOrCancelled(t *testing.T) {
 	cancel()
 	cancelled := &fakeStore{markOK: true, msgs: []app.OutboxMessage{{EventID: uuid.New()}}}
 	newRelay(cancelled, fakePublisher{}, &testutil.SyncBuffer{}).Tick(ctx)
-	assert.Equal(t, 1, cancelled.rounds, "shutdown stops further rounds")
+	assert.Zero(t, cancelled.rounds, "shutdown stops before acquiring another claim")
 }
 
 func TestRelayPreservesBatchThroughputWithSingularClaims(t *testing.T) {
@@ -289,4 +330,90 @@ func TestRelayPublishesWithinPublishTimeDetachedFromShutdown(t *testing.T) {
 	newRelay(store, pub, &testutil.SyncBuffer{}).Tick(ctx)
 	assert.Equal(t, []uuid.UUID{first}, seen, "the round stops between publications; the rest expires with its lease")
 	assert.Equal(t, []uuid.UUID{first}, store.published)
+}
+
+func TestRelayDeadlineFinalizesFailureWithLiveContext(t *testing.T) {
+	id := uuid.New()
+	store := &fakeStore{failed: map[uuid.UUID]time.Time{}, msgs: []app.OutboxMessage{{EventID: id}}}
+	pub := &deadlinePublisher{}
+	metrics := &relayMetrics{}
+
+	deadlineRelay(store, pub, metrics).Tick(context.Background())
+
+	require.Equal(t, 1, pub.calls)
+	assert.NoError(t, store.failedCtxErr, "finalization has a fresh context after publication times out")
+	assert.Equal(t, t0.Add(time.Second), store.failed[id], "the timeout is durably backed off")
+	assert.Equal(t, 1, metrics.failures)
+}
+
+func TestRelayDeadMetricsRequireDurableMutation(t *testing.T) {
+	id := uuid.New()
+	store := &fakeStore{
+		failed: map[uuid.UUID]time.Time{}, msgs: []app.OutboxMessage{{EventID: id, Attempts: 1}}, markDeadLost: true,
+	}
+	metrics := &relayMetrics{}
+
+	deadlineRelay(store, &deadlinePublisher{}, metrics).Tick(context.Background())
+
+	assert.Equal(t, 0, metrics.failures, "a stale claim does not count a durable failure")
+	assert.Equal(t, 0, metrics.dead, "dead-lettering is counted only after MarkDead succeeds")
+}
+
+func TestRelayFailureMetricsRequireDurableMutation(t *testing.T) {
+	id := uuid.New()
+	store := &fakeStore{
+		failed: map[uuid.UUID]time.Time{}, msgs: []app.OutboxMessage{{EventID: id}}, markFailLost: true,
+	}
+	metrics := &relayMetrics{}
+
+	deadlineRelay(store, &deadlinePublisher{}, metrics).Tick(context.Background())
+
+	assert.Zero(t, metrics.failures)
+	assert.NotContains(t, store.failed, id)
+}
+
+func TestRelayCountsDurableDeadLetter(t *testing.T) {
+	id := uuid.New()
+	store := &fakeStore{failed: map[uuid.UUID]time.Time{}, msgs: []app.OutboxMessage{{EventID: id, Attempts: 1}}}
+	metrics := &relayMetrics{}
+
+	deadlineRelay(store, &deadlinePublisher{}, metrics).Tick(context.Background())
+
+	assert.Equal(t, 1, metrics.failures)
+	assert.Equal(t, 1, metrics.dead)
+}
+
+func TestRelayCancellationDoesNotClaimOrAttemptLaterRecords(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	first, second := uuid.New(), uuid.New()
+	store := &fakeStore{markOK: true, msgs: []app.OutboxMessage{{EventID: first}, {EventID: second}}}
+	pub := fakePublisher{hook: func(context.Context, app.OutboxMessage) { cancel() }}
+
+	newRelay(store, pub, &testutil.SyncBuffer{}).Tick(ctx)
+
+	assert.Equal(t, []uuid.UUID{first}, store.claimed, "cancellation is checked before the next claim")
+	assert.Equal(t, 1, store.attempts[first])
+	assert.Zero(t, store.attempts[second])
+}
+
+func TestRelayLostAttemptNeverPublishes(t *testing.T) {
+	tests := []struct {
+		name  string
+		store *fakeStore
+	}{
+		{name: "lost claim", store: &fakeStore{startLost: true}},
+		{name: "store error", store: &fakeStore{startErr: errBoom}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			id := uuid.New()
+			tt.store.msgs = []app.OutboxMessage{{EventID: id}}
+			pub := &deadlinePublisher{}
+
+			deadlineRelay(tt.store, pub, &relayMetrics{}).Tick(context.Background())
+
+			assert.Zero(t, pub.calls, "publication cannot begin after StartAttempt loses ownership")
+			assert.Zero(t, tt.store.attempts[id])
+		})
+	}
 }

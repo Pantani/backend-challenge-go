@@ -116,8 +116,10 @@ type Config struct {
 	// OutboxRetryBase and OutboxRetryMax bound the publication backoff.
 	OutboxRetryBase time.Duration
 	OutboxRetryMax  time.Duration
-	// OutboxPublishTimeout bounds one publication (send plus confirmation).
+	// OutboxPublishTimeout bounds one broker publication.
 	OutboxPublishTimeout time.Duration
+	// OutboxFinalizeTimeout bounds attempt accounting and each durable outcome.
+	OutboxFinalizeTimeout time.Duration
 	// OutboxMaxAttempts dead-letters an event after that many failures.
 	OutboxMaxAttempts int
 }
@@ -213,6 +215,7 @@ func (r *reader) loadWorkers(c *Config) {
 	c.OutboxLease = r.dur("OUTBOX_LEASE", 30*time.Second)
 	c.OutboxRetryBase, c.OutboxRetryMax = r.dur("OUTBOX_RETRY_BASE", time.Second), r.dur("OUTBOX_RETRY_MAX", time.Minute)
 	c.OutboxPublishTimeout = r.dur("OUTBOX_PUBLISH_TIMEOUT", 10*time.Second)
+	c.OutboxFinalizeTimeout = r.dur("OUTBOX_FINALIZE_TIMEOUT", 5*time.Second)
 	c.OutboxMaxAttempts = r.int("OUTBOX_MAX_ATTEMPTS", 20)
 }
 
@@ -284,12 +287,20 @@ func (c Config) validate() error {
 			"batch sizes and attempts must be positive"},
 		{between(int(c.PendingBaseDelay), 1, int(c.PendingMaxDelay)), "PENDING_BASE_DELAY must be in (0, PENDING_MAX_DELAY]"},
 		{positiveDurations(c.PendingInterval, c.OutboxInterval, c.OutboxLease, c.OutboxRetryBase, c.OutboxRetryMax,
-			c.OutboxPublishTimeout, c.ShutdownTimeout, c.ReadyTimeout), "worker intervals, leases, retries and timeouts must be positive"},
+			c.OutboxPublishTimeout, c.OutboxFinalizeTimeout, c.ShutdownTimeout, c.ReadyTimeout),
+			"worker intervals, leases, retries and timeouts must be positive"},
 		{c.OutboxRetryBase <= c.OutboxRetryMax, "OUTBOX_RETRY_BASE must not exceed OUTBOX_RETRY_MAX"},
-		{c.OutboxPublishTimeout < c.OutboxLease, "OUTBOX_PUBLISH_TIMEOUT must be lower than OUTBOX_LEASE"},
+		{outboxBudgetFits(c.OutboxPublishTimeout, c.OutboxFinalizeTimeout, c.OutboxLease),
+			"OUTBOX_PUBLISH_TIMEOUT plus OUTBOX_FINALIZE_TIMEOUT must be lower than OUTBOX_LEASE"},
 		{c.ShutdownTimeout > c.SQSProcessTimeout+c.SQSAckTimeout, "SHUTDOWN_TIMEOUT must exceed SQS_PROCESS_TIMEOUT plus SQS_ACK_TIMEOUT"},
 		{c.ShutdownTimeout > c.OutboxPublishTimeout, "SHUTDOWN_TIMEOUT must exceed OUTBOX_PUBLISH_TIMEOUT"},
 	}))
+}
+
+// outboxBudgetFits validates the serial publication and finalization budget
+// using subtraction so time.Duration addition cannot overflow.
+func outboxBudgetFits(publish, finalize, lease time.Duration) bool {
+	return publish > 0 && finalize > 0 && lease > 0 && publish < lease && finalize < lease-publish
 }
 
 func nonEmpty(values ...string) bool {

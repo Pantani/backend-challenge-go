@@ -34,7 +34,7 @@ type RelayMetrics interface {
 type RelayConfig struct {
 	// Owner identifies this instance in leases.
 	Owner string
-	// BatchSize bounds how many records one claim round takes.
+	// BatchSize bounds how many singular claims one round processes.
 	BatchSize int
 	// Lease is how long a claim is exclusive; a crashed publisher's records
 	// become claimable again after it expires.
@@ -44,10 +44,11 @@ type RelayConfig struct {
 	RetryBase time.Duration
 	// RetryMax caps the retry delay.
 	RetryMax time.Duration
-	// PublishTime bounds one publication, including the store confirmation.
-	// It applies through Detach, so an in-flight publication completes even
-	// after the relay was told to stop.
+	// PublishTime bounds one broker publication.
 	PublishTime time.Duration
+	// FinalizeTime independently bounds attempt accounting and the durable
+	// confirmation, retry, or dead-letter mutation.
+	FinalizeTime time.Duration
 	// MaxAttempts dead-letters a record after that many failed publications.
 	MaxAttempts int
 }
@@ -83,18 +84,20 @@ func (r *Relay) Tick(ctx context.Context) {
 	r.refreshLag(ctx)
 }
 
-// round claims and publishes up to one configured batch. It reports whether
-// the batch was full and another round may have immediately due work.
-// It stops between publications once ctx is done: the publication in flight
-// completes, the remaining claims simply expire with their lease.
+// round claims and publishes up to BatchSize records, acquiring each claim
+// immediately before its work. It reports whether another round may have due
+// work and stops before acquiring a claim after cancellation.
 func (r *Relay) round(ctx context.Context) bool {
 	for range r.cfg.BatchSize {
+		if ctx.Err() != nil {
+			return false
+		}
 		m, ok, err := r.store.Claim(ctx, r.cfg.Owner, uuid.New(), r.clock.Now(), r.cfg.Lease)
 		if err != nil {
 			r.logger.WarnContext(ctx, "outbox claim failed", "error", err)
 			return false
 		}
-		if !ok || ctx.Err() != nil {
+		if !ok {
 			return false
 		}
 		r.publish(ctx, m)
@@ -103,41 +106,56 @@ func (r *Relay) round(ctx context.Context) bool {
 }
 
 func (r *Relay) publish(parent context.Context, m app.OutboxMessage) {
-	ctx, cancel := Detach(parent, r.cfg.PublishTime)
-	defer cancel()
 	log := r.logger.With("eventId", m.EventID, "eventType", m.EventType, "aggregateId", m.AggregateID)
-	attempts, ok, err := r.store.StartAttempt(ctx, m.EventID, m.ClaimID)
-	if err != nil || !ok {
-		log.WarnContext(ctx, "outbox publication attempt not started; claim was lost", "error", err)
+	attempts, ok := r.startAttempt(parent, log, m)
+	if !ok {
 		return
 	}
 	m.Attempts = attempts
-	if err := r.publisher.Publish(ctx, m); err != nil {
-		r.failed(ctx, log, m, err)
+	publishCtx, cancelPublish := Detach(parent, r.cfg.PublishTime)
+	err := r.publisher.Publish(publishCtx, m)
+	cancelPublish()
+	finalizeCtx, cancelFinalize := Detach(parent, r.cfg.FinalizeTime)
+	defer cancelFinalize()
+	if err != nil {
+		r.failed(finalizeCtx, log, m, err)
 		return
 	}
-	r.confirm(ctx, log, m)
+	r.confirm(finalizeCtx, log, m)
+}
+
+func (r *Relay) startAttempt(parent context.Context, log *slog.Logger, m app.OutboxMessage) (int, bool) {
+	ctx, cancel := Detach(parent, r.cfg.FinalizeTime)
+	defer cancel()
+	attempts, ok, err := r.store.StartAttempt(ctx, m.EventID, m.ClaimID)
+	if err != nil || !ok {
+		log.WarnContext(ctx, "outbox publication attempt not started; claim was lost", "error", err)
+		return 0, false
+	}
+	return attempts, true
 }
 
 // failed schedules a retry with backoff, or dead-letters a record that
 // exhausted its attempts so it stops blocking its wallet's later events.
 func (r *Relay) failed(ctx context.Context, log *slog.Logger, m app.OutboxMessage, cause error) {
-	r.metrics.OutboxFailure()
-	var (
-		ok  bool
-		err error
-	)
 	if m.Attempts >= r.cfg.MaxAttempts {
-		log.ErrorContext(ctx, "outbox event dead-lettered after exhausting its attempts", "attempts", m.Attempts, "error", cause)
+		ok, err := r.store.MarkDead(ctx, m.EventID, m.ClaimID, r.clock.Now(), cause.Error())
+		if err != nil || !ok {
+			log.WarnContext(ctx, "outbox failure not recorded; lease expiry will release it", "error", err)
+			return
+		}
+		r.metrics.OutboxFailure()
 		r.metrics.OutboxDeadLettered()
-		ok, err = r.store.MarkDead(ctx, m.EventID, m.ClaimID, r.clock.Now(), cause.Error())
-	} else {
-		log.WarnContext(ctx, "outbox publish failed", "attempts", m.Attempts, "error", cause)
-		ok, err = r.store.MarkFailed(ctx, m.EventID, m.ClaimID, r.clock.Now().Add(r.backoff(m.Attempts)), cause.Error())
+		log.ErrorContext(ctx, "outbox event dead-lettered after exhausting its attempts", "attempts", m.Attempts, "error", cause)
+		return
 	}
+	ok, err := r.store.MarkFailed(ctx, m.EventID, m.ClaimID, r.clock.Now().Add(r.backoff(m.Attempts)), cause.Error())
 	if err != nil || !ok {
 		log.WarnContext(ctx, "outbox failure not recorded; lease expiry will release it", "error", err)
+		return
 	}
+	r.metrics.OutboxFailure()
+	log.WarnContext(ctx, "outbox publish failed", "attempts", m.Attempts, "error", cause)
 }
 
 // confirm records the publication. If this fails (or the lease was lost) the

@@ -239,7 +239,8 @@ func newRelay(store app.OutboxStore, pub worker.Publisher, clock app.Clock, cfg 
 	return worker.NewRelay(store, pub, clock, worker.RelayConfig{
 		Owner: cfg.InstanceID, BatchSize: cfg.OutboxBatch, Lease: cfg.OutboxLease,
 		RetryBase: cfg.OutboxRetryBase, RetryMax: cfg.OutboxRetryMax, PublishTime: cfg.OutboxPublishTimeout,
-		MaxAttempts: cfg.OutboxMaxAttempts,
+		FinalizeTime: cfg.OutboxFinalizeTimeout,
+		MaxAttempts:  cfg.OutboxMaxAttempts,
 	}, logger, metrics)
 }
 

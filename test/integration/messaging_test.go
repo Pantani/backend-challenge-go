@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -42,7 +43,7 @@ func newRelayWithAttempts(t *testing.T, owner string, store app.OutboxStore, pub
 	t.Helper()
 	return worker.NewRelay(store, pub, app.SystemClock{}, worker.RelayConfig{
 		Owner: owner, BatchSize: 500, Lease: time.Second, RetryBase: 10 * time.Millisecond, RetryMax: 20 * time.Millisecond,
-		PublishTime: 5 * time.Second, MaxAttempts: maxAttempts,
+		PublishTime: 5 * time.Second, FinalizeTime: time.Second, MaxAttempts: maxAttempts,
 	}, observability.NewLogger(io.Discard, "error", owner), testutil.NewMetrics())
 }
 
@@ -134,6 +135,98 @@ func (forgetfulStore) MarkPublished(context.Context, uuid.UUID, uuid.UUID, time.
 type recordingPublisher struct {
 	mu  sync.Mutex
 	ids []uuid.UUID
+}
+
+type observedClaim struct {
+	eventID uuid.UUID
+	claimID uuid.UUID
+}
+
+type observedOutboxStore struct {
+	app.OutboxStore
+	mu     sync.Mutex
+	claims []observedClaim
+}
+
+func (s *observedOutboxStore) Claim(
+	ctx context.Context, owner string, claimID uuid.UUID, now time.Time, lease time.Duration,
+) (app.OutboxMessage, bool, error) {
+	m, ok, err := s.OutboxStore.Claim(ctx, owner, claimID, now, lease)
+	if ok {
+		s.mu.Lock()
+		s.claims = append(s.claims, observedClaim{eventID: m.EventID, claimID: claimID})
+		s.mu.Unlock()
+	}
+	return m, ok, err
+}
+
+func (s *observedOutboxStore) snapshotClaims() []observedClaim {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]observedClaim(nil), s.claims...)
+}
+
+type gatedFailureStore struct {
+	*observedOutboxStore
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *gatedFailureStore) MarkFailed(
+	ctx context.Context, eventID, claimID uuid.UUID, next time.Time, cause string,
+) (bool, error) {
+	select {
+	case s.entered <- struct{}{}:
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+	return s.OutboxStore.MarkFailed(ctx, eventID, claimID, next, cause)
+}
+
+type blockingPublisher struct{}
+
+func (blockingPublisher) Publish(ctx context.Context, _ app.OutboxMessage) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+type partitionPublisher struct {
+	failID    uuid.UUID
+	published []uuid.UUID
+}
+
+func (p *partitionPublisher) Publish(_ context.Context, m app.OutboxMessage) error {
+	if m.EventID == p.failID {
+		return errors.New("second relay failure")
+	}
+	p.published = append(p.published, m.EventID)
+	return nil
+}
+
+type relayCounters struct {
+	published atomic.Int64
+	failures  atomic.Int64
+	dead      atomic.Int64
+}
+
+func (m *relayCounters) OutboxPublished()      { m.published.Add(1) }
+func (m *relayCounters) OutboxFailure()        { m.failures.Add(1) }
+func (m *relayCounters) OutboxDeadLettered()   { m.dead.Add(1) }
+func (*relayCounters) OutboxLag(time.Duration) {}
+
+func relayForDeadlineTest(
+	store app.OutboxStore, pub worker.Publisher, metrics worker.RelayMetrics, batch int,
+) *worker.Relay {
+	return worker.NewRelay(store, pub, app.SystemClock{}, worker.RelayConfig{
+		Owner: "shared-owner", BatchSize: batch, Lease: 80 * time.Millisecond,
+		RetryBase: time.Second, RetryMax: time.Second, PublishTime: 20 * time.Millisecond,
+		FinalizeTime: 500 * time.Millisecond, MaxAttempts: 5,
+	}, observability.NewLogger(io.Discard, "error", "deadline-it"), metrics)
 }
 
 func (p *recordingPublisher) Publish(_ context.Context, m app.OutboxMessage) error {
@@ -1005,7 +1098,8 @@ func insertOutboxEvent(t *testing.T) uuid.UUID {
 	id := uuid.New()
 	_, err := pool.Exec(context.Background(), `INSERT INTO outbox_events
 		(event_id, aggregate_type, aggregate_id, partition_key, event_type, payload, occurred_at, next_attempt_at)
-		VALUES ($1, 'Wallet', gen_random_uuid(), $2, 'T', '{"a":1}', now(), now())`, id, id.String())
+		VALUES ($1, 'Wallet', gen_random_uuid(), $2, 'T', '{"a":1}', $3, $3)`,
+		id, id.String(), time.Now().Add(-time.Minute))
 	require.NoError(t, err)
 	return id
 }
@@ -1045,8 +1139,12 @@ func TestOutboxClaimTokenFencesReusedOwner(t *testing.T) {
 	ok, err = store.MarkDead(ctx, id, firstClaimID, firstNow.Add(3*time.Minute), "late dead letter")
 	require.NoError(t, err)
 	assert.False(t, ok, "the previous claim cannot dead-letter under the reused owner")
+	attempts, started, err := store.StartAttempt(ctx, id, firstClaimID)
+	require.NoError(t, err)
+	assert.False(t, started, "the previous claim cannot start a publication under the reused owner")
+	assert.Zero(t, attempts)
 
-	attempts, started, err := store.StartAttempt(ctx, id, secondClaimID)
+	attempts, started, err = store.StartAttempt(ctx, id, secondClaimID)
 	require.NoError(t, err)
 	require.True(t, started)
 	require.Equal(t, 1, attempts)
@@ -1056,6 +1154,70 @@ func TestOutboxClaimTokenFencesReusedOwner(t *testing.T) {
 	ok, err = store.MarkPublished(ctx, id, secondClaimID, firstNow.Add(3*time.Minute))
 	require.NoError(t, err)
 	assert.False(t, ok, "a publication is confirmed once")
+}
+
+// Not parallel: relays claim the whole (shared) outbox.
+func TestRelayDeadlineFencesStaleFailureAndProgressesAnotherPartition(t *testing.T) {
+	slowID, fastID := insertOutboxEvent(t), insertOutboxEvent(t)
+	base := postgres.NewOutboxStore(pool)
+	firstObserved := &observedOutboxStore{OutboxStore: base}
+	firstStore := &gatedFailureStore{
+		observedOutboxStore: firstObserved, entered: make(chan struct{}), release: make(chan struct{}),
+	}
+	firstMetrics := &relayCounters{}
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		relayForDeadlineTest(firstStore, blockingPublisher{}, firstMetrics, 1).Tick(context.Background())
+	}()
+
+	select {
+	case <-firstStore.entered:
+	case <-time.After(time.Second):
+		t.Fatal("first relay did not reach durable finalization")
+	}
+	var lockedUntil time.Time
+	require.NoError(t, pool.QueryRow(context.Background(),
+		`SELECT locked_until FROM outbox_events WHERE event_id = $1`, slowID).Scan(&lockedUntil))
+	if wait := time.Until(lockedUntil.Add(20 * time.Millisecond)); wait > 0 {
+		time.Sleep(wait)
+	}
+
+	secondStore := &observedOutboxStore{OutboxStore: base}
+	secondPublisher := &partitionPublisher{failID: slowID}
+	secondMetrics := &relayCounters{}
+	relayForDeadlineTest(secondStore, secondPublisher, secondMetrics, 2).Tick(context.Background())
+	close(firstStore.release)
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("first relay did not finish after finalization was released")
+	}
+
+	firstClaims, secondClaims := firstObserved.snapshotClaims(), secondStore.snapshotClaims()
+	require.NotEmpty(t, firstClaims)
+	require.Len(t, secondClaims, 2)
+	assert.Equal(t, slowID, firstClaims[0].eventID)
+	assert.Equal(t, slowID, secondClaims[0].eventID)
+	assert.NotEqual(t, firstClaims[0].claimID, secondClaims[0].claimID, "each acquisition has a fresh fencing token")
+	assert.Equal(t, fastID, secondClaims[1].eventID)
+	assert.Equal(t, []uuid.UUID{fastID}, secondPublisher.published, "an independent partition progresses")
+
+	var attempts int
+	var lastError string
+	var backedOff, released, pending bool
+	require.NoError(t, pool.QueryRow(context.Background(), `SELECT attempts, last_error, next_attempt_at > now(),
+		claim_id IS NULL, published_at IS NULL FROM outbox_events WHERE event_id = $1`, slowID).
+		Scan(&attempts, &lastError, &backedOff, &released, &pending))
+	assert.Equal(t, 2, attempts)
+	assert.Equal(t, "second relay failure", lastError, "the stale first claim cannot overwrite the current outcome")
+	assert.True(t, backedOff)
+	assert.True(t, released)
+	assert.True(t, pending)
+	assert.Zero(t, firstMetrics.failures.Load(), "a stale mutation is not counted")
+	assert.Equal(t, int64(1), secondMetrics.failures.Load())
+	assert.Equal(t, int64(1), secondMetrics.published.Load())
+	assert.Zero(t, secondMetrics.dead.Load())
 }
 
 func TestInboxRegisterSerialisesConcurrentDeliveries(t *testing.T) {

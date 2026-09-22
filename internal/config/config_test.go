@@ -60,6 +60,7 @@ func TestDefaults(t *testing.T) {
 		{"OUTBOX_RETRY_BASE", c.OutboxRetryBase, time.Second},
 		{"OUTBOX_RETRY_MAX", c.OutboxRetryMax, time.Minute},
 		{"OUTBOX_PUBLISH_TIMEOUT", c.OutboxPublishTimeout, 10 * time.Second},
+		{"OUTBOX_FINALIZE_TIMEOUT", c.OutboxFinalizeTimeout, 5 * time.Second},
 		{"OUTBOX_MAX_ATTEMPTS", c.OutboxMaxAttempts, 20},
 	}
 	for _, tc := range cases {
@@ -115,7 +116,8 @@ func TestRejectsWholeBatchBudgetOverflow(t *testing.T) {
 func TestOverrides(t *testing.T) {
 	t.Parallel()
 	c, err := config.Load(config.MapLookup(map[string]string{"HTTP_ADDR": ":9090", "SQS_CONSUMERS": "4", "OUTBOX_LEASE": "5s",
-		"INSTANCE_ID": "i-1", "LOG_LEVEL": "", "CONFLICT_RETRIES": "0", "OUTBOX_PUBLISH_TIMEOUT": "3s"}))
+		"INSTANCE_ID": "i-1", "LOG_LEVEL": "", "CONFLICT_RETRIES": "0", "OUTBOX_PUBLISH_TIMEOUT": "2s",
+		"OUTBOX_FINALIZE_TIMEOUT": "2s"}))
 	require.NoError(t, err)
 	assert.Equal(t, ":9090", c.HTTPAddr)
 	assert.Equal(t, 4, c.SQSConsumers)
@@ -123,7 +125,35 @@ func TestOverrides(t *testing.T) {
 	assert.Equal(t, "i-1", c.InstanceID)
 	assert.Equal(t, "info", c.LogLevel, "empty values fall back to defaults")
 	assert.Zero(t, c.ConflictRetries, "zero retries is allowed")
-	assert.Equal(t, 3*time.Second, c.OutboxPublishTimeout)
+	assert.Equal(t, 2*time.Second, c.OutboxPublishTimeout)
+	assert.Equal(t, 2*time.Second, c.OutboxFinalizeTimeout)
+}
+
+func TestOutboxBudgetsFitOneLeaseWithoutBatchMultiplier(t *testing.T) {
+	t.Parallel()
+	_, err := config.Load(config.MapLookup(map[string]string{
+		"OUTBOX_BATCH": "1000", "OUTBOX_PUBLISH_TIMEOUT": "10s", "OUTBOX_FINALIZE_TIMEOUT": "5s", "OUTBOX_LEASE": "16s",
+	}))
+	require.NoError(t, err)
+}
+
+func TestRejectsOutboxBudgetThatDoesNotFitLease(t *testing.T) {
+	t.Parallel()
+	tests := map[string]map[string]string{
+		"equal to lease": {
+			"OUTBOX_PUBLISH_TIMEOUT": "10s", "OUTBOX_FINALIZE_TIMEOUT": "20s", "OUTBOX_LEASE": "30s",
+		},
+		"addition overflow": {
+			"OUTBOX_PUBLISH_TIMEOUT": "2562047h47m16.854775805s", "OUTBOX_FINALIZE_TIMEOUT": "2ns",
+			"OUTBOX_LEASE": "2562047h47m16.854775807s", "SHUTDOWN_TIMEOUT": "2562047h47m16.854775807s",
+		},
+	}
+	for name, values := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := config.Load(config.MapLookup(values))
+			require.ErrorContains(t, err, "OUTBOX_PUBLISH_TIMEOUT plus OUTBOX_FINALIZE_TIMEOUT")
+		})
+	}
 }
 
 func TestParseErrorsAreAggregated(t *testing.T) {
@@ -137,35 +167,36 @@ func TestParseErrorsAreAggregated(t *testing.T) {
 func TestValidation(t *testing.T) {
 	t.Parallel()
 	invalid := map[string]map[string]string{
-		"negative pool":             {"DB_MAX_CONNS": "-1"},
-		"no consumers":              {"SQS_CONSUMERS": "0"},
-		"batch too big":             {"SQS_MAX_MESSAGES": "11"},
-		"wait too long":             {"SQS_WAIT_TIME": "21s"},
-		"process >= visibility":     {"SQS_PROCESS_TIMEOUT": "30s"},
-		"pending base > max":        {"PENDING_BASE_DELAY": "2m"},
-		"zero pending interval":     {"PENDING_INTERVAL": "0s"},
-		"negative outbox interval":  {"OUTBOX_INTERVAL": "-1s"},
-		"zero lease":                {"OUTBOX_LEASE": "0s"},
-		"negative wait":             {"SQS_WAIT_TIME": "-5s"},
-		"zero sqs retry max":        {"SQS_RETRY_MAX": "0s"},
-		"negative outbox retry max": {"OUTBOX_RETRY_MAX": "-1s"},
-		"zero lock timeout":         {"DB_LOCK_TIMEOUT": "0s"},
-		"negative statement":        {"DB_STATEMENT_TIMEOUT": "-1s"},
-		"zero outbox attempts":      {"OUTBOX_MAX_ATTEMPTS": "0"},
-		"zero receive count":        {"SQS_MAX_RECEIVE_COUNT": "0"},
-		"negative conflict retries": {"CONFLICT_RETRIES": "-1"},
-		"bad log level":             {"LOG_LEVEL": "loud"},
-		"sqs retry base > max":      {"SQS_RETRY_BASE": "2m"},
-		"outbox retry base > max":   {"OUTBOX_RETRY_BASE": "2m"},
-		"visibility > 12h":          {"SQS_VISIBILITY_TIMEOUT": "13h"},
-		"sqs retry max > 12h":       {"SQS_RETRY_MAX": "13h"},
-		"shutdown <= process":       {"SHUTDOWN_TIMEOUT": "20s"},
-		"shutdown <= process + ack": {"SHUTDOWN_TIMEOUT": "25s"},
-		"shutdown <= publish":       {"SHUTDOWN_TIMEOUT": "29s", "OUTBOX_PUBLISH_TIMEOUT": "29s", "OUTBOX_LEASE": "40s"},
-		"zero publish timeout":      {"OUTBOX_PUBLISH_TIMEOUT": "0s"},
-		"publish timeout >= lease":  {"OUTBOX_PUBLISH_TIMEOUT": "30s"},
-		"process + ack >= visible":  {"SQS_ACK_TIMEOUT": "10s"},
-		"zero ack timeout":          {"SQS_ACK_TIMEOUT": "0s"},
+		"negative pool":                  {"DB_MAX_CONNS": "-1"},
+		"no consumers":                   {"SQS_CONSUMERS": "0"},
+		"batch too big":                  {"SQS_MAX_MESSAGES": "11"},
+		"wait too long":                  {"SQS_WAIT_TIME": "21s"},
+		"process >= visibility":          {"SQS_PROCESS_TIMEOUT": "30s"},
+		"pending base > max":             {"PENDING_BASE_DELAY": "2m"},
+		"zero pending interval":          {"PENDING_INTERVAL": "0s"},
+		"negative outbox interval":       {"OUTBOX_INTERVAL": "-1s"},
+		"zero lease":                     {"OUTBOX_LEASE": "0s"},
+		"negative wait":                  {"SQS_WAIT_TIME": "-5s"},
+		"zero sqs retry max":             {"SQS_RETRY_MAX": "0s"},
+		"negative outbox retry max":      {"OUTBOX_RETRY_MAX": "-1s"},
+		"zero lock timeout":              {"DB_LOCK_TIMEOUT": "0s"},
+		"negative statement":             {"DB_STATEMENT_TIMEOUT": "-1s"},
+		"zero outbox attempts":           {"OUTBOX_MAX_ATTEMPTS": "0"},
+		"zero receive count":             {"SQS_MAX_RECEIVE_COUNT": "0"},
+		"negative conflict retries":      {"CONFLICT_RETRIES": "-1"},
+		"bad log level":                  {"LOG_LEVEL": "loud"},
+		"sqs retry base > max":           {"SQS_RETRY_BASE": "2m"},
+		"outbox retry base > max":        {"OUTBOX_RETRY_BASE": "2m"},
+		"visibility > 12h":               {"SQS_VISIBILITY_TIMEOUT": "13h"},
+		"sqs retry max > 12h":            {"SQS_RETRY_MAX": "13h"},
+		"shutdown <= process":            {"SHUTDOWN_TIMEOUT": "20s"},
+		"shutdown <= process + ack":      {"SHUTDOWN_TIMEOUT": "25s"},
+		"shutdown <= publish":            {"SHUTDOWN_TIMEOUT": "29s", "OUTBOX_PUBLISH_TIMEOUT": "29s", "OUTBOX_LEASE": "40s"},
+		"zero publish timeout":           {"OUTBOX_PUBLISH_TIMEOUT": "0s"},
+		"zero finalize timeout":          {"OUTBOX_FINALIZE_TIMEOUT": "0s"},
+		"publish plus finalize >= lease": {"OUTBOX_PUBLISH_TIMEOUT": "25s"},
+		"process + ack >= visible":       {"SQS_ACK_TIMEOUT": "10s"},
+		"zero ack timeout":               {"SQS_ACK_TIMEOUT": "0s"},
 	}
 	for name, values := range invalid {
 		_, err := config.Load(config.MapLookup(values))
