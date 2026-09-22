@@ -77,8 +77,9 @@ type ConsumerConfig struct {
 	// and exceed MaxMessages * (ProcessTimeout + AckTimeout), because this
 	// consumer handles a received batch serially.
 	VisibilityTimeout time.Duration
-	// ProcessTimeout bounds one message; it must stay below the visibility
-	// timeout so a message is never processed twice concurrently.
+	// ProcessTimeout bounds one message. Together with AckTimeout and
+	// MaxMessages it forms the full-batch budget that VisibilityTimeout must
+	// exceed; the per-message relationship alone does not prevent overlap.
 	ProcessTimeout time.Duration
 	// AckTimeout bounds the broker follow-up of a message (delete, retry
 	// visibility change, DLQ copy). It is a budget of its own, so a message

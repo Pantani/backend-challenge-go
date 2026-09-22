@@ -237,106 +237,282 @@ func consumerFor(api sqsadapter.API, q sqsadapter.Queues, svc sqsadapter.Process
 	}, svc, observability.NewLogger(io.Discard, "error", "c"), testutil.NewMetrics())
 }
 
-type slowBatchProcessor struct {
-	headStarted chan struct{}
-	tailStarted chan struct{}
-	headDelay   time.Duration
-	calls       int
+type releaseGate struct {
+	once sync.Once
+	ch   chan struct{}
 }
 
-func (p *slowBatchProcessor) ConsumeMessage(ctx context.Context, _ app.InboundMessage) (app.ConsumeResult, error) {
-	p.calls++
-	if p.calls == 1 {
-		close(p.headStarted)
-		if err := sleepContext(ctx, p.headDelay); err != nil {
-			return app.ConsumeResult{}, err
-		}
-	} else {
-		close(p.tailStarted)
+func newReleaseGate() *releaseGate { return &releaseGate{ch: make(chan struct{})} }
+
+func (g *releaseGate) release() { g.once.Do(func() { close(g.ch) }) }
+
+type processObservation struct {
+	messageID string
+	duration  time.Duration
+	err       error
+}
+
+type gatedBatchProcessor struct {
+	mu       sync.Mutex
+	calls    int
+	gates    []*releaseGate
+	started  chan string
+	finished chan processObservation
+}
+
+func newGatedBatchProcessor(gates ...*releaseGate) *gatedBatchProcessor {
+	return &gatedBatchProcessor{
+		gates: gates, started: make(chan string, len(gates)), finished: make(chan processObservation, len(gates)),
 	}
-	return app.ConsumeResult{Duplicate: true}, nil
 }
 
-func sleepContext(ctx context.Context, delay time.Duration) error {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
+func (p *gatedBatchProcessor) ConsumeMessage(ctx context.Context, msg app.InboundMessage) (app.ConsumeResult, error) {
+	p.mu.Lock()
+	index := p.calls
+	p.calls++
+	p.mu.Unlock()
+	if index >= len(p.gates) {
+		return app.ConsumeResult{}, fmt.Errorf("unexpected batch message %q", msg.MessageID)
+	}
+	started := time.Now()
+	p.started <- msg.MessageID
+	var err error
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
+		err = ctx.Err()
+	case <-p.gates[index].ch:
 	}
+	p.finished <- processObservation{messageID: msg.MessageID, duration: time.Since(started), err: err}
+	return app.ConsumeResult{Duplicate: true}, err
 }
 
-type concurrentDeliveryProbe struct {
-	called chan struct{}
-	once   sync.Once
+type callProbe struct {
+	mu    sync.Mutex
+	calls []string
 }
 
-func (p *concurrentDeliveryProbe) ConsumeMessage(context.Context, app.InboundMessage) (app.ConsumeResult, error) {
-	p.once.Do(func() { close(p.called) })
+func (p *callProbe) ConsumeMessage(_ context.Context, msg app.InboundMessage) (app.ConsumeResult, error) {
+	p.mu.Lock()
+	p.calls = append(p.calls, msg.MessageID)
+	p.mu.Unlock()
 	return app.ConsumeResult{Duplicate: true}, nil
 }
 
-func waitClosed(t *testing.T, ch <-chan struct{}, timeout time.Duration, message string) {
+func (p *callProbe) messageIDs() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.calls)
+}
+
+type prefetchedAPI struct {
+	sqsadapter.API
+	mu     sync.Mutex
+	batch  *awssqs.ReceiveMessageOutput
+	served bool
+}
+
+func (a *prefetchedAPI) ReceiveMessage(ctx context.Context, _ *awssqs.ReceiveMessageInput, _ ...func(*awssqs.Options)) (*awssqs.ReceiveMessageOutput, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.served {
+		return nil, fmt.Errorf("prefetched batch already served")
+	}
+	a.served = true
+	return a.batch, nil
+}
+
+type receiveObservation struct {
+	messages int
+	err      error
+}
+
+type observedReceiveAPI struct {
+	sqsadapter.API
+	startedOnce sync.Once
+	started     chan struct{}
+	results     chan receiveObservation
+}
+
+func (a *observedReceiveAPI) ReceiveMessage(ctx context.Context, in *awssqs.ReceiveMessageInput, opts ...func(*awssqs.Options)) (*awssqs.ReceiveMessageOutput, error) {
+	a.startedOnce.Do(func() { close(a.started) })
+	out, err := a.API.ReceiveMessage(ctx, in, opts...)
+	observation := receiveObservation{err: err}
+	if out != nil {
+		observation.messages = len(out.Messages)
+	}
+	a.results <- observation
+	return out, err
+}
+
+func receiveFullBatch(ctx context.Context, api sqsadapter.API, queue string, visibility int32, size int32) (*awssqs.ReceiveMessageOutput, time.Time, error) {
+	for {
+		out, err := api.ReceiveMessage(ctx, &awssqs.ReceiveMessageInput{
+			QueueUrl: aws.String(queue), MaxNumberOfMessages: size, WaitTimeSeconds: 1, VisibilityTimeout: visibility,
+			MessageSystemAttributeNames: []types.MessageSystemAttributeName{
+				types.MessageSystemAttributeNameApproximateReceiveCount, types.MessageSystemAttributeNameSenderId,
+				types.MessageSystemAttributeNameMessageGroupId, types.MessageSystemAttributeNameMessageDeduplicationId,
+			},
+		})
+		if err != nil {
+			return nil, time.Time{}, fmt.Errorf("receive exact batch: %w", err)
+		}
+		if int32(len(out.Messages)) == size {
+			return out, time.Now(), nil
+		}
+		if err := releaseBatch(ctx, api, queue, out.Messages); err != nil {
+			return nil, time.Time{}, err
+		}
+	}
+}
+
+func releaseBatch(ctx context.Context, api sqsadapter.API, queue string, messages []types.Message) error {
+	for _, message := range messages {
+		_, err := api.ChangeMessageVisibility(ctx, &awssqs.ChangeMessageVisibilityInput{
+			QueueUrl: aws.String(queue), ReceiptHandle: message.ReceiptHandle, VisibilityTimeout: 0,
+		})
+		if err != nil {
+			return fmt.Errorf("release partial batch: %w", err)
+		}
+	}
+	return nil
+}
+
+func await[T any](t *testing.T, ch <-chan T, timeout time.Duration, message string) T {
 	t.Helper()
 	select {
-	case <-ch:
+	case value := <-ch:
+		return value
 	case <-time.After(timeout):
 		t.Fatal(message)
+		var zero T
+		return zero
+	}
+}
+
+func pollOnce(ctx context.Context, consumer *sqsadapter.Consumer) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		consumer.PollOnce(ctx)
+		close(done)
+	}()
+	return done
+}
+
+func runConsumer(ctx context.Context, consumer *sqsadapter.Consumer) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		consumer.Run(ctx)
+		close(done)
+	}()
+	return done
+}
+
+func receiveTotals(t *testing.T, observations <-chan receiveObservation) (int, int) {
+	t.Helper()
+	calls, messages := 0, 0
+	for {
+		select {
+		case observation := <-observations:
+			calls++
+			messages += observation.messages
+			if observation.err != nil {
+				assert.ErrorIs(t, observation.err, context.Canceled)
+			}
+		default:
+			return calls, messages
+		}
+	}
+}
+
+func waitUntil(deadline time.Time) {
+	if delay := time.Until(deadline); delay > 0 {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		<-timer.C
 	}
 }
 
 func TestVisibilityProtectsSlowBatchFromSecondConsumer(t *testing.T) {
 	t.Parallel()
+	const (
+		visibility    = 4 * time.Second
+		processBudget = 1900 * time.Millisecond
+		ackBudget     = 50 * time.Millisecond
+	)
 	s := newServices(t, defaultPolicy)
-	api, q, _ := provisionQueues(t, 5)
+	api, q, _ := provisionQueues(t, 20)
 	_, err := api.SetQueueAttributes(context.Background(), &awssqs.SetQueueAttributesInput{
-		QueueUrl: aws.String(q.Input), Attributes: map[string]string{string(types.QueueAttributeNameVisibilityTimeout): "3"},
+		QueueUrl: aws.String(q.Input),
+		Attributes: map[string]string{
+			string(types.QueueAttributeNameVisibilityTimeout): strconv.Itoa(int(visibility.Seconds())),
+		},
 	})
 	require.NoError(t, err)
 	w := s.openWallet(t, "100.00")
-	for i := range 2 {
-		messageID := fmt.Sprintf("%sslow-batch-%d", s.prefix, i)
+	expectedIDs := []string{s.prefix + "slow-batch-0", s.prefix + "slow-batch-1"}
+	for i, messageID := range expectedIDs {
 		sendMessage(t, api, q, messageID, s.input(w, "provider-a", fmt.Sprintf("slow-batch-%d", i), "BET", "1.00", ""))
 	}
 
-	first := &slowBatchProcessor{
-		headStarted: make(chan struct{}), tailStarted: make(chan struct{}), headDelay: 750 * time.Millisecond,
-	}
+	receiveCtx, stopReceive := context.WithTimeout(context.Background(), 10*time.Second)
+	defer stopReceive()
+	batch, receivedAt, err := receiveFullBatch(receiveCtx, api, q.Input, int32(visibility.Seconds()), 2)
+	require.NoError(t, err)
+	require.Len(t, batch.Messages, 2)
+
+	headGate, tailGate := newReleaseGate(), newReleaseGate()
+	t.Cleanup(headGate.release)
+	t.Cleanup(tailGate.release)
+	processorA := newGatedBatchProcessor(headGate, tailGate)
 	consumerConfig := sqsadapter.ConsumerConfig{
-		Name: "slow-batch", QueueURL: q.Input, DLQURL: q.DLQ, MaxMessages: 2, WaitTime: time.Second,
-		VisibilityTimeout: 3 * time.Second, ProcessTimeout: time.Second, AckTimeout: 100 * time.Millisecond,
+		Name: "slow-batch", QueueURL: q.Input, DLQURL: q.DLQ, MaxMessages: 2, WaitTime: 3 * time.Second,
+		VisibilityTimeout: visibility, ProcessTimeout: processBudget, AckTimeout: ackBudget,
 		RetryBase: time.Second, RetryMax: time.Second, Senders: localSenders,
 	}
 	logger := observability.NewLogger(io.Discard, "error", "slow-batch")
-	consumerA := sqsadapter.NewConsumer(api, consumerConfig, first, logger, testutil.NewMetrics())
-	firstDone := make(chan struct{})
-	go func() {
-		consumerA.PollOnce(context.Background())
-		close(firstDone)
-	}()
+	consumerA := sqsadapter.NewConsumer(&prefetchedAPI{API: api, batch: batch}, consumerConfig, processorA, logger, testutil.NewMetrics())
+	ctxA, cancelA := context.WithCancel(context.Background())
+	t.Cleanup(cancelA)
+	doneA := pollOnce(ctxA, consumerA)
+	assert.Equal(t, expectedIDs[0], await(t, processorA.started, time.Second, "consumer A did not start the batch head"))
 
-	waitClosed(t, first.headStarted, 3*time.Second, "first consumer did not start the batch head")
+	processorB := &callProbe{}
+	observedB := &observedReceiveAPI{API: api, started: make(chan struct{}), results: make(chan receiveObservation, 128)}
+	consumerBConfig := consumerConfig
+	consumerBConfig.WaitTime = 0
+	consumerBConfig.RetryBase = 50 * time.Millisecond
+	consumerB := sqsadapter.NewConsumer(observedB, consumerBConfig, processorB, logger, testutil.NewMetrics())
+	ctxB, cancelB := context.WithCancel(context.Background())
+	t.Cleanup(cancelB)
+	doneB := runConsumer(ctxB, consumerB)
+	await(t, observedB.started, time.Second, "consumer B did not start receiving while A was blocked")
 
-	probe := &concurrentDeliveryProbe{called: make(chan struct{})}
-	consumerB := sqsadapter.NewConsumer(api, consumerConfig, probe, logger, testutil.NewMetrics())
-	secondDone := make(chan struct{})
-	go func() {
-		consumerB.PollOnce(context.Background())
-		close(secondDone)
-	}()
+	waitUntil(receivedAt.Add(1700 * time.Millisecond))
+	headGate.release()
+	head := await(t, processorA.finished, time.Second, "consumer A did not finish the batch head")
+	assert.NoError(t, head.err)
+	assert.Equal(t, expectedIDs[0], head.messageID)
+	assert.Less(t, head.duration, processBudget)
+	assert.Equal(t, expectedIDs[1], await(t, processorA.started, time.Second, "consumer A did not start the batch tail"))
 
-	select {
-	case <-probe.called:
-		t.Fatal("second consumer received the batch tail before the first consumer reached it")
-	case <-first.tailStarted:
-	case <-time.After(3 * time.Second):
-		t.Fatal("first consumer did not receive both messages in one batch")
-	}
-	waitClosed(t, firstDone, 3*time.Second, "first consumer did not finish the batch")
-	waitClosed(t, secondDone, 3*time.Second, "second consumer did not finish polling")
-	assert.Equal(t, 2, first.calls)
+	waitUntil(receivedAt.Add(3500 * time.Millisecond))
+	cancelB()
+	await(t, doneB, time.Second, "consumer B did not stop after cancellation")
+	receiveCalls, receivedMessages := receiveTotals(t, observedB.results)
+
+	tailGate.release()
+	tail := await(t, processorA.finished, time.Second, "consumer A did not finish the batch tail")
+	await(t, doneA, time.Second, "consumer A did not finish the exact batch")
+	assert.NoError(t, tail.err)
+	assert.Equal(t, expectedIDs[1], tail.messageID)
+	assert.Less(t, tail.duration, processBudget)
+	assert.Greater(t, time.Since(receivedAt), 2*time.Second)
+	assert.Positive(t, receiveCalls, "consumer B must poll while A owns the batch")
+	assert.Zero(t, receivedMessages, "consumer B must receive no message during A's protected batch")
+	assert.Empty(t, processorB.messageIDs(), "consumer B must receive no message during A's protected batch")
 }
 
 func sendMessage(t *testing.T, api sqsadapter.API, q sqsadapter.Queues, messageID string, in app.SubmitInput) {
