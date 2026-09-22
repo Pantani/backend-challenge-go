@@ -1,6 +1,8 @@
 DROP TABLE IF EXISTS outbox_events;
 DROP FUNCTION IF EXISTS outbox_events_guard();
 DROP TABLE IF EXISTS inbox_messages;
+DROP TRIGGER IF EXISTS ledger_entries_match_wallet ON ledger_entries;
+DROP FUNCTION IF EXISTS ledger_entries_match_wallet();
 DROP TABLE IF EXISTS ledger_entries;
 DROP FUNCTION IF EXISTS ledger_entries_chain();
 DROP FUNCTION IF EXISTS ledger_entries_immutable();

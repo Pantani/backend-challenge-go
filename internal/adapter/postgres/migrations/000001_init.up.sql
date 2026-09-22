@@ -15,7 +15,7 @@ CREATE TABLE wager_transactions (
     id                                UUID PRIMARY KEY,
     origin                            TEXT        NOT NULL CHECK (origin IN ('EXTERNAL', 'INTERNAL')),
     kind                              TEXT        NOT NULL CHECK (kind IN ('OPENING', 'BET', 'WIN', 'LOSS', 'REFUND', 'ROLLBACK')),
-    status                            TEXT        NOT NULL CHECK (status IN ('PENDING', 'PENDING_REFERENCE', 'PROCESSED', 'REJECTED', 'FAILED')),
+    status                            TEXT        NOT NULL CHECK (status IN ('PENDING_REFERENCE', 'PROCESSED', 'REJECTED', 'FAILED')),
     wallet_id                         UUID        NOT NULL REFERENCES wallets (id),
     player_id                         UUID        NOT NULL,
     amount_minor                      BIGINT      NOT NULL,
@@ -26,10 +26,11 @@ CREATE TABLE wager_transactions (
     payload_hash                      TEXT,
     round_id                          TEXT,
     game_id                           TEXT,
-    reference_external_transaction_id TEXT,
+    reference_external_transaction_id TEXT CHECK (reference_external_transaction_id IS NULL OR reference_external_transaction_id <> ''),
     reference_transaction_id          UUID REFERENCES wager_transactions (id),
     failure_code                      TEXT,
     result_balance_minor              BIGINT CHECK (result_balance_minor >= 0),
+    result_currency                   CHAR(3),
     attempts                          INTEGER     NOT NULL DEFAULT 0 CHECK (attempts >= 0),
     next_attempt_at                   TIMESTAMPTZ,
     correlation_id                    TEXT        NOT NULL DEFAULT '',
@@ -58,6 +59,10 @@ CREATE TABLE wager_transactions (
     ),
     CONSTRAINT wager_transactions_processed_result CHECK (
         status <> 'PROCESSED' OR result_balance_minor IS NOT NULL
+    ),
+    CONSTRAINT wager_transactions_result_currency CHECK (
+        (result_balance_minor IS NULL) = (result_currency IS NULL)
+        AND (result_currency IS NULL OR result_currency ~ '^[A-Z]{3}$')
     ),
     CONSTRAINT wager_transactions_pending_schedule CHECK (
         status <> 'PENDING_REFERENCE' OR next_attempt_at IS NOT NULL
@@ -222,6 +227,30 @@ CREATE CONSTRAINT TRIGGER wallets_match_ledger
     DEFERRABLE INITIALLY DEFERRED
     FOR EACH ROW EXECUTE FUNCTION wallets_match_ledger();
 
+-- A ledger entry must have the matching wallet balance by commit time.
+CREATE FUNCTION ledger_entries_match_wallet() RETURNS trigger
+    LANGUAGE plpgsql AS
+$$
+DECLARE
+    stored BIGINT;
+    last_after BIGINT;
+BEGIN
+    SELECT balance_minor INTO stored FROM wallets WHERE id = NEW.wallet_id;
+    SELECT balance_after_minor INTO last_after FROM ledger_entries
+    WHERE wallet_id = NEW.wallet_id ORDER BY seq DESC LIMIT 1;
+    IF stored IS DISTINCT FROM last_after THEN
+        RAISE EXCEPTION 'ledger of wallet % ends at % but the stored balance is %', NEW.wallet_id, last_after, stored
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+CREATE CONSTRAINT TRIGGER ledger_entries_match_wallet
+    AFTER INSERT ON ledger_entries
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION ledger_entries_match_wallet();
+
 -- Inbox: durable deduplication of consumed messages.
 CREATE TABLE inbox_messages (
     consumer_name  TEXT        NOT NULL,
@@ -248,11 +277,21 @@ CREATE TABLE outbox_events (
     next_attempt_at TIMESTAMPTZ NOT NULL,
     locked_by       TEXT,
     locked_until    TIMESTAMPTZ,
+    claim_id        UUID,
     published_at    TIMESTAMPTZ,
-    last_error      TEXT
+    last_error      TEXT,
+    dead_lettered_at TIMESTAMPTZ,
+    CONSTRAINT outbox_events_single_outcome CHECK (published_at IS NULL OR dead_lettered_at IS NULL),
+    CONSTRAINT outbox_events_lease_triplet CHECK (
+        (locked_by IS NULL) = (locked_until IS NULL)
+        AND (locked_by IS NULL) = (claim_id IS NULL)
+    )
 );
 
-CREATE INDEX outbox_events_unpublished ON outbox_events (next_attempt_at, seq) WHERE published_at IS NULL;
+CREATE INDEX outbox_events_unpublished ON outbox_events (next_attempt_at, seq)
+    WHERE published_at IS NULL AND dead_lettered_at IS NULL;
+CREATE INDEX outbox_events_partition_unpublished ON outbox_events (partition_key, seq)
+    WHERE published_at IS NULL AND dead_lettered_at IS NULL;
 
 CREATE FUNCTION outbox_events_guard() RETURNS trigger
     LANGUAGE plpgsql AS
