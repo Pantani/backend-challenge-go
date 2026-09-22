@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"strconv"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
@@ -12,49 +13,100 @@ import (
 
 	"github.com/Pantani/backend-challenge-go/internal/app"
 	"github.com/Pantani/backend-challenge-go/internal/observability"
+	"github.com/Pantani/backend-challenge-go/internal/worker"
 )
 
-// Consumer outcomes, used as metric labels.
+// Consumer outcomes, the label set of ConsumerMetrics.SQSMessage.
 const (
+	// OutcomeProcessed is a message whose operation committed.
 	OutcomeProcessed = "processed"
+	// OutcomeDuplicate is a redelivery absorbed by the inbox.
 	OutcomeDuplicate = "duplicate"
-	OutcomeRetry     = "retry"
-	OutcomeDLQ       = "dlq"
-	OutcomeReleased  = "released"
+	// OutcomeRetry is a transient failure left for redelivery with backoff.
+	OutcomeRetry = "retry"
+	// OutcomeDLQ is an invalid message or permanent failure copied to the DLQ.
+	OutcomeDLQ = "dlq"
+	// OutcomeReleased is a message made visible again without processing
+	// (shutdown, or the tail of a group whose head was retried).
+	OutcomeReleased = "released"
+)
+
+// Default budgets applied when the configuration leaves them at zero.
+const (
+	// DefaultAckTimeout bounds the broker follow-up of one message (delete,
+	// visibility change, DLQ copy).
+	DefaultAckTimeout = 5 * time.Second
+	// deadLetterGroup is the DLQ MessageGroupId of messages without one.
+	deadLetterGroup = "dead-letters"
+	// failureReasonLimit caps the failureReason attribute copied to the DLQ.
+	failureReasonLimit = 256
 )
 
 // Processor handles a decoded message (app.WagerService).
 type Processor interface {
+	// ConsumeMessage runs the operation carried by msg exactly once per
+	// (consumer, messageId) through the inbox. A transient error
+	// (app.IsTransient) leaves the message for a retry; any other error
+	// sends it to the DLQ.
 	ConsumeMessage(ctx context.Context, msg app.InboundMessage) (app.ConsumeResult, error)
 }
 
 // ConsumerMetrics counts consumed messages.
 type ConsumerMetrics interface {
+	// SQSMessage counts one message by outcome: one of OutcomeProcessed,
+	// OutcomeDuplicate, OutcomeRetry, OutcomeDLQ or OutcomeReleased.
 	SQSMessage(outcome string)
 }
 
 // ConsumerConfig configures the consumer.
 type ConsumerConfig struct {
-	Name              string
-	QueueURL          string
-	DLQURL            string
-	MaxMessages       int32
-	WaitTime          time.Duration
+	// Name is the inbox consumer_name: the deduplication scope of messageId.
+	Name string
+	// QueueURL is the FIFO input queue; DLQURL its dead-letter queue.
+	QueueURL string
+	DLQURL   string
+	// MaxMessages is the receive batch size (1..10, an SQS limit).
+	MaxMessages int32
+	// WaitTime is the long-poll duration (0..20s). With 0 an empty receive
+	// is followed by a RetryBase pause instead of an immediate re-poll.
+	WaitTime time.Duration
+	// VisibilityTimeout overrides the queue attribute for every receive. It
+	// must agree with the provisioned queue value (SQS_VISIBILITY_TIMEOUT)
+	// and exceed ProcessTimeout + AckTimeout so a message is never processed
+	// twice concurrently.
 	VisibilityTimeout time.Duration
 	// ProcessTimeout bounds one message; it must stay below the visibility
 	// timeout so a message is never processed twice concurrently.
 	ProcessTimeout time.Duration
-	RetryBase      time.Duration
-	RetryMax       time.Duration
+	// AckTimeout bounds the broker follow-up of a message (delete, retry
+	// visibility change, DLQ copy). It is a budget of its own, so a message
+	// that exhausted ProcessTimeout still gets its backoff applied. Zero
+	// means DefaultAckTimeout.
+	AckTimeout time.Duration
+	// RetryBase is the visibility delay after the first transient failure;
+	// it doubles with the receive count (app.Backoff) up to RetryMax, which
+	// must not exceed the SQS maximum of 12h.
+	RetryBase time.Duration
+	RetryMax  time.Duration
 	// Senders binds broker identities to the providers they may act for.
 	Senders SenderPolicy
+}
+
+// ackTimeout returns the configured ack budget or its default.
+func (c ConsumerConfig) ackTimeout() time.Duration {
+	if c.AckTimeout > 0 {
+		return c.AckTimeout
+	}
+	return DefaultAckTimeout
 }
 
 // Consumer polls the FIFO input queue. A message is deleted only after its
 // handling committed; transient failures are retried with exponential
 // backoff through the visibility timeout, and after maxReceiveCount the
 // queue redrive policy moves the message to the DLQ. Invalid messages and
-// permanent errors go to the DLQ immediately.
+// permanent errors go to the DLQ immediately. When a message is left in the
+// queue (retry, or a failed DLQ copy), the rest of its MessageGroupId in the
+// batch is released unprocessed so the group is redelivered in order.
 type Consumer struct {
 	api     API
 	cfg     ConsumerConfig
@@ -69,15 +121,18 @@ func NewConsumer(api API, cfg ConsumerConfig, proc Processor, logger *slog.Logge
 }
 
 // Run polls until ctx is cancelled (SIGTERM): it then stops fetching,
-// finishes the message in progress within ProcessTimeout and releases the
-// visibility of the messages it had not started.
+// finishes the message in progress within ProcessTimeout plus AckTimeout
+// (the broker follow-up has its own budget, detached from ctx) and releases
+// the visibility of the messages it had not started.
 func (c *Consumer) Run(ctx context.Context) {
 	for ctx.Err() == nil {
 		c.PollOnce(ctx)
 	}
 }
 
-// PollOnce receives and handles one batch.
+// PollOnce receives and handles one batch. It is exported for tests; Run is
+// the loop. Without long polling (WaitTime 0) an empty receive pauses for
+// RetryBase so an idle consumer does not spin.
 func (c *Consumer) PollOnce(ctx context.Context) {
 	out, err := c.api.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
 		QueueUrl:            aws.String(c.cfg.QueueURL),
@@ -93,13 +148,17 @@ func (c *Consumer) PollOnce(ctx context.Context) {
 		c.receiveFailed(ctx, err)
 		return
 	}
+	if len(out.Messages) == 0 && c.cfg.WaitTime <= 0 {
+		worker.Sleep(ctx, c.cfg.RetryBase)
+		return
+	}
 	c.process(ctx, out.Messages)
 }
 
 // process handles a batch in order. A batch can carry several messages of
 // the same MessageGroupId (the in-order tail of a wallet): once a message is
-// retried, the rest of its group is released instead of processed, so the
-// group is redelivered in order after the retried head.
+// left in the queue, the rest of its group is released instead of processed,
+// so the group is redelivered in order after its head.
 func (c *Consumer) process(ctx context.Context, msgs []types.Message) {
 	blocked := map[string]bool{}
 	for i, m := range msgs {
@@ -112,7 +171,7 @@ func (c *Consumer) process(ctx context.Context, msgs []types.Message) {
 }
 
 func (c *Consumer) step(ctx context.Context, m types.Message, blocked map[string]bool) {
-	group := m.Attributes[string(types.MessageSystemAttributeNameMessageGroupId)]
+	group := groupID(m)
 	if blocked[group] {
 		c.release(ctx, []types.Message{m})
 		return
@@ -127,43 +186,36 @@ func (c *Consumer) receiveFailed(ctx context.Context, err error) {
 		return
 	}
 	c.logger.WarnContext(ctx, "sqs receive failed", "error", err)
-	sleep(ctx, c.cfg.RetryBase)
+	worker.Sleep(ctx, c.cfg.RetryBase)
 }
 
-func sleep(ctx context.Context, d time.Duration) {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-	case <-t.C:
-	}
-}
-
-// handle runs detached from the shutdown signal so the message in progress
-// completes (or times out) instead of being aborted mid-way. It reports false
-// when the message was left for a retry.
+// handle processes one message detached from the shutdown signal so the
+// message in progress completes (or times out) instead of being aborted
+// mid-way. Processing runs within ProcessTimeout; the broker follow-up gets
+// its own AckTimeout budget so a processing deadline never skips the ack,
+// the retry backoff or the DLQ copy. It reports false when the message was
+// left in the queue (retry or failed DLQ copy) so its group tail is released.
 func (c *Consumer) handle(parent context.Context, m types.Message) bool {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), c.cfg.ProcessTimeout)
-	defer cancel()
-	ctx = observability.WithAttrs(ctx, slog.String("sqsMessageId", aws.ToString(m.MessageId)))
+	ctx := observability.WithAttrs(parent, slog.String("sqsMessageId", aws.ToString(m.MessageId)))
 	msg, err := c.decode(m)
 	if err != nil {
-		c.deadLetter(ctx, m, err)
-		return true
+		return c.deadLetter(ctx, m, err)
 	}
 	ctx = observability.WithAttrs(ctx, slog.String("messageId", msg.MessageID), slog.String("correlationId", msg.MessageID),
 		slog.String("providerId", msg.Command.ProviderID), slog.String("walletId", msg.Command.WalletID.String()))
-	res, err := c.proc.ConsumeMessage(ctx, msg)
+	procCtx, cancel := worker.Detach(ctx, c.cfg.ProcessTimeout)
+	defer cancel()
+	res, err := c.proc.ConsumeMessage(procCtx, msg)
 	switch {
 	case err == nil:
 		c.ack(ctx, m, res)
+		return true
 	case app.IsTransient(err):
 		c.retry(ctx, m, err)
 		return false
 	default:
-		c.deadLetter(ctx, m, err)
+		return c.deadLetter(ctx, m, err)
 	}
-	return true
 }
 
 // decode validates the message and binds its providerId to the sender.
@@ -176,7 +228,10 @@ func (c *Consumer) decode(m types.Message) (app.InboundMessage, error) {
 	return msg, c.cfg.Senders.Authorize(sender, msg.Command.ProviderID)
 }
 
-func (c *Consumer) ack(ctx context.Context, m types.Message, res app.ConsumeResult) {
+// ack deletes a handled message within the ack budget.
+func (c *Consumer) ack(parent context.Context, m types.Message, res app.ConsumeResult) {
+	ctx, cancel := worker.Detach(parent, c.cfg.ackTimeout())
+	defer cancel()
 	outcome := OutcomeProcessed
 	if res.Duplicate {
 		outcome = OutcomeDuplicate
@@ -198,21 +253,33 @@ func (c *Consumer) delete(ctx context.Context, m types.Message) {
 
 // retry hides the message for an exponential backoff based on its receive
 // count; SQS redrives it to the DLQ after maxReceiveCount receives.
-func (c *Consumer) retry(ctx context.Context, m types.Message, cause error) {
+func (c *Consumer) retry(parent context.Context, m types.Message, cause error) {
+	ctx, cancel := worker.Detach(parent, c.cfg.ackTimeout())
+	defer cancel()
 	delay := c.backoff(receiveCount(m))
 	c.logger.WarnContext(ctx, "sqs message will be retried", "error", cause, "delaySeconds", int(delay.Seconds()))
 	c.metrics.SQSMessage(OutcomeRetry)
 	c.changeVisibility(ctx, m, delay)
 }
 
+// backoff is the visibility delay for the count-th receive: RetryBase on
+// the first, doubling afterwards up to RetryMax.
 func (c *Consumer) backoff(count int) time.Duration {
-	delay := c.cfg.RetryBase << min(max(count-1, 0), 16)
-	return min(delay, c.cfg.RetryMax)
+	return app.Backoff(c.cfg.RetryBase, c.cfg.RetryMax, count-1)
 }
 
+// receiveCount reads ApproximateReceiveCount; a missing or malformed value
+// counts as the first receive.
 func receiveCount(m types.Message) int {
-	n, _ := strconv.Atoi(m.Attributes[string(types.MessageSystemAttributeNameApproximateReceiveCount)])
+	n, err := strconv.Atoi(m.Attributes[string(types.MessageSystemAttributeNameApproximateReceiveCount)])
+	if err != nil || n < 1 {
+		return 1
+	}
 	return n
+}
+
+func groupID(m types.Message) string {
+	return m.Attributes[string(types.MessageSystemAttributeNameMessageGroupId)]
 }
 
 func (c *Consumer) changeVisibility(ctx context.Context, m types.Message, d time.Duration) {
@@ -224,71 +291,56 @@ func (c *Consumer) changeVisibility(ctx context.Context, m types.Message, d time
 	}
 }
 
-// deadLetter copies the message to the DLQ with the failure reason, then
-// removes it from the input queue. If the copy fails the message stays and
-// the redrive policy eventually moves it.
-func (c *Consumer) deadLetter(ctx context.Context, m types.Message, cause error) {
+// deadLetter copies the message to the DLQ with the failure reason, keeping
+// its MessageGroupId (so a DLQ replay preserves the wallet order), then
+// removes it from the input queue. It reports whether the message left the
+// input queue: if the copy fails the message stays, its group tail is
+// released and the redrive policy eventually moves it.
+func (c *Consumer) deadLetter(parent context.Context, m types.Message, cause error) bool {
+	ctx, cancel := worker.Detach(parent, c.cfg.ackTimeout())
+	defer cancel()
 	c.logger.ErrorContext(ctx, "sqs message sent to DLQ", "error", cause)
+	group := groupID(m)
+	if group == "" {
+		group = deadLetterGroup
+	}
 	_, err := c.api.SendMessage(ctx, &sqs.SendMessageInput{
 		QueueUrl:               aws.String(c.cfg.DLQURL),
 		MessageBody:            m.Body,
-		MessageGroupId:         aws.String("dead-letters"),
+		MessageGroupId:         aws.String(group),
 		MessageDeduplicationId: m.MessageId,
 		MessageAttributes: map[string]types.MessageAttributeValue{
-			"failureReason": {DataType: aws.String("String"), StringValue: aws.String(truncate(cause.Error(), 256))},
+			"failureReason": {DataType: aws.String("String"), StringValue: aws.String(truncate(cause.Error(), failureReasonLimit))},
 		},
 	})
 	if err != nil {
 		c.logger.ErrorContext(ctx, "sqs DLQ send failed", "error", err)
-		return
+		return false
 	}
 	c.metrics.SQSMessage(OutcomeDLQ)
 	c.delete(ctx, m)
+	return true
 }
 
+// truncate cuts s to at most n bytes without splitting a multi-byte rune,
+// since SQS rejects attributes that are not valid UTF-8.
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n]
+	cut := n
+	for cut > 0 && !utf8.ValidString(s[:cut]) {
+		cut--
+	}
+	return s[:cut]
 }
 
 // release makes unstarted messages visible again for a safe redelivery.
 func (c *Consumer) release(parent context.Context, msgs []types.Message) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), c.cfg.ProcessTimeout)
+	ctx, cancel := worker.Detach(parent, c.cfg.ackTimeout())
 	defer cancel()
 	for _, m := range msgs {
 		c.metrics.SQSMessage(OutcomeReleased)
 		c.changeVisibility(ctx, m, 0)
 	}
-}
-
-// Publisher sends outbox events to the FIFO events queue. MessageGroupId is
-// the wallet id (per-wallet ordering) and MessageDeduplicationId the stable
-// eventId, so a republication inside the FIFO window is dropped by SQS and
-// later ones carry the same eventId for consumer-side deduplication.
-type Publisher struct {
-	api      API
-	queueURL string
-}
-
-// NewPublisher builds a publisher.
-func NewPublisher(api API, queueURL string) *Publisher {
-	return &Publisher{api: api, queueURL: queueURL}
-}
-
-// Publish implements the relay publisher.
-func (p *Publisher) Publish(ctx context.Context, m app.OutboxMessage) error {
-	_, err := p.api.SendMessage(ctx, &sqs.SendMessageInput{
-		QueueUrl:               aws.String(p.queueURL),
-		MessageBody:            aws.String(string(m.Payload)),
-		MessageGroupId:         aws.String(m.PartitionKey),
-		MessageDeduplicationId: aws.String(m.EventID.String()),
-		MessageAttributes: map[string]types.MessageAttributeValue{
-			"eventType":     {DataType: aws.String("String"), StringValue: aws.String(m.EventType)},
-			"eventId":       {DataType: aws.String("String"), StringValue: aws.String(m.EventID.String())},
-			"aggregateType": {DataType: aws.String("String"), StringValue: aws.String(m.AggregateType)},
-		},
-	})
-	return err
 }

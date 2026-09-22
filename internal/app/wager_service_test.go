@@ -43,6 +43,8 @@ func TestReplayReturnsOriginalResult(t *testing.T) {
 
 	replay := h.submit(t, w, op{ext: "t-1", kind: "BET", amount: "25.00"})
 	assert.True(t, replay.Replay)
+	assert.Equal(t, 1.0, h.counter(t, "wager_duplicates_total", map[string]string{"source": app.SourceHTTP}))
+	assert.Equal(t, 3.0, h.counter(t, "wager_transactions_total", map[string]string{"source": app.SourceHTTP}))
 	assert.Equal(t, first.Transaction.ID(), replay.Transaction.ID())
 	assert.Equal(t, "975.00", replay.Transaction.ResultBalance().Amount(), "balance observed originally")
 	assert.Equal(t, "875.00", h.balance(t, w))
@@ -193,6 +195,7 @@ func TestSubmitRetriesConflicts(t *testing.T) {
 	h.store.failOn("txs.create", app.ErrConflict)
 	res := h.submit(t, w, op{ext: "b", kind: "BET", amount: "1.00"})
 	assert.Equal(t, wager.StatusProcessed, res.Transaction.Status())
+	assert.Equal(t, 1.0, h.counter(t, "wallet_concurrency_conflicts_total", map[string]string{"operation": "submit"}))
 
 	h.store.failOn("txs.create", app.ErrConflict, app.ErrConflict, app.ErrConflict)
 	_, err := h.wagers.Submit(context.Background(), h.cmd(t, w, op{ext: "c", kind: "BET", amount: "1.00"}))
@@ -210,6 +213,8 @@ func TestSubmitRollsBackOnPersistenceFailure(t *testing.T) {
 		require.ErrorIs(t, err, errBoom, failing)
 		assert.Equal(t, "100.00", h.balance(t, w), failing)
 		assert.Equal(t, 1, h.store.ledgerCount(w.ID()), failing)
+		assert.Equal(t, 1, h.store.txCount(), "only the opening remains: %s", failing)
+		assert.Equal(t, 2, h.store.outboxCount(), "only the opening events remain: %s", failing)
 	}
 }
 

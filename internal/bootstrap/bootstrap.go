@@ -1,10 +1,13 @@
 // Package bootstrap composes the application with Uber Fx. It is the only
 // package that knows about Fx; domain, use cases and adapters stay free of it.
 //
-// Lifecycle order: resources are constructed first, so their OnStop hooks run
-// last. Workers start before the HTTP server, and the HTTP server stops first
-// (no new inputs), then the consumers and workers (in-flight work completes or
-// its visibility is released), and finally the database pool.
+// Lifecycle order follows hook registration: the pool registers its hooks
+// while it is constructed, the worker group's hooks are registered by the
+// startWorkers invoke (after every constructor) and the HTTP server's by the
+// startServer invoke, last. Stop runs the hooks in reverse: the HTTP server
+// stops first (no new inputs), then the consumers and workers (in-flight work
+// completes or its visibility is released), and finally the database pool
+// closes.
 package bootstrap
 
 import (
@@ -17,7 +20,6 @@ import (
 	"os"
 	"time"
 
-	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -35,8 +37,13 @@ import (
 	"github.com/Pantani/backend-challenge-go/internal/worker"
 )
 
-// connectTimeout bounds dependency lookups done while constructing the graph.
-const connectTimeout = 10 * time.Second
+const (
+	// queueResolveTimeout bounds the queue URL lookups done while the graph
+	// is constructed.
+	queueResolveTimeout = 10 * time.Second
+	// pingTimeout is the start budget for the database ping and the listen.
+	pingTimeout = 10 * time.Second
+)
 
 // LogOutput is where JSON logs are written.
 type LogOutput struct{ io.Writer }
@@ -45,16 +52,26 @@ type LogOutput struct{ io.Writer }
 func Options(cfg config.Config) fx.Option {
 	return fx.Options(
 		fx.Supply(cfg, LogOutput{os.Stdout}),
-		fx.WithLogger(func(l *slog.Logger) fxevent.Logger { return &fxevent.SlogLogger{Logger: l} }),
+		fx.WithLogger(newFxLogger),
 		ObservabilityModule, PostgresModule, SQSModule, AppModule, AuthModule, WorkerModule, HTTPModule,
 	)
 }
 
-// New builds the application. extra options (fx.Replace, fx.Decorate,
+// newFxLogger routes Fx events to the service logger at debug level, so
+// the graph construction is visible with LOG_LEVEL=debug only.
+func newFxLogger(l *slog.Logger) fxevent.Logger {
+	fl := &fxevent.SlogLogger{Logger: l}
+	fl.UseLogLevel(slog.LevelDebug)
+	return fl
+}
+
+// New builds the application. The start budget covers the database ping and
+// the listen (pingTimeout) plus the readiness timeout; the stop budget is the
+// configured shutdown timeout. extra options (fx.Replace, fx.Decorate,
 // fx.Populate) let tests adjust the graph.
 func New(cfg config.Config, extra ...fx.Option) *fx.App {
 	return fx.New(Options(cfg), fx.Options(extra...),
-		fx.StartTimeout(connectTimeout+cfg.ReadyTimeout), fx.StopTimeout(cfg.ShutdownTimeout))
+		fx.StartTimeout(pingTimeout+cfg.ReadyTimeout), fx.StopTimeout(cfg.ShutdownTimeout))
 }
 
 // ObservabilityModule provides logging and metrics.
@@ -69,6 +86,7 @@ var ObservabilityModule = fx.Module("observability",
 	),
 )
 
+// newRegistry is a private registry with the Go runtime and process collectors.
 func newRegistry() *prometheus.Registry {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
@@ -114,19 +132,30 @@ var SQSModule = fx.Module("sqs",
 	),
 )
 
-func newSQSClient(cfg config.Config) (sqsadapter.API, error) {
-	client, err := sqsadapter.NewClient(context.Background(), sqsadapter.ClientConfig{Region: cfg.AWSRegion, Endpoint: cfg.AWSEndpoint})
+// NewSQSClient builds the SQS client for the configured region and endpoint.
+// The CLI uses it too, so provisioning and serving share one setup.
+func NewSQSClient(ctx context.Context, cfg config.SQS) (sqsadapter.API, error) {
+	client, err := sqsadapter.NewClient(ctx, sqsadapter.ClientConfig{Region: cfg.AWSRegion, Endpoint: cfg.AWSEndpoint})
 	if err != nil {
 		return nil, err
 	}
 	return client, nil
 }
 
+// QueueNames returns the configured queue names.
+func QueueNames(cfg config.SQS) sqsadapter.QueueNames {
+	return sqsadapter.QueueNames{Input: cfg.SQSInputQueue, DLQ: cfg.SQSDLQ, Events: cfg.SQSEventsQueue}
+}
+
+func newSQSClient(cfg config.Config) (sqsadapter.API, error) {
+	return NewSQSClient(context.Background(), cfg.SQS)
+}
+
 // newQueues resolves the queue URLs; missing queues fail the start.
 func newQueues(api sqsadapter.API, cfg config.Config) (sqsadapter.Queues, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), queueResolveTimeout)
 	defer cancel()
-	return sqsadapter.ResolveQueues(ctx, api, sqsadapter.QueueNames{Input: cfg.SQSInputQueue, DLQ: cfg.SQSDLQ, Events: cfg.SQSEventsQueue})
+	return sqsadapter.ResolveQueues(ctx, api, QueueNames(cfg.SQS))
 }
 
 func newPublisher(api sqsadapter.API, q sqsadapter.Queues) *sqsadapter.Publisher {
@@ -141,7 +170,7 @@ func newConsumer(api sqsadapter.API, q sqsadapter.Queues, cfg config.Config, svc
 	}
 	return sqsadapter.NewConsumer(api, sqsadapter.ConsumerConfig{
 		Name: cfg.SQSConsumerName, QueueURL: q.Input, DLQURL: q.DLQ, MaxMessages: int32(cfg.SQSMaxMessages),
-		WaitTime: cfg.SQSWaitTime, VisibilityTimeout: cfg.SQSVisibility, ProcessTimeout: cfg.SQSProcessTimeout,
+		WaitTime: cfg.SQSWaitTime, VisibilityTimeout: cfg.SQSVisibilityTimeout, ProcessTimeout: cfg.SQSProcessTimeout,
 		RetryBase: cfg.SQSRetryBase, RetryMax: cfg.SQSRetryMax, Senders: senders,
 	}, svc, logger, metrics), nil
 }
@@ -169,7 +198,7 @@ type serviceDeps struct {
 
 func newWagerService(d serviceDeps) *app.WagerService {
 	return app.NewWagerService(app.WagerDeps{
-		UoW: d.UoW, Queries: d.Queries, Clock: d.Clock, IDs: d.IDs, Metrics: d.Metrics, Logger: d.Logger,
+		Deps:            d.deps(),
 		ConflictRetries: d.Config.ConflictRetries,
 		Policy: app.PendingPolicy{BaseDelay: d.Config.PendingBaseDelay, MaxDelay: d.Config.PendingMaxDelay,
 			MaxAttempts: d.Config.PendingMaxAttempts, BatchSize: d.Config.PendingBatch},
@@ -177,9 +206,11 @@ func newWagerService(d serviceDeps) *app.WagerService {
 }
 
 func newWalletService(d serviceDeps) *app.WalletService {
-	return app.NewWalletService(app.WalletDeps{
-		UoW: d.UoW, Queries: d.Queries, Clock: d.Clock, IDs: d.IDs, Metrics: d.Metrics, Logger: d.Logger,
-	})
+	return app.NewWalletService(app.WalletDeps{Deps: d.deps()})
+}
+
+func (d serviceDeps) deps() app.Deps {
+	return app.Deps{UoW: d.UoW, Queries: d.Queries, Clock: d.Clock, IDs: d.IDs, Metrics: d.Metrics, Logger: d.Logger}
 }
 
 // AuthModule provides the OIDC token verifier.
@@ -196,18 +227,18 @@ var WorkerModule = fx.Module("worker",
 	fx.Invoke(startWorkers),
 )
 
-func newGroup(lc fx.Lifecycle, logger *slog.Logger) *worker.Group {
-	g := worker.NewGroup(context.Background(), logger)
-	lc.Append(fx.StopHook(g.Stop))
-	return g
+// newGroup registers no hook: startWorkers does, so the group stops before
+// the resources constructed earlier (the pool) are closed.
+func newGroup(logger *slog.Logger) *worker.Group {
+	return worker.NewGroup(context.Background(), logger)
 }
 
 func newRelay(store app.OutboxStore, pub worker.Publisher, clock app.Clock, cfg config.Config,
 	logger *slog.Logger, metrics *observability.Metrics) *worker.Relay {
 	return worker.NewRelay(store, pub, clock, worker.RelayConfig{
 		Owner: cfg.InstanceID, BatchSize: cfg.OutboxBatch, Lease: cfg.OutboxLease,
-		RetryBase: cfg.OutboxRetryBase, RetryMax: cfg.OutboxRetryMax, PublishTime: cfg.SQSProcessTimeout,
-		MaxAttempts: cfg.OutboxMaxTries,
+		RetryBase: cfg.OutboxRetryBase, RetryMax: cfg.OutboxRetryMax, PublishTime: cfg.OutboxPublishTimeout,
+		MaxAttempts: cfg.OutboxMaxAttempts,
 	}, logger, metrics)
 }
 
@@ -225,6 +256,9 @@ type workerDeps struct {
 	Config    config.Config
 }
 
+// startWorkers launches the loops on start and stops the group on stop. Both
+// hooks are appended here, after every constructor's, so the workers stop
+// before the pool closes.
 func startWorkers(d workerDeps) {
 	d.Lifecycle.Append(fx.StartHook(func() {
 		d.Group.Go("outbox-relay", func(ctx context.Context) { worker.Loop(ctx, d.Config.OutboxInterval, d.Relay.Tick) })
@@ -233,13 +267,22 @@ func startWorkers(d workerDeps) {
 			d.Group.Go(fmt.Sprintf("sqs-consumer-%d", i), d.Consumer.Run)
 		}
 	}))
+	d.Lifecycle.Append(fx.StopHook(d.Group.Stop))
 }
 
 // HTTPModule serves the API.
 var HTTPModule = fx.Module("http",
-	fx.Provide(newHandler, newServer, func() *Addr { return &Addr{} }),
+	fx.Provide(newHealthChecks, newHandler, newServer, func() *Addr { return &Addr{} }),
 	fx.Invoke(startServer),
 )
+
+// newHealthChecks are the readiness probes: the database and the input queue.
+func newHealthChecks(pool *pgxpool.Pool, api sqsadapter.API, q sqsadapter.Queues) []httpapi.HealthCheck {
+	return []httpapi.HealthCheck{
+		{Name: "postgres", Check: func(ctx context.Context) error { return postgres.Ping(ctx, pool) }},
+		{Name: "sqs", Check: sqsadapter.QueueCheck(api, q.Input)},
+	}
+}
 
 type handlerDeps struct {
 	fx.In
@@ -248,9 +291,7 @@ type handlerDeps struct {
 	Verifier httpapi.TokenVerifier
 	Metrics  *observability.Metrics
 	Registry *prometheus.Registry
-	Pool     *pgxpool.Pool
-	SQS      sqsadapter.API
-	Queues   sqsadapter.Queues
+	Checks   []httpapi.HealthCheck
 	Logger   *slog.Logger
 	Config   config.Config
 }
@@ -260,10 +301,7 @@ func newHandler(d handlerDeps) http.Handler {
 		Wallets: d.Wallets, Wagers: d.Wagers, Verifier: d.Verifier, Metrics: d.Metrics, Logger: d.Logger,
 		MetricsHandler: promhttp.HandlerFor(d.Registry, promhttp.HandlerOpts{}),
 		ReadyTimeout:   d.Config.ReadyTimeout,
-		Checks: []httpapi.HealthCheck{
-			{Name: "postgres", Check: func(ctx context.Context) error { return postgres.Ping(ctx, d.Pool) }},
-			{Name: "sqs", Check: sqsadapter.QueueCheck(d.SQS, d.Queues.Input)},
-		},
+		Checks:         d.Checks,
 	})
 }
 
@@ -287,6 +325,8 @@ type Addr struct{ value string }
 // String returns the listening address.
 func (a *Addr) String() string { return a.value }
 
+// startServer listens on start (the bound address is published through
+// Addr) and drains the connections on stop.
 func startServer(lc fx.Lifecycle, srv *http.Server, addr *Addr, logger *slog.Logger) {
 	lc.Append(fx.Hook{
 		OnStart: func(ctx context.Context) error {
@@ -305,6 +345,3 @@ func startServer(lc fx.Lifecycle, srv *http.Server, addr *Addr, logger *slog.Log
 		},
 	})
 }
-
-// ensure the concrete SQS client satisfies the port.
-var _ sqsadapter.API = (*awssqs.Client)(nil)

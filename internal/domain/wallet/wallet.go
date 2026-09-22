@@ -28,7 +28,7 @@ var (
 )
 
 // Wallet is the financial aggregate root. Its balance only changes through
-// Debit and Credit, which always produce the matching ledger entry.
+// Apply, which always produces the matching ledger entry.
 type Wallet struct {
 	id        uuid.UUID
 	playerID  uuid.UUID
@@ -60,7 +60,7 @@ func Open(p OpenParams) (*Wallet, *LedgerEntry, error) {
 	if p.InitialBalance.IsZero() {
 		return w, nil, nil
 	}
-	zero, _ := money.Zero(p.InitialBalance.Currency())
+	zero, _ := money.Zero(p.InitialBalance.Currency()) // currency already validated by validBalance
 	entry, err := NewLedgerEntry(LedgerEntryParams{
 		ID: p.OpeningEntryID, WalletID: p.ID, TransactionID: p.OpeningTxID, Direction: Credit,
 		Amount: p.InitialBalance, BalanceBefore: zero, BalanceAfter: p.InitialBalance, CreatedAt: now,
@@ -97,14 +97,31 @@ type Snapshot struct {
 
 // Rehydrate rebuilds a wallet from storage without replaying movements.
 func Rehydrate(s Snapshot) (*Wallet, error) {
-	if s.ID == uuid.Nil || s.PlayerID == uuid.Nil || s.Version < InitialVersion || s.CreatedAt.IsZero() {
-		return nil, fmt.Errorf("%w: invalid snapshot identity, version or timestamp", ErrInvalidWallet)
+	if err := s.validIdentity(); err != nil {
+		return nil, err
+	}
+	if err := s.validTimes(); err != nil {
+		return nil, err
 	}
 	if err := validBalance(s.Balance); err != nil {
 		return nil, err
 	}
 	return &Wallet{id: s.ID, playerID: s.PlayerID, balance: s.Balance, version: s.Version,
 		createdAt: s.CreatedAt.UTC(), updatedAt: s.UpdatedAt.UTC()}, nil
+}
+
+func (s Snapshot) validIdentity() error {
+	if s.ID == uuid.Nil || s.PlayerID == uuid.Nil || s.Version < InitialVersion {
+		return fmt.Errorf("%w: invalid snapshot identity or version", ErrInvalidWallet)
+	}
+	return nil
+}
+
+func (s Snapshot) validTimes() error {
+	if s.CreatedAt.IsZero() || s.UpdatedAt.IsZero() || s.UpdatedAt.Before(s.CreatedAt) {
+		return fmt.Errorf("%w: invalid snapshot timestamps", ErrInvalidWallet)
+	}
+	return nil
 }
 
 // Movement describes a single debit or credit applied to the wallet.
@@ -122,11 +139,7 @@ func (w *Wallet) Apply(m Movement) (LedgerEntry, error) {
 	if err := w.checkMovement(m); err != nil {
 		return LedgerEntry{}, err
 	}
-	delta := m.Amount
-	if m.Direction == Debit {
-		delta = delta.Neg()
-	}
-	after, err := w.balance.Add(delta)
+	after, err := w.balance.Add(m.Direction.signed(m.Amount))
 	if err != nil {
 		return LedgerEntry{}, err
 	}
@@ -156,7 +169,8 @@ func (w *Wallet) checkMovement(m Movement) error {
 	return nil
 }
 
-// CanDebit reports whether amount can be debited without going negative.
+// CanDebit reports whether amount can be debited without going negative. It
+// is false when amount is uninitialized or in another currency.
 func (w *Wallet) CanDebit(amount money.Money) bool {
 	cmp, err := w.balance.Cmp(amount)
 	return err == nil && cmp >= 0

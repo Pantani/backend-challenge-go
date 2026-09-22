@@ -6,25 +6,22 @@
 package e2e_test
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/stretchr/testify/require"
 
 	sqsadapter "github.com/Pantani/backend-challenge-go/internal/adapter/sqs"
+	"github.com/Pantani/backend-challenge-go/internal/testutil"
 	"github.com/Pantani/backend-challenge-go/test/testenv"
 )
 
@@ -121,28 +118,13 @@ type instance struct {
 	port int
 	cmd  *exec.Cmd
 	// logs is written by the exec copier goroutine while the process runs.
-	logs syncBuffer
-}
-
-// syncBuffer is a log sink safe for concurrent writes and reads.
-type syncBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (s *syncBuffer) Write(p []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.buf.Write(p)
-}
-
-func (s *syncBuffer) String() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.buf.String()
+	logs testutil.SyncBuffer
 }
 
 func (i *instance) base() string { return fmt.Sprintf("http://127.0.0.1:%d", i.port) }
+
+// client drives this instance with cached Keycloak tokens.
+func (i *instance) client() testenv.Client { return testenv.Client{Base: i.base(), Token: tokens.get} }
 
 func freePort(ctx context.Context) (int, error) {
 	l, err := (&net.ListenConfig{}).Listen(ctx, "tcp", "127.0.0.1:0")
@@ -244,40 +226,9 @@ func (c *tokenCache) get(client string) (string, error) {
 	return value, nil
 }
 
-type response struct {
-	status int
-	body   map[string]any
-}
-
 // call sends a request to one instance, failing the test on transport errors.
-// It must run on the test goroutine; concurrent code uses callE.
-func call(t *testing.T, inst *instance, method, path, client, body string, headers map[string]string) response {
+// It must run on the test goroutine; concurrent code uses inst.client().Do.
+func call(t *testing.T, inst *instance, method, path, client, body string, headers map[string]string) testenv.Response {
 	t.Helper()
-	res, err := callE(inst, method, path, client, body, headers)
-	require.NoError(t, err)
-	return res
-}
-
-// callE sends a request and returns transport errors instead of failing, so
-// it is safe from worker goroutines.
-func callE(inst *instance, method, path, client, body string, headers map[string]string) (response, error) {
-	tok, err := tokens.get(client)
-	if err != nil {
-		return response{}, err
-	}
-	req, err := http.NewRequestWithContext(context.Background(), method, inst.base()+path, strings.NewReader(body))
-	if err != nil {
-		return response{}, err
-	}
-	req.Header.Set("Authorization", "Bearer "+tok)
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return response{}, err
-	}
-	defer resp.Body.Close()
-	out := response{status: resp.StatusCode}
-	return out, json.NewDecoder(resp.Body).Decode(&out.body)
+	return inst.client().Call(t, method, path, client, body, headers)
 }

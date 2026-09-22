@@ -15,6 +15,7 @@ import (
 	"github.com/Pantani/backend-challenge-go/internal/domain/money"
 	"github.com/Pantani/backend-challenge-go/internal/domain/wager"
 	"github.com/Pantani/backend-challenge-go/internal/domain/wallet"
+	"github.com/Pantani/backend-challenge-go/internal/testutil"
 )
 
 func TestOpenWalletWithBalanceCreatesOpening(t *testing.T) {
@@ -40,7 +41,7 @@ func TestOpenWalletZeroBalanceAndDuplicates(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
 	player := uuid.New()
-	cmd := app.OpenWalletCommand{PlayerID: player, InitialBalance: brl(t, "0.00")}
+	cmd := app.OpenWalletCommand{PlayerID: player, InitialBalance: testutil.BRL(t, "0.00")}
 	w, err := h.wallets.Open(context.Background(), cmd)
 	require.NoError(t, err)
 	assert.Zero(t, h.store.ledgerCount(w.ID()))
@@ -57,7 +58,7 @@ func TestOpenWalletRollsBack(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
 	h.store.failOn("ledger.append", errBoom)
-	_, err := h.wallets.Open(context.Background(), app.OpenWalletCommand{PlayerID: uuid.New(), InitialBalance: brl(t, "5.00")})
+	_, err := h.wallets.Open(context.Background(), app.OpenWalletCommand{PlayerID: uuid.New(), InitialBalance: testutil.BRL(t, "5.00")})
 	require.ErrorIs(t, err, errBoom)
 	assert.Empty(t, h.store.st.wallets)
 }
@@ -122,7 +123,7 @@ func TestReconcile(t *testing.T) {
 	assert.Equal(t, "0.00", rec.Difference.Amount())
 	assert.Equal(t, int64(2), rec.CheckedEntries)
 
-	h.store.putWalletBalance(w.ID(), func(s *wallet.Snapshot) { s.Balance = brl(t, "980.00") })
+	h.store.putWalletBalance(w.ID(), func(s *wallet.Snapshot) { s.Balance = testutil.BRL(t, "980.00") })
 	rec, err = h.wallets.Reconcile(ctx, w.ID())
 	require.NoError(t, err)
 	assert.False(t, rec.Consistent)
@@ -150,10 +151,10 @@ func TestReconcileOverflow(t *testing.T) {
 	maxM, err := money.FromMinor(math.MaxInt64, "BRL")
 	require.NoError(t, err)
 	snaps := []app.ReconciliationSnapshot{
-		{Stored: brl(t, "0.00"), Credits: math.MinInt64},
-		{Stored: brl(t, "0.00"), Debits: math.MinInt64},
+		{Stored: testutil.BRL(t, "0.00"), Credits: math.MinInt64},
+		{Stored: testutil.BRL(t, "0.00"), Debits: math.MinInt64},
 		{Stored: maxM, Debits: math.MaxInt64},
-		{Stored: brl(t, "0.00"), Credits: math.MaxInt64, Debits: -math.MaxInt64},
+		{Stored: testutil.BRL(t, "0.00"), Credits: math.MaxInt64, Debits: -math.MaxInt64},
 	}
 	for i, snap := range snaps {
 		svc := app.NewWalletService(app.WalletDeps{Queries: reconcileStub{newMemStore(), snap}})

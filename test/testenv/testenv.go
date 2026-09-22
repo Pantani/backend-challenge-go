@@ -198,9 +198,5 @@ func (e *Env) Vars(overrides map[string]string) map[string]string {
 
 // Config loads a service configuration pointing at the containers.
 func (e *Env) Config(overrides map[string]string) (config.Config, error) {
-	vars := e.Vars(overrides)
-	return config.Load(func(key string) (string, bool) {
-		v, ok := vars[key]
-		return v, ok
-	})
+	return config.Load(config.MapLookup(e.Vars(overrides)))
 }

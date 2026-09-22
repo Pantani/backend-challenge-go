@@ -5,6 +5,10 @@
 //	wallet migrate down [n]      revert n migrations (default 1)
 //	wallet migrate version       print the current schema version
 //	wallet provision-queues      create the SQS queues and the DLQ redrive
+//
+// The command is parsed before any configuration is read, and each command
+// loads only the variables it needs: migrate reads the database ones,
+// provision-queues the AWS ones and serve all of them.
 package cli
 
 import (
@@ -16,6 +20,8 @@ import (
 	"strconv"
 	"syscall"
 
+	"go.uber.org/fx"
+
 	"github.com/Pantani/backend-challenge-go/internal/adapter/postgres"
 	sqsadapter "github.com/Pantani/backend-challenge-go/internal/adapter/sqs"
 	"github.com/Pantani/backend-challenge-go/internal/bootstrap"
@@ -25,80 +31,157 @@ import (
 // ErrUsage reports an unknown command or bad arguments.
 var ErrUsage = errors.New("usage: wallet [serve | migrate up | migrate down [n] | migrate version | provision-queues]")
 
-// Run executes the command in args and returns the process exit code.
-func Run(ctx context.Context, args []string, lookup config.Lookup, stdout io.Writer) int {
-	if err := run(ctx, args, lookup, stdout); err != nil {
-		_, _ = fmt.Fprintln(stdout, "error:", err)
-		return 1
+// Exit codes of Run.
+const (
+	ExitOK    = 0
+	ExitError = 1
+	ExitUsage = 2
+)
+
+// migrator is the subset of postgres.Migrator the migrate command uses.
+type migrator interface {
+	Up() error
+	Down(steps int) error
+	Version() (version uint, dirty bool, err error)
+	Close() error
+}
+
+// Constructors of the external dependencies, replaceable in tests.
+var (
+	newMigrator  = defaultMigrator
+	newSQSClient = bootstrap.NewSQSClient
+	newApp       = defaultApp
+)
+
+func defaultMigrator(databaseURL string) (migrator, error) {
+	m, err := postgres.NewMigrator(databaseURL)
+	if err != nil {
+		return nil, err
 	}
-	return 0
+	return m, nil
+}
+
+func defaultApp(cfg config.Config) *fx.App { return bootstrap.New(cfg) }
+
+// Run executes the command in args and returns the process exit code:
+// ExitUsage for an unknown command or bad arguments, ExitError for any other
+// failure (printed on stderr as "error: ..."), ExitOK otherwise. Command
+// output goes to stdout.
+func Run(ctx context.Context, args []string, lookup config.Lookup, stdout, stderr io.Writer) int {
+	err := run(ctx, args, lookup, stdout)
+	if err == nil {
+		return ExitOK
+	}
+	_, _ = fmt.Fprintln(stderr, "error:", err)
+	if errors.Is(err, ErrUsage) {
+		return ExitUsage
+	}
+	return ExitError
 }
 
 func run(ctx context.Context, args []string, lookup config.Lookup, stdout io.Writer) error {
-	cfg, err := config.Load(lookup)
-	if err != nil {
-		return fmt.Errorf("invalid configuration: %w", err)
-	}
 	cmd, rest := "serve", []string(nil)
 	if len(args) > 0 {
 		cmd, rest = args[0], args[1:]
 	}
 	switch cmd {
 	case "serve":
-		return serve(ctx, cfg)
+		return serveCmd(ctx, lookup)
 	case "migrate":
-		return migrateCmd(cfg, rest, stdout)
+		return migrateCmd(lookup, rest, stdout)
 	case "provision-queues":
-		return provision(ctx, cfg, stdout)
+		return provision(ctx, lookup, stdout)
 	}
 	return ErrUsage
 }
 
+func serveCmd(ctx context.Context, lookup config.Lookup) error {
+	cfg, err := config.Load(lookup)
+	if err != nil {
+		return fmt.Errorf("invalid configuration: %w", err)
+	}
+	return serve(ctx, cfg)
+}
+
 // serve runs until SIGINT/SIGTERM (or ctx cancellation), then stops the
-// application within the configured shutdown timeout.
+// application within the configured shutdown timeout. Signal handling is
+// released before the stop, so a second signal terminates the process.
 func serve(ctx context.Context, cfg config.Config) error {
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	application := bootstrap.New(cfg)
+	application := newApp(cfg)
+	if err := application.Err(); err != nil {
+		return fmt.Errorf("build application: %w", err)
+	}
 	if err := application.Start(ctx); err != nil {
 		return err
 	}
 	<-ctx.Done()
+	stop()
 	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.ShutdownTimeout)
 	defer cancel()
 	return application.Stop(stopCtx)
 }
 
-func migrateCmd(cfg config.Config, args []string, stdout io.Writer) error {
+// migration is a parsed migrate subcommand.
+type migration struct {
+	op    string
+	steps int
+}
+
+// parseMigration validates the migrate arguments before any configuration
+// is read, so `wallet migrate` alone is a usage error.
+func parseMigration(args []string) (migration, error) {
 	if len(args) == 0 {
-		return ErrUsage
+		return migration{}, ErrUsage
 	}
-	m, err := postgres.NewMigrator(cfg.DatabaseURL)
+	switch args[0] {
+	case "up", "version":
+		return migration{op: args[0]}, nil
+	case "down":
+		steps, err := parseSteps(args[1:])
+		return migration{op: "down", steps: steps}, err
+	}
+	return migration{}, ErrUsage
+}
+
+// parseSteps reads the optional step count of `migrate down` (default 1).
+func parseSteps(args []string) (int, error) {
+	if len(args) == 0 {
+		return 1, nil
+	}
+	n, err := strconv.Atoi(args[0])
+	if err != nil || n < 1 {
+		return 0, ErrUsage
+	}
+	return n, nil
+}
+
+func migrateCmd(lookup config.Lookup, args []string, stdout io.Writer) error {
+	mig, err := parseMigration(args)
+	if err != nil {
+		return err
+	}
+	cfg, err := config.LoadDatabase(lookup)
+	if err != nil {
+		return fmt.Errorf("invalid configuration: %w", err)
+	}
+	m, err := newMigrator(cfg.DatabaseURL)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = m.Close() }()
-	switch args[0] {
+	return mig.run(m, stdout)
+}
+
+func (mig migration) run(m migrator, stdout io.Writer) error {
+	switch mig.op {
 	case "up":
 		return m.Up()
 	case "down":
-		return migrateDown(m, args[1:])
-	case "version":
-		return printVersion(m, stdout)
+		return m.Down(mig.steps)
 	}
-	return ErrUsage
-}
-
-func migrateDown(m *postgres.Migrator, args []string) error {
-	steps := 1
-	if len(args) > 0 {
-		n, err := strconv.Atoi(args[0])
-		if err != nil || n < 1 {
-			return ErrUsage
-		}
-		steps = n
-	}
-	return m.Down(steps)
+	return printVersion(m, stdout)
 }
 
 type versioner interface {
@@ -114,14 +197,18 @@ func printVersion(m versioner, stdout io.Writer) error {
 	return err
 }
 
-func provision(ctx context.Context, cfg config.Config, stdout io.Writer) error {
-	client, err := sqsadapter.NewClient(ctx, sqsadapter.ClientConfig{Region: cfg.AWSRegion, Endpoint: cfg.AWSEndpoint})
+func provision(ctx context.Context, lookup config.Lookup, stdout io.Writer) error {
+	cfg, err := config.LoadSQS(lookup)
+	if err != nil {
+		return fmt.Errorf("invalid configuration: %w", err)
+	}
+	client, err := newSQSClient(ctx, cfg)
 	if err != nil {
 		return err
 	}
 	q, err := sqsadapter.Provision(ctx, client, sqsadapter.ProvisionConfig{
-		Names:           sqsadapter.QueueNames{Input: cfg.SQSInputQueue, DLQ: cfg.SQSDLQ, Events: cfg.SQSEventsQueue},
-		MaxReceiveCount: cfg.SQSMaxReceive, VisibilityTimeout: int(cfg.SQSVisibility.Seconds()),
+		Names:           bootstrap.QueueNames(cfg),
+		MaxReceiveCount: cfg.SQSMaxReceiveCount, VisibilityTimeout: int(cfg.SQSVisibilityTimeout.Seconds()),
 	})
 	if err != nil {
 		return err

@@ -1,9 +1,9 @@
 SHELL := /bin/bash
 COVERAGE_DIR := $(CURDIR)/coverage
 
-.PHONY: all build test test-race vet lint test-integration test-e2e coverage up down logs migrate-up migrate-down provision-queues
+.PHONY: all build test test-race vet lint test-integration test-e2e coverage up down clean logs migrate-up migrate-down provision-queues
 
-all: lint test-race
+all: vet lint test-race
 
 build:
 	go build -o bin/wallet ./cmd/wallet
@@ -34,8 +34,8 @@ test-e2e:
 ## Combined coverage of unit + integration + e2e (binary built with -cover).
 coverage:
 	rm -rf $(COVERAGE_DIR) && mkdir -p $(COVERAGE_DIR)/unit $(COVERAGE_DIR)/integration $(COVERAGE_DIR)/e2e
-	go test -race -covermode=atomic -count=1 -coverpkg=./internal/... ./internal/... -args -test.gocoverdir=$(COVERAGE_DIR)/unit
-	go test -race -covermode=atomic -count=1 -tags integration -coverpkg=./internal/... ./test/integration/... -args -test.gocoverdir=$(COVERAGE_DIR)/integration
+	go test -race -covermode=atomic -count=1 -coverpkg=./cmd/...,./internal/... ./cmd/... ./internal/... -args -test.gocoverdir=$(COVERAGE_DIR)/unit
+	go test -race -covermode=atomic -count=1 -tags integration -coverpkg=./cmd/...,./internal/... ./test/integration/... -args -test.gocoverdir=$(COVERAGE_DIR)/integration
 	E2E_GOCOVERDIR=$(COVERAGE_DIR)/e2e go test -count=1 -timeout 15m -tags e2e ./test/e2e/...
 	go tool covdata textfmt -i=$(COVERAGE_DIR)/unit,$(COVERAGE_DIR)/integration,$(COVERAGE_DIR)/e2e -o $(COVERAGE_DIR)/coverage.out
 	go tool cover -func=$(COVERAGE_DIR)/coverage.out | tail -1
@@ -43,7 +43,12 @@ coverage:
 up:
 	docker compose up --build -d
 
+## Stop the stack, keeping the database and queue volumes.
 down:
+	docker compose down
+
+## Stop the stack and delete its volumes.
+clean:
 	docker compose down -v
 
 logs:

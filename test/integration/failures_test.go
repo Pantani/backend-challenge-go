@@ -16,6 +16,7 @@ import (
 	"github.com/Pantani/backend-challenge-go/internal/domain/event"
 	"github.com/Pantani/backend-challenge-go/internal/domain/wager"
 	"github.com/Pantani/backend-challenge-go/internal/domain/wallet"
+	"github.com/Pantani/backend-challenge-go/internal/testutil"
 )
 
 // inCancelledTx runs op inside a unit of work whose context is cancelled
@@ -34,7 +35,7 @@ func TestRepositoriesFailOnBrokenConnections(t *testing.T) {
 	t.Parallel()
 	s := newServices(t, defaultPolicy)
 	w := s.openWallet(t, "10.00")
-	tx, err := wager.NewOpening(wager.OpeningParams{ID: uuid.New(), WalletID: w.ID(), PlayerID: w.PlayerID(), Amount: brl(t, "1.00"), Now: time.Now()})
+	tx, err := wager.NewOpening(wager.OpeningParams{ID: uuid.New(), WalletID: w.ID(), PlayerID: w.PlayerID(), Amount: testutil.BRL(t, "1.00"), Now: time.Now()})
 	require.NoError(t, err)
 	ops := map[string]func(ctx context.Context, r app.Repositories) error{
 		"wallet create": func(ctx context.Context, r app.Repositories) error { return r.Wallets().Create(ctx, w) },
@@ -97,6 +98,7 @@ func TestQueriesFailOnBrokenConnections(t *testing.T) {
 		"claim":     func() error { _, err := store.Claim(ctx, "o", time.Now(), time.Second, 1); return err },
 		"published": func() error { _, err := store.MarkPublished(ctx, uuid.New(), "o", time.Now()); return err },
 		"failed":    func() error { return store.MarkFailed(ctx, uuid.New(), "o", time.Now(), "x") },
+		"dead":      func() error { return store.MarkDead(ctx, uuid.New(), "o", time.Now(), "x") },
 		"oldest":    func() error { _, _, err := store.OldestPending(ctx); return err },
 		"ping":      func() error { return postgres.Ping(ctx, pool) },
 		"begin":     func() error { return postgres.NewUnitOfWork(pool).Do(ctx, nil) },
@@ -113,6 +115,63 @@ func TestClosedPoolIsUnavailable(t *testing.T) {
 	closed.Close()
 	_, err = postgres.NewQueries(closed).GetWallet(context.Background(), uuid.New())
 	require.ErrorIs(t, err, app.ErrUnavailable)
+	err = postgres.NewOutboxStore(closed).MarkDead(context.Background(), uuid.New(), "o", time.Now(), "x")
+	require.ErrorIs(t, err, app.ErrUnavailable)
+}
+
+func TestStatementTimeoutIsUnavailable(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	// The statement times out before the lock does, so the slow statement
+	// (waiting on the wallet lock) fails with 57014, not 55P03.
+	slow, err := postgres.NewPool(ctx, postgres.Config{URL: env.DatabaseURL, MaxConns: 1, LockTimeout: 5 * time.Second, StatementTimeout: 50 * time.Millisecond})
+	require.NoError(t, err)
+	defer slow.Close()
+	s := newServices(t, defaultPolicy)
+	w := s.openWallet(t, "10.00")
+
+	release := make(chan struct{})
+	locked := make(chan error, 1)
+	go func() {
+		locked <- postgres.NewUnitOfWork(pool).Do(ctx, func(ctx context.Context, r app.Repositories) error {
+			if _, err := r.Wallets().GetForUpdate(ctx, w.ID()); err != nil {
+				return err
+			}
+			<-release
+			return nil
+		})
+	}()
+	defer func() { close(release); require.NoError(t, <-locked) }()
+	require.Eventually(t, func() bool {
+		var n int
+		require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+			WHERE l.locktype = 'transactionid' AND a.state = 'idle in transaction'`).Scan(&n))
+		return n > 0
+	}, 5*time.Second, 20*time.Millisecond, "the wallet is locked by an open transaction")
+
+	err = postgres.NewUnitOfWork(slow).Do(ctx, func(ctx context.Context, r app.Repositories) error {
+		_, err := r.Wallets().GetForUpdate(ctx, w.ID())
+		return err
+	})
+	require.ErrorIs(t, err, app.ErrUnavailable)
+	assert.NotErrorIs(t, err, app.ErrConflict)
+}
+
+func TestWritesToUnknownRowsAreReported(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	tx, err := wager.NewOpening(wager.OpeningParams{ID: uuid.New(), WalletID: uuid.New(), PlayerID: uuid.New(), Amount: testutil.BRL(t, "1.00"), Now: time.Now()})
+	require.NoError(t, err)
+	err = postgres.NewUnitOfWork(pool).Do(ctx, func(ctx context.Context, r app.Repositories) error {
+		return r.Transactions().Save(ctx, tx)
+	})
+	require.ErrorIs(t, err, app.ErrTransactionNotFound, "saving a transaction that was never created")
+
+	err = postgres.NewUnitOfWork(pool).Do(ctx, func(ctx context.Context, r app.Repositories) error {
+		return r.Inbox().Complete(ctx, "nobody", uuid.NewString(), uuid.Nil, time.Now())
+	})
+	require.Error(t, err, "completing a message that was never registered")
+	assert.False(t, app.IsTransient(err), "a consumer bug is not retried: %v", err)
 }
 
 func TestNotFoundAndCommitFailures(t *testing.T) {
@@ -143,7 +202,7 @@ func TestNotFoundAndCommitFailures(t *testing.T) {
 	require.Error(t, err)
 	assert.Equal(t, "10.00", s.balance(t, w))
 
-	_, err = s.wallets.Open(ctx, app.OpenWalletCommand{PlayerID: w.PlayerID(), InitialBalance: brl(t, "1.00")})
+	_, err = s.wallets.Open(ctx, app.OpenWalletCommand{PlayerID: w.PlayerID(), InitialBalance: testutil.BRL(t, "1.00")})
 	require.ErrorIs(t, err, app.ErrWalletExists)
 }
 
@@ -153,13 +212,8 @@ func TestCorruptRowsAreReportedNotHidden(t *testing.T) {
 	// XYZ passes the schema's format check but is not a supported currency.
 	require.Empty(t, sqlState(t,
 		`INSERT INTO wallets VALUES ('`+w+`', gen_random_uuid(), 'XYZ', 100, 1, now(), now())`,
-		`INSERT INTO wager_transactions (id, origin, kind, status, wallet_id, player_id, amount_minor, currency,
-		provider_id, external_transaction_id, idempotency_key, payload_hash, round_id, game_id, result_balance_minor,
-		result_currency, created_at, updated_at)
-		VALUES ('`+tx+`', 'EXTERNAL', 'WIN', 'PROCESSED', '`+w+`', gen_random_uuid(), 100, 'XYZ',
-		'corrupt', '`+tx+`', '`+tx+`', 'h', 'r', 'g', 100, 'XYZ', now(), now())`,
-		`INSERT INTO ledger_entries (id, wallet_id, transaction_id, direction, amount_minor, currency,
-		balance_before_minor, balance_after_minor, created_at) VALUES (gen_random_uuid(), '`+w+`', '`+tx+`', 'CREDIT', 100, 'XYZ', 0, 100, now())`))
+		insertTransaction(txRow{ID: tx, WalletID: w, Kind: "WIN", Status: "PROCESSED", Amount: 100, Currency: "XYZ", Provider: "corrupt", Result: ptr(100)}),
+		insertLedgerEntry(w, tx, "CREDIT", 100, 0, 100, "XYZ")))
 
 	ctx := context.Background()
 	q := postgres.NewQueries(pool)
@@ -181,5 +235,5 @@ func TestCorruptRowsAreReportedNotHidden(t *testing.T) {
 
 func walletMovement(t *testing.T) wallet.Movement {
 	t.Helper()
-	return wallet.Movement{EntryID: uuid.New(), TransactionID: uuid.New(), Direction: wallet.Credit, Amount: brl(t, "1.00"), Now: time.Now()}
+	return wallet.Movement{EntryID: uuid.New(), TransactionID: uuid.New(), Direction: wallet.Credit, Amount: testutil.BRL(t, "1.00"), Now: time.Now()}
 }

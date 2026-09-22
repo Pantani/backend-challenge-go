@@ -3,12 +3,16 @@
 package auth
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"slices"
+	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/go-jose/go-jose/v4"
 )
 
 // Realm roles granted by the IdP.
@@ -25,10 +29,14 @@ var ErrUnauthenticated = errors.New("unauthenticated")
 
 // Principal is the authenticated caller.
 type Principal struct {
-	Subject    string
-	ClientID   string
+	// Subject is the "sub" claim.
+	Subject string
+	// ClientID is the OAuth client that obtained the token ("azp").
+	ClientID string
+	// ProviderID binds a provider client to its providerId; empty otherwise.
 	ProviderID string
-	Roles      []string
+	// Roles are the realm roles granted by the IdP.
+	Roles []string
 }
 
 // HasRole reports whether the principal holds a realm role.
@@ -50,7 +58,22 @@ type Config struct {
 	JWKSURL string
 	// Audience is the expected "aud" entry for this API.
 	Audience string
+	// JWKSTimeout bounds each JWKS fetch; DefaultJWKSTimeout when zero.
+	JWKSTimeout time.Duration
+	// JWKSRefreshInterval is the minimum time between two JWKS fetches
+	// triggered by tokens that match no cached key; tokens arriving within
+	// the interval fail fast. DefaultJWKSRefreshInterval when zero.
+	JWKSRefreshInterval time.Duration
 }
+
+// Defaults of the JWKS client.
+const (
+	// DefaultJWKSTimeout is the JWKS fetch timeout when none is configured.
+	DefaultJWKSTimeout = 5 * time.Second
+	// DefaultJWKSRefreshInterval is the minimum spacing of cache-miss
+	// refreshes when none is configured.
+	DefaultJWKSRefreshInterval = 30 * time.Second
+)
 
 // Verifier validates access tokens.
 type Verifier struct {
@@ -58,9 +81,15 @@ type Verifier struct {
 }
 
 // NewVerifier builds a verifier backed by the remote JWKS. Keys are fetched
-// lazily and cached, and refreshed when an unknown key id appears.
-func NewVerifier(ctx context.Context, cfg Config) *Verifier {
-	keys := oidc.NewRemoteKeySet(ctx, cfg.JWKSURL)
+// lazily with a bounded timeout and cached; a token matching no cached key
+// refreshes them at most once per Config.JWKSRefreshInterval.
+func NewVerifier(_ context.Context, cfg Config) *Verifier {
+	keys := &keySet{
+		url:      cfg.JWKSURL,
+		client:   &http.Client{Timeout: cmp.Or(cfg.JWKSTimeout, DefaultJWKSTimeout)},
+		interval: cmp.Or(cfg.JWKSRefreshInterval, DefaultJWKSRefreshInterval),
+		algs:     []jose.SignatureAlgorithm{jose.RS256},
+	}
 	return &Verifier{verifier: oidc.NewVerifier(cfg.Issuer, keys, &oidc.Config{
 		ClientID:             cfg.Audience,
 		SupportedSigningAlgs: []string{oidc.RS256},
@@ -76,7 +105,8 @@ type claims struct {
 }
 
 // Verify checks signature, issuer, audience and expiry, then extracts the
-// principal.
+// principal. Every failure wraps ErrUnauthenticated; the cause is safe to
+// log but never to return to clients.
 func (v *Verifier) Verify(ctx context.Context, raw string) (Principal, error) {
 	tok, err := v.verifier.Verify(ctx, raw)
 	if err != nil {

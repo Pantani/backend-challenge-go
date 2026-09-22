@@ -10,17 +10,20 @@ internal/domain/wager      WagerTransaction, máquina de estados, regras (Decide
 internal/domain/event      eventos de integração tipados + snapshot para a outbox
 internal/app               casos de uso (HTTP, SQS e workers compartilham) e portas
 internal/adapter/postgres  pgx + SQL explícito, UnitOfWork, migrations
+internal/contract          formas de wire compartilhadas por HTTP e SQS (Money, Operation, decoder estrito)
 internal/adapter/httpapi   net/http (ServeMux do Go 1.22+), DTOs, middlewares
-internal/adapter/auth      validação OIDC (go-oidc + JWKS)
+internal/adapter/auth      validação OIDC (JWKS com cache próprio, RS256)
 internal/adapter/sqs       provisionamento, consumidor e publisher
-internal/worker            supervisor, relay da outbox, resolvedor de pendências
+internal/worker            supervisor, relay da outbox, resolvedor de pendências, contextos desacoplados do shutdown
 internal/observability     slog JSON com atributos de contexto, métricas Prometheus
 internal/bootstrap         único pacote que conhece o Fx
 internal/config, cli       configuração validada e comandos do binário
 test/testenv|integration|e2e  containers reais, integração e e2e (build tags)
 ```
 
-O domínio não importa Fx, HTTP, SQS nem pgx (depende só de `google/uuid` e da biblioteca padrão). `app` define as portas que usa (`UnitOfWork`, repositórios, `Queries`, `OutboxStore`, `Clock`, `IDGenerator`, `Metrics`), e os adaptadores as implementam. Os handlers HTTP dependem de interfaces declaradas no próprio pacote (lado do consumidor).
+O domínio não importa Fx, HTTP, SQS nem pgx (depende só de `google/uuid` e da biblioteca padrão). `app` define as portas que usa (`UnitOfWork`, repositórios, `Queries`, `OutboxStore`, `Clock`, `IDGenerator`, `Metrics`), e os adaptadores as implementam. Os handlers HTTP dependem de interfaces declaradas no próprio pacote (lado do consumidor). `contract` guarda o que HTTP e SQS têm em comum (o objeto `{amount, currency}`, o corpo da operação e o decoder JSON estrito: um único objeto, sem campos desconhecidos, nada depois dele), para que as duas entradas rejeitem exatamente as mesmas coisas.
+
+Um único helper de backoff exponencial (`app.Backoff(base, máximo, expoente)` = `base × 2^expoente`, limitado ao máximo e sem overflow) serve às referências pendentes, ao consumidor SQS e ao relay da outbox.
 
 Complexidade: `golangci-lint` com `gocyclo` ≤ 6 e `gocognit` ≤ 8 vale para todo o código, testes incluídos.
 
@@ -37,7 +40,8 @@ Complexidade: `golangci-lint` com `gocyclo` ≤ 6 e `gocognit` ≤ 8 vale para t
 - **Wallet**: `Open` (criação, versão 1; com saldo inicial positivo gera o crédito de abertura sem mudar a versão), `Rehydrate` (sem reaplicar nada) e `Apply(Movement)`, o único caminho que muda o saldo: valida moeda e valor positivo, impede saldo negativo, incrementa a versão e devolve o `LedgerEntry`.
 - **LedgerEntry**: o construtor valida `balanceAfter = balanceBefore ± amount`.
 - **WagerTransaction** (a reidratação também valida a referência, então uma linha corrompida vira erro, nunca pânico nas regras): `NewExternal` (política de zero: `LOSS` = `0.00`, os demais > 0; referência obrigatória em REFUND/ROLLBACK, opcional em WIN, proibida em BET/LOSS), `NewOpening` (sem provedor, chaves, rodada, jogo nem referência) e `Rehydrate`. Transições: `Process`, `Reject`, `Fail` e `AwaitReference`.
-- **Regras** (`wager.Decide`, função pura): recebe carteira, operação, referência (ou `nil`) e se a referência já foi revertida, e devolve `Process` (com direção), `Reject(code)` ou `Await`.
+- **Regras** (`wager.Decide`, função pura): recebe carteira, operação, referência (ou `nil`) e se a referência já foi revertida, e devolve `Process` (com direção), `Reject(code)` ou `Await`. A direção de um `ROLLBACK` vem de uma tabela explícita (BET → crédito; WIN/REFUND → débito); qualquer alvo fora dela é rejeitado com `REFERENCE_KIND_INVALID`, nunca "processado sem mover dinheiro".
+- **Validações do construtor** que o banco não cobre: uma operação não pode referenciar a si mesma; `Process` exige referência resolvida em REFUND/ROLLBACK e a proíbe em BET/LOSS; `Reject` e `Fail` exigem `failureCode`, e `Reject` valida o saldo observado.
 - Erros de domínio são sentinelas comparáveis com `errors.Is`. Nenhum `panic` representa regra de negócio.
 
 ### Máquina de estados
@@ -49,7 +53,7 @@ PROCESSED, REJECTED, FAILED: terminais (o domínio e o trigger do banco recusam 
 ```
 
 - Operações sem dependência são concluídas **de forma síncrona na mesma transação SQL**. `PENDING` existe só em memória e nunca é commitado, então não há aceite assíncrono a retomar. A única espera durável é `PENDING_REFERENCE`, retomada por qualquer instância.
-- **Transitório × permanente**: `ErrConflict` (unique violation, versão velha, deadlock, serialização, `lock_timeout`), `ErrUnavailable` (conexão, shutdown do servidor, `statement_timeout`) e cancelamento/timeout de contexto são transitórios e são retentados. Qualquer outro erro é permanente. No worker de pendências, um erro permanente registra `FAILED` / `INTERNAL_FAILURE` para auditoria e interrompe os retries.
+- **Transitório × permanente**: `ErrConflict` (unique violation, versão velha, deadlock, serialização, `lock_timeout`), `ErrUnavailable` (classes SQLSTATE 08, 53 e 58, `40003`, `statement_timeout`, pool fechado, shutdown do servidor) e cancelamento/timeout de contexto (repassados sem reclassificar) são transitórios e são retentados. Qualquer outro erro é permanente. No worker de pendências, um erro permanente registra `FAILED` / `INTERNAL_FAILURE`, emite `WagerTransactionFailed` e acorda as pendências que referenciam a operação, exatamente como uma rejeição.
 
 ## 4. Transações SQL e concorrência
 
@@ -77,13 +81,15 @@ Independentes de locks locais e da deduplicação do SQS FIFO:
 - `wager_transactions`: referência externa nunca vazia (migration 3); checks de formato interno × externo (OPENING sem provedor/chaves/rodada/jogo/referência), política de zero, referência obrigatória em reversões, `failure_code` em REJECTED/FAILED, resultado em PROCESSED, agenda em PENDING_REFERENCE. Índices únicos: `(provider_id, external_transaction_id)`, `(provider_id, idempotency_key)`, uma `OPENING` por carteira e **uma reversão bem-sucedida por transação referenciada**. Trigger: linhas terminais congeladas e colunas de identidade/payload imutáveis.
 - `outbox_events`: snapshot (`payload json`, que preserva o texto exato) e identidade imutáveis, sem `DELETE`, e publicação que não pode ser reescrita.
 
-Todos esses pontos são verificados em `test/integration/schema_test.go`.
+- Migration 4: o `CHECK` de `status` deixa de admitir `PENDING` (que só existe em memória) e a outbox ganha `outbox_events_single_outcome` (publicado ou dead-lettered, nunca os dois) e `outbox_events_lease_pair` (`locked_by` e `locked_until` sempre juntos).
+
+Todos esses pontos são verificados em `test/integration/schema_test.go`. O pool (`pgx`) usa `MinConns=1`, `MaxConnLifetime=1h`, `MaxConnIdleTime=30m` e `HealthCheckPeriod=1m`, além de `lock_timeout`/`statement_timeout` por conexão. `Transactions.Save` de uma linha inexistente devolve `ErrTransactionNotFound` e `Inbox.Complete` de uma mensagem não registrada é um erro permanente, para que um bug de fluxo nunca passe em silêncio.
 
 ## 6. Idempotência
 
 - Persistente em PostgreSQL. Sobrevive ao reinício de todos os processos (testado no e2e com SIGKILL).
 - Chave: header `Idempotency-Key` (HTTP) ou `data.idempotencyKey` (SQS), **com escopo por provedor** e nunca substituída por uma chave calculada. A mesma chave usada por outro provedor é outra operação, então não há vazamento entre provedores em replays.
-- **Hash** (`wager.Fingerprint`): SHA-256 hex do JSON canônico (chaves ordenadas, sem espaços) dos campos de negócio `providerId`, `externalTransactionId`, `playerId`, `walletId` (UUIDs normalizados em minúsculas), `roundId`, `gameId`, `kind`, `money.amount`, `money.currency` e `referenceExternalTransactionId` (omitido se ausente). Ficam fora a chave, os headers, o envelope SQS (`messageId`, `occurredAt`, `type`) e a correlação. HTTP e SQS geram o mesmo hash (testado).
+- **Hash** (`wager.Fingerprint`): SHA-256 hex do JSON canônico (chaves ordenadas, sem espaços, sem escape HTML de `<`, `>` e `&`) dos campos de negócio `providerId`, `externalTransactionId`, `playerId`, `walletId` (UUIDs normalizados em minúsculas), `roundId`, `gameId`, `kind`, `money.amount`, `money.currency` e `referenceExternalTransactionId` (omitido se ausente). Ficam fora a chave, os headers, o envelope SQS (`messageId`, `occurredAt`, `type`) e a correlação. HTTP e SQS geram o mesmo hash (testado).
 - Regras: mesma chave + mesmo hash → replay do resultado persistido (`idempotentReplay: true`, com o **saldo observado no processamento original**). Mesma chave + hash diferente → `409 IDEMPOTENCY_CONFLICT`. Mesmo `(providerId, externalTransactionId)` com outra chave → `409 DUPLICATE_EXTERNAL_TRANSACTION`.
 - Entradas corrigíveis (JSON, Money, UUID, tipo inválido, falta de header) **não são persistidas**: o cliente corrige e reenvia com a mesma chave.
 
@@ -92,7 +98,7 @@ Todos esses pontos são verificados em `test/integration/schema_test.go`.
 | Tipo | Movimento | Referência |
 | --- | --- | --- |
 | `BET` | débito; saldo insuficiente → `INSUFFICIENT_FUNDS` | proibida |
-| `WIN` | crédito | opcional; se informada, precisa ser uma `BET` do mesmo contexto |
+| `WIN` | crédito | opcional; se informada, precisa ser uma `BET` do mesmo contexto (se ela ainda não chegou, a WIN espera como uma reversão e expira com `REFERENCE_NOT_FOUND`) |
 | `LOSS` | nenhum (`0.00`, sem ledger, versão inalterada; emite só `WagerTransactionProcessed`) | proibida |
 | `REFUND` | crédito do valor da `BET` | obrigatória, deve ser `BET` |
 | `ROLLBACK` | contrário ao original (BET → crédito; WIN/REFUND → débito) | obrigatória: `BET`, `WIN` ou `REFUND` |
@@ -106,7 +112,7 @@ Todos esses pontos são verificados em `test/integration/schema_test.go`.
 - Referência inexistente → `PENDING_REFERENCE` (evento `WagerTransactionPendingReference`, `202`).
 - O worker (`PENDING_INTERVAL`) lista as pendências vencidas e, para cada uma, trava a carteira e depois a linha (`FOR UPDATE SKIP LOCKED`, na mesma ordem de locks do fluxo HTTP) e reavalia. Várias instâncias competem sem processar em duplicidade. O estado inteiro vive no banco, então um reinício não perde nada.
 - Backoff exponencial `PENDING_BASE_DELAY × 2^tentativas`, limitado a `PENDING_MAX_DELAY`. Quando a referência chega (qualquer operação externa terminal), as pendências que a apontam são "acordadas" na mesma transação, sem esperar o backoff.
-- Depois de `PENDING_MAX_ATTEMPTS`: `REJECTED` com `REFERENCE_NOT_FOUND` (nunca chegou) ou `REFERENCE_NOT_PROCESSED` (chegou mas não concluiu), mais o evento de rejeição.
+- Depois de `PENDING_MAX_ATTEMPTS`: `REJECTED` com `REFERENCE_NOT_FOUND` (nunca chegou) ou `REFERENCE_NOT_PROCESSED` (chegou mas não concluiu), mais o evento de rejeição. As resoluções do worker contam em `wager_transactions_total{source="worker"}` e `wager_processing_seconds{source="worker"}`.
 - Referência existente mas ainda pendente → continua esperando. Referência terminada sem sucesso (REJECTED/FAILED) → rejeição imediata `REFERENCE_NOT_PROCESSED`.
 
 ## 9. Consumidor SQS e inbox
@@ -117,8 +123,8 @@ Todos esses pontos são verificados em `test/integration/schema_test.go`.
 - Por mensagem, **numa única transação SQL**: `INSERT` na inbox `(consumer_name, message_id)` com o hash (tipo + chave + hash de negócio), processamento da operação (o mesmo caso de uso do HTTP) e conclusão da inbox. Uma reentrega de mensagem já commitada vira `duplicate` e é removida. O mesmo `messageId` com outro conteúdo é permanente e vai para a DLQ.
 - **Ordem do grupo dentro de um lote**: um `ReceiveMessage` pode trazer várias mensagens do mesmo `MessageGroupId` (a cauda em ordem de uma carteira). Se a primeira for para retry, as seguintes do mesmo grupo não são processadas naquele lote: elas são liberadas (visibilidade 0) e voltam em ordem depois da cabeça.
 - `DeleteMessage` só acontece **depois do commit**. Se o processo morrer entre um e outro, a reentrega é absorvida pela inbox (testado).
-- Resultados: sucesso ou rejeição de negócio confirmada → delete. Erro transitório → `ChangeMessageVisibility` com backoff `SQS_RETRY_BASE × 2^(receiveCount−1)` (máx. `SQS_RETRY_MAX`), e depois de `maxReceiveCount` o redrive leva à DLQ. Mensagem inválida (JSON, tipo, campos, float) ou erro permanente (conflito de idempotência, carteira inexistente) → cópia para a DLQ com o atributo `failureReason` e delete.
-- Tempos: `SQS_PROCESS_TIMEOUT` (20 s) < `SQS_VISIBILITY_TIMEOUT` (30 s), para que uma mensagem nunca seja processada em dobro enquanto ainda está em andamento. Long polling de `SQS_WAIT_TIME`.
+- Resultados: sucesso ou rejeição de negócio confirmada → delete. Erro transitório → `ChangeMessageVisibility` com backoff `SQS_RETRY_BASE × 2^(receiveCount−1)` (máx. `SQS_RETRY_MAX`), e depois de `maxReceiveCount` o redrive leva à DLQ. Mensagem inválida (JSON, tipo, campos, float) ou erro permanente (conflito de idempotência, carteira inexistente) → cópia para a DLQ com o atributo `failureReason` (truncado sem quebrar UTF-8) e o `MessageGroupId` original (a ordem por carteira sobrevive a um replay da DLQ), e delete. Se a cópia para a DLQ falhar, a mensagem fica e o resto do seu grupo é liberado, para não passar à frente dela.
+- Tempos: `SQS_PROCESS_TIMEOUT` (20 s) < `SQS_VISIBILITY_TIMEOUT` (30 s), para que uma mensagem nunca seja processada em dobro enquanto ainda está em andamento. As chamadas de confirmação ao broker (delete, mudança de visibilidade, cópia para a DLQ) têm um orçamento próprio de 5 s (`AckTimeout`), desacoplado do prazo de processamento: um timeout no processamento não impede o backoff de ser aplicado. Long polling de `SQS_WAIT_TIME`.
 - `SIGTERM`: o polling para (a chamada em curso é cancelada). A mensagem em processamento termina num contexto desacoplado e com prazo. As mensagens do lote que ainda não começaram voltam a ficar visíveis (`visibility = 0`) para reentrega segura.
 
 ## 10. Transactional outbox
@@ -126,6 +132,7 @@ Todos esses pontos são verificados em `test/integration/schema_test.go`.
 - Os eventos são gravados na mesma transação do estado, do saldo, do ledger e da inbox. Nada é publicado antes do commit.
 - O relay (uma goroutine por instância) faz `UPDATE … WHERE event_id IN (SELECT … FOR UPDATE SKIP LOCKED) RETURNING`, que reivindica um lote com **lease** (`locked_by`, `locked_until`). Publishers concorrentes não pegam o mesmo registro enquanto o lease vale. Se um publisher morrer, o lease expira e outra instância assume.
 - **Ordem por carteira**: cada rodada reivindica, por `partition_key` (carteira), apenas o evento não publicado mais antigo, e só se ele estiver vencido e sem lease. Um evento posterior nunca sai antes do anterior, mesmo que o anterior esteja em backoff ou nas mãos de outro relay, então o SQS FIFO recebe os eventos de cada carteira na ordem do banco. Para drenar carteiras com vários eventos, cada tick executa rodadas até não haver mais nada vencido (limite de 20). O custo é que uma falha no evento da frente segura os demais daquela carteira até o retry, o que é intencional.
+- Cada publicação tem `OUTBOX_PUBLISH_TIMEOUT` (10 s) e roda num contexto desacoplado do `SIGTERM`; entre uma publicação e outra o relay verifica o cancelamento e devolve o restante do lote ao expirar do lease.
 - Falha de publicação → libera o lease e agenda `next_attempt_at` com backoff exponencial (`attempts`, `last_error`). Depois de `OUTBOX_MAX_ATTEMPTS` falhas, o evento recebe `dead_lettered_at` (fica guardado para auditoria e replay manual; métrica `outbox_dead_lettered_total` e log `ERROR`) e deixa de bloquear os eventos seguintes da carteira. Confirmação: `published_at` apenas se o lease ainda for do dono.
 - **Republicação preserva o `eventId`**: ele está no payload imutável e é o `MessageDeduplicationId`. Dentro de 5 min o SQS FIFO descarta a duplicata. Depois disso, o consumidor deduplica por `eventId` (entrega at-least-once).
 - Destino: `wallet-events.fifo`, com `MessageGroupId` = `walletId` (ordem por carteira) e atributos `eventType`, `eventId` e `aggregateType`.
@@ -138,6 +145,7 @@ Envelope: `eventId`, `eventType`, `aggregateType`, `aggregateId`, `correlationId
 | --- | --- | --- |
 | `WagerTransactionProcessed` | transação | dados da transação + `balance` + `referenceTransactionId?` |
 | `WagerTransactionRejected` | transação | dados da transação + `failureCode` |
+| `WagerTransactionFailed` | transação | dados da transação + `failureCode` (`INTERNAL_FAILURE`, emitido pelo worker de pendências) |
 | `WagerTransactionPendingReference` | transação | dados da transação + `nextAttemptAt` |
 | `WalletBalanceChanged` | carteira | `walletId`, `transactionId`, `direction`, `money`, `balanceBefore`, `balanceAfter`, `walletVersion` |
 
@@ -146,7 +154,7 @@ A abertura interna emite `WagerTransactionProcessed` (com `origin: INTERNAL`, se
 ## 11. Autenticação e autorização
 
 - **IdP: Keycloak** (recomendado pelo desafio, OIDC completo, import declarativo do realm). Serviços usam `client_credentials`. O serviço não emite tokens e não guarda senhas.
-- **Validação**: JWT RS256 contra o JWKS (`go-oidc`, com cache e rotação por `kid`), `iss` = `OIDC_ISSUER`, `aud` contém `wallet-api` (audience mapper), `exp` sem tolerância. Emissor e URL do JWKS são configuráveis separadamente, o que permite ao container buscar as chaves por `keycloak:8080` enquanto o `iss` público é `localhost:8180`.
+- **Validação**: JWT RS256 contra o JWKS (`go-oidc` para as claims; o cache de chaves é próprio, com rotação por `kid`), `iss` = `OIDC_ISSUER`, `aud` contém `wallet-api` (audience mapper), `exp` sem tolerância (`nbf` tem os 5 min de tolerância do `go-oidc`). Emissor e URL do JWKS são configuráveis separadamente, o que permite ao container buscar as chaves por `keycloak:8080` enquanto o `iss` público é `localhost:8180`. Cada busca do JWKS tem timeout de 5 s, e um token cujo `kid` não está em cache só dispara uma nova busca a cada 30 s: fora dessa janela ele é recusado com `401`, o que impede que tokens forjados transformem cada requisição numa chamada ao IdP. Tokens rejeitados são registrados em `DEBUG` (o motivo, nunca o token).
 - **Permissões** (papéis de realm em `realm_access.roles`):
   - `wallet-admin` (client `wallet-service`): `POST /wallets`, leitura de carteira, ledger e reconciliação, e leitura de qualquer transação.
   - `wager-provider`: `POST /wagering/transactions` e leitura **das próprias** transações.
@@ -160,7 +168,8 @@ A abertura interna emite `WagerTransactionProcessed` (com `origin: INTERNAL`, se
 - Cada camada é um `fx.Module` (`observability`, `postgres`, `sqs`, `app`, `auth`, `worker`, `http`) com construtores via `fx.Provide`/`fx.Annotate(fx.As(...))` e início via `fx.Invoke`. O grafo é validado com `fx.ValidateApp` num teste unitário.
 - **Inicialização**: config validada antes do Fx. O `OnStart` do pool faz `Ping`, as URLs das filas são resolvidas (se uma fila não existir, o start falha) e o servidor faz `Listen` antes de responder pronto. `fx.StartTimeout` limita tudo.
 - **Workers**: um `worker.Group` supervisiona relay, resolvedor e N consumidores, cada um com contexto cancelável, e loga `worker started/stopped` (término observável). `Stop` cancela e espera, com prazo.
-- **Shutdown** (ordem inversa de registro dos hooks): (1) `http.Server.Shutdown` interrompe novas entradas e conclui as requisições em curso; (2) o grupo de workers para, e o consumidor conclui a mensagem atual ou libera as não iniciadas; (3) o pool do PostgreSQL fecha **depois** de todos que o usam. `SHUTDOWN_TIMEOUT` = `fx.StopTimeout`.
+- **Shutdown** (ordem inversa de registro dos hooks): (1) `http.Server.Shutdown` interrompe novas entradas e conclui as requisições em curso; (2) o grupo de workers para, e o consumidor conclui a mensagem atual ou libera as não iniciadas; (3) o pool do PostgreSQL fecha **depois** de todos que o usam. O hook de parada do grupo é registrado em `startWorkers`, depois de todas as dependências (inclusive o pool) terem registrado os seus, o que garante essa ordem; `TestFxStopsServerThenWorkersThenPool` verifica a sequência real dos hooks. `SHUTDOWN_TIMEOUT` = `fx.StopTimeout` e precisa ser maior que `SQS_PROCESS_TIMEOUT`. Um segundo `SIGTERM`/`SIGINT` durante o encerramento devolve o tratamento padrão do Go (encerra na hora).
+- Os eventos internos do Fx são logados em `DEBUG`.
 
 ## 13. Contrato HTTP
 
@@ -174,15 +183,20 @@ A abertura interna emite `WagerTransactionProcessed` (com `origin: INTERNAL`, se
 | Sem token / token inválido ou expirado | `401` | `{code:"UNAUTHORIZED"}` + `WWW-Authenticate` |
 | Papel ou provedor não autorizado | `403` | `{code:"FORBIDDEN"}` |
 | Carteira / transação inexistente (ou de outro provedor) | `404` | `WALLET_NOT_FOUND` / `TRANSACTION_NOT_FOUND` |
+| Rota inexistente / método não permitido | `404` / `405` | `NOT_FOUND` / `METHOD_NOT_ALLOWED` (com `Allow`) |
+| Corpo maior que 64 KiB | `413` | `PAYLOAD_TOO_LARGE` |
+| `Content-Type` presente e diferente de `application/json` | `415` | `UNSUPPORTED_MEDIA_TYPE` |
 | Conflito | `409` | `IDEMPOTENCY_CONFLICT`, `DUPLICATE_EXTERNAL_TRANSACTION`, `WALLET_ALREADY_EXISTS` |
 | Indisponibilidade transitória (banco, lock timeout, disputa esgotada) | `503` | `{code:"SERVICE_UNAVAILABLE"}` + `Retry-After: 1`; repetir com a mesma chave |
 | Erro inesperado | `500` | `{code:"INTERNAL_ERROR"}` (detalhes só no log) |
 
-As mensagens de erro são fixas por código, então o contexto interno de erros encapsulados nunca chega ao cliente. A exceção é `INVALID_REQUEST`, cuja mensagem descreve a própria entrada do cliente para que ele a corrija. O esquema `Bearer` do header `Authorization` é aceito sem diferenciar maiúsculas (RFC 6750). O servidor aplica `ReadHeaderTimeout` 5 s, `ReadTimeout` 15 s e `WriteTimeout` 30 s.
+As mensagens de erro são fixas por código, então o contexto interno de erros encapsulados nunca chega ao cliente. A exceção é `INVALID_REQUEST`, cuja mensagem descreve a própria entrada do cliente para que ele a corrija, em termos do contrato e nunca de tipos internos: `body is required`, `malformed JSON at offset N`, `field initialBalance.amount must be a string`, `unknown field "x"`, `body must contain a single JSON object`. Toda resposta, inclusive 404/405, é JSON, passa pelo log de acesso e pelas métricas (rota `unmatched`) e devolve `X-Correlation-Id`. O esquema `Bearer` do header `Authorization` é aceito sem diferenciar maiúsculas (RFC 6750). O servidor aplica `ReadHeaderTimeout` 5 s, `ReadTimeout` 15 s e `WriteTimeout` 30 s; um `panic` num handler vira `500` só se nada foi escrito ainda (e `http.ErrAbortHandler` é repassado).
+
+`Idempotency-Key` é obrigatório, tem espaços das pontas removidos, no máximo 128 caracteres e só ASCII imprimível. UUIDs de rota não podem ser nulos.
 
 O saldo observado (`balance` do resultado) é persistido com a própria moeda (`result_currency`). Numa rejeição `CURRENCY_MISMATCH`, o replay devolve o saldo na moeda da carteira, e não na moeda da operação.
 
-`X-Correlation-Id` é aceito (ou gerado) e devolvido. O ledger usa um cursor opaco (`base64url("v1:<seq>")`) sobre uma sequência crescente (`seq`), com ordem estável; `limit` vai de 1 a 200 (padrão 50).
+`X-Correlation-Id` é aceito se casar com `^[A-Za-z0-9._:-]{1,128}$` (senão é substituído por um UUID gerado) e devolvido. O ledger usa um cursor opaco (`base64url("v1:<seq>")`) sobre uma sequência crescente (`seq`), com ordem estável; `limit`, quando informado, vai de 1 a 200 (`limit=0` é `400`); ausente, vale 50.
 
 ## 14. Códigos de falha (`failureCode`)
 
@@ -210,15 +224,16 @@ Todos são **resultados definitivos**, persistidos em `REJECTED`/`FAILED`: a ope
 ## 16. Observabilidade
 
 - Logs JSON (`slog`) com `service`, `instance` e, conforme disponíveis, `correlationId`, `messageId`, `transactionId`, `walletId`, `providerId` e `clientId` (propagados pelo contexto). Tokens, segredos e payloads financeiros completos não são registrados.
-- Métricas em `/metrics`: `wager_transactions_total{source,status}`, `wager_duplicates_total`, `wallet_concurrency_conflicts_total`, `wager_processing_seconds`, `wager_pending_resolutions_total`, `sqs_messages_total{outcome=processed|duplicate|retry|dlq|released}`, `outbox_published_total`, `outbox_publish_failures_total`, `outbox_lag_seconds`, `wallet_reconciliation_divergences_total`, `http_requests_total` e `http_request_duration_seconds`, além das métricas de runtime Go e de processo.
-- `GET /health/live` (processo) e `GET /health/ready` (ping no PostgreSQL + `GetQueueAttributes` no SQS).
+- Métricas em `/metrics`: `wager_transactions_total{source,status}`, `wager_duplicates_total`, `wallet_concurrency_conflicts_total`, `wager_processing_seconds`, `wager_pending_resolutions_total`, `sqs_messages_total{outcome=processed|duplicate|retry|dlq|released}`, `outbox_published_total`, `outbox_publish_failures_total`, `outbox_dead_lettered_total`, `outbox_lag_seconds`, `wallet_reconciliation_divergences_total`, `http_requests_total` e `http_request_duration_seconds`, além das métricas de runtime Go e de processo.
+- `GET /health/live` (processo) e `GET /health/ready` (ping no PostgreSQL + `GetQueueAttributes` no SQS, em paralelo, cada um com `READY_TIMEOUT` inteiro).
 
 ## 17. Testes
 
 - **Unitários** (`go test ./...`, sem Docker): Money (parsing, escala, limites, overflow, moedas), carteira e ledger, estados, regras dos cinco tipos e política de zero, abertura com metadados e eventos, conflito de payload, casos de uso sobre um store em memória com falhas injetáveis, HTTP, consumidor e publisher SQS com API falsa, relay, config e observabilidade.
 - **Integração** (`-tags integration`): PostgreSQL, LocalStack e Keycloak reais via testcontainers (ver README).
 - **E2E** (`-tags e2e`): o binário real, 3 processos, SIGKILL e reinício.
-- Cobertura combinada (`make coverage`): 100% de `cmd/` e `internal/`. Os testes de integração e e2e compartilham um banco, então usam IDs externos únicos, e os testes de outbox rodam em série porque os relays reivindicam a outbox inteira.
+- Helpers compartilhados: `internal/testutil` (sem build tag: dinheiro, relógio falso, registro de métricas, buffer sincronizado) para os unitários, e `test/testenv` (containers, cliente HTTP, corpos de operação, envelope SQS via `sqs.EncodeMessage`) para integração e e2e.
+- Cobertura combinada (`make coverage`) de `cmd/` e `internal/`. Os testes de integração e e2e compartilham um banco, então usam IDs externos únicos, e os testes de outbox rodam em série porque os relays reivindicam a outbox inteira. O e2e roda o binário real sem `-race`.
 
 ## 18. Limitações, interpretações e trabalho não concluído
 

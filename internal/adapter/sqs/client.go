@@ -25,10 +25,15 @@ type API interface {
 	SetQueueAttributes(ctx context.Context, in *sqs.SetQueueAttributesInput, opts ...func(*sqs.Options)) (*sqs.SetQueueAttributesOutput, error)
 }
 
+// The SDK client satisfies API.
+var _ API = (*sqs.Client)(nil)
+
 // ClientConfig configures the SQS client. Credentials come from the default
 // AWS chain (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY locally).
 type ClientConfig struct {
-	Region   string
+	// Region is the AWS region of the queues.
+	Region string
+	// Endpoint overrides the SQS endpoint (LocalStack); empty means AWS.
 	Endpoint string
 }
 
@@ -45,17 +50,23 @@ func NewClient(ctx context.Context, cfg ClientConfig) (*sqs.Client, error) {
 	}), nil
 }
 
-// QueueNames are the logical queue names.
+// QueueNames are the logical queue names (all FIFO, ending in .fifo).
 type QueueNames struct {
-	Input  string
-	DLQ    string
+	// Input receives wager-transaction requests.
+	Input string
+	// DLQ receives the invalid and exhausted input messages.
+	DLQ string
+	// Events receives the outbox (wallet events).
 	Events string
 }
 
-// Queues are the resolved queue URLs.
+// Queues are the resolved queue URLs, in the same order as QueueNames.
 type Queues struct {
-	Input  string
-	DLQ    string
+	// Input is the URL of the wager-transactions queue.
+	Input string
+	// DLQ is the URL of its dead-letter queue.
+	DLQ string
+	// Events is the URL of the outbox events queue.
 	Events string
 }
 
@@ -77,8 +88,12 @@ func ResolveQueues(ctx context.Context, api API, names QueueNames) (Queues, erro
 
 // ProvisionConfig configures queue creation.
 type ProvisionConfig struct {
-	Names             QueueNames
-	MaxReceiveCount   int
+	// Names are the queues to create.
+	Names QueueNames
+	// MaxReceiveCount is the redrive threshold of the input queue.
+	MaxReceiveCount int
+	// VisibilityTimeout, in seconds, is the input queue attribute; the
+	// consumer's ConsumerConfig.VisibilityTimeout must agree with it.
 	VisibilityTimeout int
 }
 

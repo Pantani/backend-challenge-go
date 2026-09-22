@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"log/slog"
 	"strconv"
 	"strings"
 
@@ -18,18 +17,15 @@ import (
 
 // Ledger page size limits.
 const (
+	// DefaultLedgerLimit is the page size when the caller gives none.
 	DefaultLedgerLimit = 50
-	MaxLedgerLimit     = 200
+	// MaxLedgerLimit is the largest page a caller may request.
+	MaxLedgerLimit = 200
 )
 
 // WalletDeps are the collaborators of WalletService.
 type WalletDeps struct {
-	UoW     UnitOfWork
-	Queries Queries
-	Clock   Clock
-	IDs     IDGenerator
-	Metrics Metrics
-	Logger  *slog.Logger
+	Deps
 }
 
 // WalletService implements the internal wallet operations.
@@ -53,7 +49,7 @@ func (s *WalletService) Open(ctx context.Context, cmd OpenWalletCommand) (*walle
 		OpeningTxID: openingTxID, OpeningEntryID: s.IDs.New(), Now: now,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrValidation, err)
+		return nil, invalid(err)
 	}
 	err = s.UoW.Do(ctx, func(ctx context.Context, r Repositories) error {
 		if err := r.Wallets().Create(ctx, w); err != nil || entry == nil {
@@ -68,9 +64,7 @@ func (s *WalletService) Open(ctx context.Context, cmd OpenWalletCommand) (*walle
 }
 
 func (s *WalletService) persistOpening(ctx context.Context, r Repositories, w *wallet.Wallet, entry wallet.LedgerEntry, correlation string) error {
-	meta := func() event.Meta {
-		return event.Meta{EventID: s.IDs.New(), CorrelationID: correlation, OccurredAt: entry.CreatedAt()}
-	}
+	meta := func() event.Meta { return newMeta(s.IDs, correlation, "", entry.CreatedAt()) }
 	var tx *wager.Transaction
 	return sequence(
 		func() (err error) {
@@ -98,7 +92,9 @@ func (s *WalletService) Get(ctx context.Context, id uuid.UUID) (*wallet.Wallet, 
 
 // LedgerPage is one page of ledger entries in stable (append) order.
 type LedgerPage struct {
-	Entries    []wallet.LedgerEntry
+	// Entries are the page's entries, oldest first.
+	Entries []wallet.LedgerEntry
+	// NextCursor requests the following page; empty on the last page.
 	NextCursor string
 }
 
@@ -155,22 +151,28 @@ func decodeCursor(cursor string) (int64, error) {
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(cursor)
 	if err != nil || !strings.HasPrefix(string(raw), cursorPrefix) {
-		return 0, fmt.Errorf("%w: invalid cursor", ErrValidation)
+		return 0, invalid(errInvalidCursor)
 	}
 	seq, err := strconv.ParseInt(strings.TrimPrefix(string(raw), cursorPrefix), 10, 64)
 	if err != nil || seq < 0 {
-		return 0, fmt.Errorf("%w: invalid cursor", ErrValidation)
+		return 0, invalid(errInvalidCursor)
 	}
 	return seq, nil
 }
 
 // Reconciliation compares the stored balance with the ledger.
 type Reconciliation struct {
-	WalletID       uuid.UUID
-	Stored         money.Money
-	Calculated     money.Money
-	Difference     money.Money
-	Consistent     bool
+	// WalletID is the reconciled wallet.
+	WalletID uuid.UUID
+	// Stored is the balance kept on the wallet row.
+	Stored money.Money
+	// Calculated is the balance rebuilt from the ledger (opening included).
+	Calculated money.Money
+	// Difference is Stored minus Calculated.
+	Difference money.Money
+	// Consistent reports a zero Difference.
+	Consistent bool
+	// CheckedEntries is how many ledger entries were summed.
 	CheckedEntries int64
 }
 

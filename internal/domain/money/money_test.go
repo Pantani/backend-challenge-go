@@ -8,14 +8,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Pantani/backend-challenge-go/internal/domain/money"
+	"github.com/Pantani/backend-challenge-go/internal/testutil"
 )
-
-func brl(t *testing.T, amount string) money.Money {
-	t.Helper()
-	m, err := money.Parse(amount, "BRL")
-	require.NoError(t, err)
-	return m
-}
 
 func minor(t *testing.T, v int64) money.Money {
 	t.Helper()
@@ -35,9 +29,10 @@ func TestParseValid(t *testing.T) {
 		"1000.99":              100099,
 		"92233720368547757.00": 9223372036854775700,
 		"92233720368547757.99": 9223372036854775799,
+		"92233720368547758.07": math.MaxInt64,
 	}
 	for in, want := range cases {
-		m := brl(t, in)
+		m := testutil.BRL(t, in)
 		assert.Equal(t, want, m.Minor(), in)
 		assert.Equal(t, money.Currency("BRL"), m.Currency())
 		assert.Equal(t, in, m.Amount(), "round trip")
@@ -66,7 +61,8 @@ func TestParseInvalid(t *testing.T) {
 		{".50", "BRL", money.ErrInvalidAmount},
 		{"-25.00", "BRL", money.ErrNegativeAmount},
 		{"-0.00", "BRL", money.ErrNegativeAmount},
-		{"92233720368547758.00", "BRL", money.ErrOverflow},
+		{"-abc", "BRL", money.ErrNegativeAmount}, // sign is checked before shape
+		{"92233720368547758.08", "BRL", money.ErrOverflow},
 		{"99999999999999999999999.00", "BRL", money.ErrOverflow},
 		{"25.00", "", money.ErrInvalidCurrency},
 		{"25.00", "brl", money.ErrInvalidCurrency},
@@ -79,6 +75,14 @@ func TestParseInvalid(t *testing.T) {
 	}
 }
 
+func TestParseMaxRoundTrip(t *testing.T) {
+	t.Parallel()
+	maxM := minor(t, math.MaxInt64)
+	got, err := money.Parse(maxM.Amount(), "BRL")
+	require.NoError(t, err)
+	assert.Equal(t, maxM, got)
+}
+
 func TestFromMinor(t *testing.T) {
 	t.Parallel()
 	_, err := money.FromMinor(1, "XYZ")
@@ -88,6 +92,8 @@ func TestFromMinor(t *testing.T) {
 
 	neg := minor(t, -505)
 	assert.Equal(t, "-5.05", neg.Amount())
+	assert.Equal(t, "-5.05 BRL", neg.String())
+	assert.Equal(t, "5.05", neg.Neg().Amount())
 	assert.True(t, neg.IsNegative())
 	assert.False(t, neg.IsPositive())
 	assert.False(t, neg.IsZero())
@@ -99,13 +105,14 @@ func TestZero(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, z.IsZero())
 	assert.Equal(t, "0.00 USD", z.String())
+	assert.Equal(t, z, z.Neg(), "negating zero is a no-op")
 	_, err = money.Zero("nope")
 	require.ErrorIs(t, err, money.ErrInvalidCurrency)
 }
 
 func TestArithmetic(t *testing.T) {
 	t.Parallel()
-	a, b := brl(t, "100.00"), brl(t, "80.00")
+	a, b := testutil.BRL(t, "100.00"), testutil.BRL(t, "80.00")
 	sum, err := a.Add(b)
 	require.NoError(t, err)
 	assert.Equal(t, "180.00", sum.Amount())
@@ -116,13 +123,13 @@ func TestArithmetic(t *testing.T) {
 
 	assert.Equal(t, "-100.00", a.Neg().Amount())
 	assert.Equal(t, a, a.Neg().Neg())
-	assert.True(t, a.Equal(brl(t, "100.00")))
+	assert.True(t, a.Equal(testutil.BRL(t, "100.00")))
 	assert.False(t, a.Equal(b))
 }
 
 func TestCompare(t *testing.T) {
 	t.Parallel()
-	a, b := brl(t, "1.00"), brl(t, "2.00")
+	a, b := testutil.BRL(t, "1.00"), testutil.BRL(t, "2.00")
 	cases := []struct {
 		x, y money.Money
 		want int
@@ -136,7 +143,7 @@ func TestCompare(t *testing.T) {
 
 func TestCurrencyMismatch(t *testing.T) {
 	t.Parallel()
-	b := brl(t, "1.00")
+	b := testutil.BRL(t, "1.00")
 	usd, err := money.Parse("1.00", "USD")
 	require.NoError(t, err)
 
@@ -146,12 +153,13 @@ func TestCurrencyMismatch(t *testing.T) {
 	assert.ErrorIs(t, err, money.ErrCurrencyMismatch)
 	_, err = b.Cmp(usd)
 	assert.ErrorIs(t, err, money.ErrCurrencyMismatch)
+	assert.False(t, b.Equal(usd), "same amount, different currency")
 }
 
 func TestUninitialized(t *testing.T) {
 	t.Parallel()
 	var zero money.Money
-	valid := brl(t, "1.00")
+	valid := testutil.BRL(t, "1.00")
 	require.ErrorIs(t, zero.Validate(), money.ErrUninitialized)
 	require.NoError(t, valid.Validate())
 
@@ -159,6 +167,7 @@ func TestUninitialized(t *testing.T) {
 		func() error { _, err := zero.Add(valid); return err },
 		func() error { _, err := valid.Add(zero); return err },
 		func() error { _, err := valid.Sub(zero); return err },
+		func() error { _, err := zero.Sub(valid); return err },
 		func() error { _, err := zero.Cmp(valid); return err },
 	}
 	for _, op := range ops {

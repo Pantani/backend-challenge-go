@@ -3,6 +3,7 @@ package app_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"maps"
 	"slices"
 	"sync"
@@ -16,8 +17,11 @@ import (
 	"github.com/Pantani/backend-challenge-go/internal/domain/wallet"
 )
 
-// errTerminal emulates the database guard trigger on terminal transactions.
-var errTerminal = errors.New("memstore: terminal transaction cannot change")
+// Errors emulating the database guards (triggers and CHECK constraints).
+var (
+	errTerminal = errors.New("memstore: terminal transaction cannot change")
+	errCheck    = errors.New("memstore: check constraint violated")
+)
 
 type inboxRow struct {
 	hash      string
@@ -42,8 +46,11 @@ func (s state) clone() state {
 }
 
 // memStore is an in-memory implementation of the persistence ports. One
-// mutex serializes units of work (the strongest isolation), unique
-// constraints mirror the schema and failures can be injected per operation.
+// mutex serializes units of work (the strongest isolation), unique and
+// CHECK constraints mirror the schema and failures can be injected per
+// operation. Row lock semantics (FOR UPDATE, SKIP LOCKED, lock timeouts)
+// are not modelled here: they are only covered by the integration tests
+// against PostgreSQL.
 type memStore struct {
 	mu       sync.Mutex
 	st       state
@@ -75,7 +82,8 @@ func (m *memStore) fail(op string) error {
 	return errs[0]
 }
 
-// Do implements app.UnitOfWork.
+// Do implements app.UnitOfWork. Like PostgreSQL, a failed commit leaves
+// nothing behind: the state is restored from the backup taken before fn.
 func (m *memStore) Do(ctx context.Context, fn func(ctx context.Context, r app.Repositories) error) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -83,11 +91,14 @@ func (m *memStore) Do(ctx context.Context, fn func(ctx context.Context, r app.Re
 		return err
 	}
 	backup := m.st.clone()
-	if err := fn(ctx, memRepos{m}); err != nil {
-		m.st = backup
-		return err
+	err := fn(ctx, memRepos{m})
+	if err == nil {
+		err = m.fail("uow.commit")
 	}
-	return m.fail("uow.commit")
+	if err != nil {
+		m.st = backup
+	}
+	return err
 }
 
 type memRepos struct{ m *memStore }
@@ -148,15 +159,32 @@ func (m *memStore) getWallet(id uuid.UUID) (*wallet.Wallet, error) {
 	return wallet.Rehydrate(s)
 }
 
+// Save mirrors the optimistic UPDATE: the stored version must still be the
+// expected one, the balance never goes negative and the version grows by
+// exactly one when (and only when) the balance changes.
 func (r memWallets) Save(_ context.Context, w *wallet.Wallet, expected int64) error {
 	if err := r.m.fail("wallets.save"); err != nil {
 		return err
 	}
-	if r.m.st.wallets[w.ID()].Version != expected {
+	stored := r.m.st.wallets[w.ID()]
+	if stored.Version != expected {
 		return app.ErrConflict
+	}
+	if w.Balance().IsNegative() {
+		return errCheck
+	}
+	if bump := !stored.Balance.Equal(w.Balance()); w.Version() != stored.Version+versionDelta(bump) {
+		return errCheck
 	}
 	r.m.st.wallets[w.ID()] = walletSnapshot(w)
 	return nil
+}
+
+func versionDelta(bump bool) int64 {
+	if bump {
+		return 1
+	}
+	return 0
 }
 
 type memTxs memRepos
@@ -170,8 +198,38 @@ func (r memTxs) Create(_ context.Context, t *wager.Transaction) error {
 			return app.ErrConflict
 		}
 	}
-	r.m.st.txs[t.ID()] = txSnapshot(t)
+	row := txSnapshot(t)
+	if err := checkRow(row); err != nil {
+		return err
+	}
+	r.m.st.txs[t.ID()] = row
 	r.m.st.order = append(r.m.st.order, t.ID())
+	return nil
+}
+
+// rowChecks mirrors the CHECK constraints of wager_transactions.
+var rowChecks = map[string]func(s wager.Snapshot) bool{
+	"failure_code required in REJECTED/FAILED": func(s wager.Snapshot) bool {
+		return s.Status.Terminal() && s.Status != wager.StatusProcessed && s.FailureCode == ""
+	},
+	"result balance required in PROCESSED": func(s wager.Snapshot) bool {
+		return s.Status == wager.StatusProcessed && s.ResultBalance.Validate() != nil
+	},
+	"next_attempt_at required in PENDING_REFERENCE": func(s wager.Snapshot) bool {
+		return s.Status == wager.StatusPendingReference && s.NextAttemptAt.IsZero()
+	},
+	"reference required for reversals": func(s wager.Snapshot) bool {
+		return s.Kind.IsReversal() && s.External.ReferenceExternalID == ""
+	},
+}
+
+// checkRow rejects rows the database CHECK constraints would reject.
+func checkRow(s wager.Snapshot) error {
+	for name, violated := range rowChecks {
+		if violated(s) {
+			return fmt.Errorf("%w: %s", errCheck, name)
+		}
+	}
 	return nil
 }
 
@@ -201,7 +259,11 @@ func (r memTxs) Save(_ context.Context, t *wager.Transaction) error {
 	if r.m.st.txs[t.ID()].Status.Terminal() {
 		return errTerminal
 	}
-	r.m.st.txs[t.ID()] = txSnapshot(t)
+	row := txSnapshot(t)
+	if err := checkRow(row); err != nil {
+		return err
+	}
+	r.m.st.txs[t.ID()] = row
 	return nil
 }
 
@@ -284,6 +346,11 @@ func (r memLedger) Append(_ context.Context, e wallet.LedgerEntry) error {
 	if err := r.m.fail("ledger.append"); err != nil {
 		return err
 	}
+	for _, row := range r.m.st.ledger {
+		if row.Entry.WalletID() == e.WalletID() && row.Entry.TransactionID() == e.TransactionID() {
+			return app.ErrConflict
+		}
+	}
 	r.m.st.ledger = append(r.m.st.ledger, app.LedgerRow{Seq: int64(len(r.m.st.ledger) + 1), Entry: e})
 	return nil
 }
@@ -352,6 +419,9 @@ func (m *memStore) ListLedger(_ context.Context, walletID uuid.UUID, after int64
 func (m *memStore) GetTransaction(_ context.Context, id uuid.UUID) (*wager.Transaction, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.fail("q.tx"); err != nil {
+		return nil, err
+	}
 	s, ok := m.st.txs[id]
 	if !ok {
 		return nil, app.ErrTransactionNotFound
@@ -362,6 +432,9 @@ func (m *memStore) GetTransaction(_ context.Context, id uuid.UUID) (*wager.Trans
 func (m *memStore) GetTransactionByExternal(_ context.Context, providerID, externalID string) (*wager.Transaction, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.fail("q.txByExternal"); err != nil {
+		return nil, err
+	}
 	return m.byExternal(providerID, externalID)
 }
 
@@ -410,6 +483,20 @@ func (m *memStore) ListDuePending(_ context.Context, now time.Time, limit int) (
 }
 
 // Test helpers.
+
+// txCount returns how many transaction rows are stored.
+func (m *memStore) txCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.st.txs)
+}
+
+// outboxCount returns how many outbox records are stored.
+func (m *memStore) outboxCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.st.outbox)
+}
 
 func (m *memStore) outboxTypes() []string {
 	m.mu.Lock()

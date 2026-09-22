@@ -71,3 +71,49 @@ func TestMetrics(t *testing.T) {
 wager_duplicates_total{source="sqs"} 1
 `), "wager_duplicates_total"))
 }
+
+func TestParseLevel(t *testing.T) {
+	t.Parallel()
+	for in, want := range map[string]slog.Level{"debug": slog.LevelDebug, "INFO": slog.LevelInfo, "Warn": slog.LevelWarn, "error": slog.LevelError} {
+		got, err := observability.ParseLevel(in)
+		require.NoError(t, err, in)
+		assert.Equal(t, want, got, in)
+	}
+	_, err := observability.ParseLevel("loud")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "loud")
+}
+
+func TestWithAttrsOnEmptyContextAndMergeOrder(t *testing.T) {
+	t.Parallel()
+	buf := &bytes.Buffer{}
+	logger := observability.NewLogger(buf, "info", "i")
+	logger.InfoContext(context.Background(), "plain")
+	var rec map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &rec))
+	assert.NotContains(t, rec, "walletId", "an empty context adds nothing")
+
+	ctx := observability.WithAttrs(context.Background(), slog.String("k", "first"), slog.String("only", "1"))
+	ctx = observability.WithAttrs(ctx, slog.String("k", "second"))
+	buf.Reset()
+	logger.InfoContext(ctx, "merged")
+	line := buf.String()
+	assert.Less(t, strings.Index(line, `"k":"first"`), strings.Index(line, `"k":"second"`), "earlier attributes come first, later ones are appended")
+	assert.Contains(t, line, `"only":"1"`)
+}
+
+func TestMetricNamesAndLabels(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := observability.NewMetrics(reg)
+	m.TransactionResult("http", wager.StatusProcessed, false)
+	m.HTTPRequest("GET /wallets/{id}", 404, time.Millisecond)
+	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+# HELP wager_transactions_total Concluded wager submissions by source and status.
+# TYPE wager_transactions_total counter
+wager_transactions_total{source="http",status="PROCESSED"} 1
+# HELP http_requests_total HTTP requests by route and status code.
+# TYPE http_requests_total counter
+http_requests_total{code="404",route="GET /wallets/{id}"} 1
+`), "wager_transactions_total", "http_requests_total"))
+}

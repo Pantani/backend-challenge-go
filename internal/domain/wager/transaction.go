@@ -14,20 +14,36 @@ const maxFieldLength = 128
 
 // External holds the provider metadata of an external operation.
 type External struct {
-	ProviderID          string
-	ExternalID          string
-	IdempotencyKey      string
-	PayloadHash         string
-	RoundID             string
-	GameID              string
+	// ProviderID identifies the game provider that submitted the operation.
+	ProviderID string
+	// ExternalID is the provider's transaction identifier, unique per provider.
+	ExternalID string
+	// IdempotencyKey is the caller supplied key used to deduplicate retries.
+	IdempotencyKey string
+	// PayloadHash is Fingerprint.Hash() of the business fields, used to detect
+	// a reused idempotency key with a different payload.
+	PayloadHash string
+	// RoundID groups the operations of one game round.
+	RoundID string
+	// GameID identifies the game the round belongs to.
+	GameID string
+	// ReferenceExternalID names the provider transaction this one refers to;
+	// empty when the kind carries no reference.
 	ReferenceExternalID string
 }
 
 func (e External) validate(kind Kind) error {
-	for _, f := range []string{e.ProviderID, e.ExternalID, e.IdempotencyKey, e.PayloadHash, e.RoundID, e.GameID} {
-		if f == "" || len(f) > maxFieldLength {
-			return fmt.Errorf("%w: provider metadata must be non-empty and at most %d bytes", ErrInvalidTransaction, maxFieldLength)
+	fields := []struct{ name, value string }{
+		{"providerId", e.ProviderID}, {"externalTransactionId", e.ExternalID}, {"idempotencyKey", e.IdempotencyKey},
+		{"payloadHash", e.PayloadHash}, {"roundId", e.RoundID}, {"gameId", e.GameID},
+	}
+	for _, f := range fields {
+		if f.value == "" || len(f.value) > maxFieldLength {
+			return fmt.Errorf("%w: %s must be non-empty and at most %d bytes", ErrInvalidTransaction, f.name, maxFieldLength)
 		}
+	}
+	if e.ReferenceExternalID != "" && e.ReferenceExternalID == e.ExternalID {
+		return fmt.Errorf("%w: an operation cannot reference itself", ErrInvalidTransaction)
 	}
 	return validateReference(kind, e.ReferenceExternalID)
 }
@@ -81,8 +97,8 @@ type ExternalParams struct {
 // NewExternal creates a PENDING provider operation, enforcing the zero-value
 // policy: LOSS requires exactly 0.00, every other kind requires a positive amount.
 func NewExternal(p ExternalParams) (*Transaction, error) {
-	if _, err := ParseExternalKind(string(p.Kind)); err != nil {
-		return nil, err
+	if !p.Kind.External() {
+		return nil, fmt.Errorf("%w: %q", ErrInvalidKind, p.Kind)
 	}
 	if err := validateCore(p.ID, p.WalletID, p.PlayerID, p.Now); err != nil {
 		return nil, err
@@ -115,8 +131,8 @@ func NewOpening(p OpeningParams) (*Transaction, error) {
 	if err := validateCore(p.ID, p.WalletID, p.PlayerID, p.Now); err != nil {
 		return nil, err
 	}
-	if p.Amount.Validate() != nil || !p.Amount.IsPositive() {
-		return nil, fmt.Errorf("%w: opening amount must be positive", ErrInvalidTransaction)
+	if err := validateAmount(KindOpening, p.Amount); err != nil {
+		return nil, err
 	}
 	now := p.Now.UTC()
 	return &Transaction{id: p.ID, origin: OriginInternal, kind: KindOpening, status: StatusPending,
@@ -196,16 +212,30 @@ func (t *Transaction) ensureOpen(target Status) error {
 }
 
 // Process moves the transaction to PROCESSED, recording the balance returned
-// to the provider and the resolved reference (uuid.Nil when none).
+// to the provider and the resolved reference. The reference must be uuid.Nil
+// for kinds that accept none and must be set for kinds that require one.
 func (t *Transaction) Process(balance money.Money, referenceTxID uuid.UUID, now time.Time) error {
 	if err := t.ensureOpen(StatusProcessed); err != nil {
 		return err
 	}
-	if balance.Validate() != nil {
-		return fmt.Errorf("%w: processed transaction needs a result balance", ErrInvalidTransaction)
+	if err := requireBalance(balance, "processed"); err != nil {
+		return err
+	}
+	if err := t.checkResolvedReference(referenceTxID); err != nil {
+		return err
 	}
 	t.status, t.resultBalance, t.referenceTxID = StatusProcessed, balance, referenceTxID
 	t.touch(now)
+	return nil
+}
+
+func (t *Transaction) checkResolvedReference(referenceTxID uuid.UUID) error {
+	if referenceTxID != uuid.Nil && !t.kind.AcceptsReference() {
+		return fmt.Errorf("%w: %s cannot resolve a reference", ErrInvalidTransaction, t.kind)
+	}
+	if referenceTxID == uuid.Nil && t.kind.RequiresReference() {
+		return fmt.Errorf("%w: %s needs a resolved reference", ErrInvalidTransaction, t.kind)
+	}
 	return nil
 }
 
@@ -215,8 +245,11 @@ func (t *Transaction) Reject(code FailureCode, observed money.Money, now time.Ti
 	if err := t.ensureOpen(StatusRejected); err != nil {
 		return err
 	}
-	if code == "" {
-		return fmt.Errorf("%w: rejection requires a failure code", ErrInvalidTransaction)
+	if err := requireCode(code, "rejection"); err != nil {
+		return err
+	}
+	if err := requireBalance(observed, "rejected"); err != nil {
+		return err
 	}
 	t.status, t.failureCode, t.resultBalance = StatusRejected, code, observed
 	t.touch(now)
@@ -228,8 +261,25 @@ func (t *Transaction) Fail(code FailureCode, now time.Time) error {
 	if err := t.ensureOpen(StatusFailed); err != nil {
 		return err
 	}
+	if err := requireCode(code, "failure"); err != nil {
+		return err
+	}
 	t.status, t.failureCode = StatusFailed, code
 	t.touch(now)
+	return nil
+}
+
+func requireCode(code FailureCode, what string) error {
+	if code == "" {
+		return fmt.Errorf("%w: %s requires a failure code", ErrInvalidTransaction, what)
+	}
+	return nil
+}
+
+func requireBalance(balance money.Money, what string) error {
+	if balance.Validate() != nil {
+		return fmt.Errorf("%w: %s transaction needs a result balance", ErrInvalidTransaction, what)
+	}
 	return nil
 }
 
@@ -282,7 +332,8 @@ func (t *Transaction) ReferenceTxID() uuid.UUID { return t.referenceTxID }
 func (t *Transaction) FailureCode() FailureCode { return t.failureCode }
 
 // ResultBalance returns the balance observed when the operation concluded.
-// It is the zero Money while the operation has not concluded.
+// It is the zero Money while the operation has not concluded and also after
+// Fail, which records no balance.
 func (t *Transaction) ResultBalance() money.Money { return t.resultBalance }
 
 // Attempts returns how many times the reference resolution was deferred.

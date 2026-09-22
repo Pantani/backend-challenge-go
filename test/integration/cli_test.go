@@ -5,6 +5,11 @@ package integration_test
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -13,19 +18,31 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Pantani/backend-challenge-go/internal/cli"
+	"github.com/Pantani/backend-challenge-go/internal/config"
+	"github.com/Pantani/backend-challenge-go/test/testenv"
 )
 
-func lookup(vars map[string]string) func(string) (string, bool) {
-	return func(k string) (string, bool) {
-		v, ok := vars[k]
-		return v, ok
+// latestMigration is the highest migration number in the embedded set.
+func latestMigration(t *testing.T) int {
+	t.Helper()
+	files, err := filepath.Glob(filepath.Join("..", "..", "internal", "adapter", "postgres", "migrations", "*.up.sql"))
+	require.NoError(t, err)
+	require.NotEmpty(t, files)
+	latest := 0
+	for _, f := range files {
+		n, err := strconv.Atoi(strings.SplitN(filepath.Base(f), "_", 2)[0])
+		require.NoError(t, err, f)
+		latest = max(latest, n)
 	}
+	return latest
 }
 
-func runCLI(ctx context.Context, vars map[string]string, args ...string) (int, string) {
-	var out bytes.Buffer
-	code := cli.Run(ctx, args, lookup(env.Vars(vars)), &out)
-	return code, out.String()
+// runCLI runs the binary's entry point against the containers and returns
+// the exit code, stdout and stderr.
+func runCLI(ctx context.Context, vars map[string]string, args ...string) (code int, stdout, stderr string) {
+	var out, errOut bytes.Buffer
+	code = cli.Run(ctx, args, config.MapLookup(env.Vars(vars)), &out, &errOut)
+	return code, out.String(), errOut.String()
 }
 
 func TestCLIMigrations(t *testing.T) {
@@ -35,58 +52,78 @@ func TestCLIMigrations(t *testing.T) {
 	db := map[string]string{"DATABASE_URL": strings.Replace(env.DatabaseURL, "/wallet?", "/cli_check?", 1)}
 	ctx := context.Background()
 
-	code, out := runCLI(ctx, db, "migrate", "up")
-	require.Zero(t, code, out)
-	code, out = runCLI(ctx, db, "migrate", "version")
+	code, out, stderr := runCLI(ctx, db, "migrate", "up")
+	require.Zero(t, code, stderr)
+	assert.Empty(t, out)
+	latest := latestMigration(t)
+	code, out, _ = runCLI(ctx, db, "migrate", "version")
 	require.Zero(t, code)
-	assert.Equal(t, "version=3 dirty=false\n", out)
-	code, _ = runCLI(ctx, db, "migrate", "down", "1")
+	assert.Equal(t, fmt.Sprintf("version=%d dirty=false\n", latest), out)
+	code, _, _ = runCLI(ctx, db, "migrate", "down", "1")
 	require.Zero(t, code)
-	code, out = runCLI(ctx, db, "migrate", "version")
+	code, out, _ = runCLI(ctx, db, "migrate", "version")
 	require.Zero(t, code)
-	assert.Equal(t, "version=2 dirty=false\n", out)
-	code, _ = runCLI(ctx, db, "migrate", "down", "2")
+	assert.Equal(t, fmt.Sprintf("version=%d dirty=false\n", latest-1), out)
+	code, _, _ = runCLI(ctx, db, "migrate", "down", strconv.Itoa(latest-1))
 	require.Zero(t, code)
-	code, out = runCLI(ctx, db, "migrate", "version")
+	code, out, _ = runCLI(ctx, db, "migrate", "version")
 	require.Zero(t, code)
 	assert.Equal(t, "version=0 dirty=false\n", out)
-	code, _ = runCLI(ctx, db, "migrate", "down")
+	code, _, _ = runCLI(ctx, db, "migrate", "down")
 	assert.Zero(t, code, "nothing left to revert is not an error")
 
 	for _, args := range [][]string{{"migrate"}, {"migrate", "sideways"}, {"migrate", "down", "zero"}, {"unknown"}} {
-		code, out := runCLI(ctx, db, args...)
-		assert.Equal(t, 1, code, args)
-		assert.Contains(t, out, "usage", args)
+		code, out, stderr := runCLI(ctx, db, args...)
+		assert.Equal(t, cli.ExitUsage, code, args)
+		assert.Empty(t, out, args)
+		assert.Contains(t, stderr, "usage", args)
 	}
-	code, out = runCLI(ctx, map[string]string{"DATABASE_URL": "postgres://%%%"}, "migrate", "up")
-	assert.Equal(t, 1, code)
-	assert.Contains(t, out, "error")
-	code, out = runCLI(ctx, map[string]string{"SQS_CONSUMERS": "0"}, "migrate", "up")
-	assert.Equal(t, 1, code)
-	assert.Contains(t, out, "invalid configuration")
+	code, _, stderr = runCLI(ctx, map[string]string{"DATABASE_URL": "postgres://%%%"}, "migrate", "up")
+	assert.Equal(t, cli.ExitError, code)
+	assert.Contains(t, stderr, "error:")
+	db["SQS_CONSUMERS"] = "0"
+	code, _, stderr = runCLI(ctx, db, "migrate", "up")
+	assert.Zero(t, code, "migrate reads only the database variables: %s", stderr)
 }
 
 func TestCLIProvisionQueues(t *testing.T) {
 	t.Parallel()
 	vars := map[string]string{"SQS_INPUT_QUEUE": "cli-in.fifo", "SQS_DLQ": "cli-dlq.fifo", "SQS_EVENTS_QUEUE": "cli-events.fifo"}
-	code, out := runCLI(context.Background(), vars, "provision-queues")
-	require.Zero(t, code, out)
+	vars["DB_MAX_CONNS"] = "0"
+	code, out, stderr := runCLI(context.Background(), vars, "provision-queues")
+	require.Zero(t, code, "provision reads only the AWS variables: %s", stderr)
 	assert.Contains(t, out, "cli-dlq.fifo")
 
-	code, _ = runCLI(context.Background(), map[string]string{"SQS_INPUT_QUEUE": "not-fifo"}, "provision-queues")
-	assert.Equal(t, 1, code, "a FIFO queue name must end in .fifo")
+	code, _, stderr = runCLI(context.Background(), map[string]string{"SQS_INPUT_QUEUE": "not-fifo"}, "provision-queues")
+	assert.Equal(t, cli.ExitError, code, "a FIFO queue name must end in .fifo")
+	assert.Contains(t, stderr, "error:")
+}
+
+// freeAddr reserves a loopback port for a server started by someone else.
+func freeAddr(t *testing.T) string {
+	t.Helper()
+	l, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer l.Close()
+	return l.Addr().String()
 }
 
 func TestCLIServeUntilCancelled(t *testing.T) {
 	t.Parallel()
 	_, _, names := provisionQueues(t, 3)
+	vars := queueVars(names)
+	vars["HTTP_ADDR"] = freeAddr(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan int, 1)
 	go func() {
-		code, _ := runCLI(ctx, queueVars(names))
+		code, _, _ := runCLI(ctx, vars)
 		done <- code
 	}()
-	time.Sleep(2 * time.Second)
+	ready := testenv.Client{Base: "http://" + vars["HTTP_ADDR"]}
+	require.Eventually(t, func() bool {
+		res, err := ready.Do(context.Background(), http.MethodGet, "/health/ready", "", "", nil)
+		return err == nil && res.Status == http.StatusOK
+	}, 30*time.Second, 200*time.Millisecond, "serve becomes ready")
 	cancel()
 	select {
 	case code := <-done:
@@ -95,14 +132,15 @@ func TestCLIServeUntilCancelled(t *testing.T) {
 		t.Fatal("serve did not stop")
 	}
 
-	code, out := runCLI(context.Background(), map[string]string{"SQS_INPUT_QUEUE": "missing.fifo"}, "serve")
-	assert.Equal(t, 1, code, out)
+	code, _, stderr := runCLI(context.Background(), map[string]string{"SQS_INPUT_QUEUE": "missing.fifo"}, "serve")
+	assert.Equal(t, cli.ExitError, code, stderr)
+	assert.Contains(t, stderr, "missing.fifo")
 }
 
 // Not parallel: it changes the environment read by the AWS SDK.
 func TestCLIProvisionWithBrokenAWSConfig(t *testing.T) {
 	t.Setenv("AWS_PROFILE", "profile-that-does-not-exist")
 	t.Setenv("AWS_CONFIG_FILE", t.TempDir()+"/missing")
-	code, _ := runCLI(context.Background(), nil, "provision-queues")
-	assert.Equal(t, 1, code)
+	code, _, _ := runCLI(context.Background(), nil, "provision-queues")
+	assert.Equal(t, cli.ExitError, code)
 }
