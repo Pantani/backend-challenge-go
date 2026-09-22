@@ -163,9 +163,10 @@ func CountDebits(ctx context.Context, pool *pgxpool.Pool, walletID string) (int,
 }
 
 // Parallel runs fn n times at once (every goroutine waits on a start gate)
-// and collects the results in call order.
-func Parallel[T any](n int, fn func(i int) T) []T {
-	out := make([]T, n)
+// and collects the results and joined worker errors in call order.
+func Parallel[T any](n int, fn func(i int) (T, error)) ([]T, error) {
+	values := make([]T, n)
+	errs := make([]error, n)
 	var wg, ready sync.WaitGroup
 	ready.Add(n)
 	start := make(chan struct{})
@@ -173,11 +174,11 @@ func Parallel[T any](n int, fn func(i int) T) []T {
 		wg.Go(func() {
 			ready.Done()
 			<-start
-			out[i] = fn(i)
+			values[i], errs[i] = fn(i)
 		})
 	}
 	ready.Wait()
 	close(start)
 	wg.Wait()
-	return out
+	return values, errors.Join(errs...)
 }

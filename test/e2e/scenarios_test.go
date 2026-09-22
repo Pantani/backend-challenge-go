@@ -4,7 +4,6 @@ package e2e_test
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"testing"
@@ -48,25 +47,15 @@ func debits(t *testing.T, w testenv.Wallet) int {
 	return n
 }
 
-type outcome struct {
-	res testenv.Response
-	err error
-}
-
 // concurrently submits n requests at once, round-robin across the
 // instances, and fails the test on the test goroutine if any request failed
 // (FailNow must never run on a worker goroutine).
 func concurrently(t *testing.T, n int, fn func(i int, inst *instance) (testenv.Response, error)) []testenv.Response {
 	t.Helper()
-	outcomes := testenv.Parallel(n, func(i int) outcome {
-		res, err := fn(i, instances[i%len(instances)])
-		return outcome{res: res, err: err}
+	results, err := testenv.Parallel(n, func(i int) (testenv.Response, error) {
+		return fn(i, instances[i%len(instances)])
 	})
-	results, errs := make([]testenv.Response, n), make([]error, n)
-	for i, o := range outcomes {
-		results[i], errs[i] = o.res, o.err
-	}
-	require.NoError(t, errors.Join(errs...))
+	require.NoError(t, err)
 	return results
 }
 
@@ -135,11 +124,14 @@ func TestSameOperationThroughHTTPAndSQSAcrossInstances(t *testing.T) {
 	res := submit(t, instances[2], w, ext, "BET", "10.00", "")
 	require.Contains(t, []int{http.StatusCreated, http.StatusOK}, res.Status)
 
-	require.Eventually(t, func() bool {
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
 		var done int
-		_ = pool.QueryRow(context.Background(), `SELECT count(*) FROM inbox_messages
+		err := pool.QueryRow(context.Background(), `SELECT count(*) FROM inbox_messages
 			WHERE message_id IN ($1, $2) AND processed_at IS NOT NULL`, "msg-"+ext, "msg-dup-"+ext).Scan(&done)
-		return done == 2
+		if !assert.NoError(collect, err) {
+			return
+		}
+		assert.Equal(collect, 2, done)
 	}, 30*time.Second, 200*time.Millisecond)
 	assert.Equal(t, "90.00", balance(t, w))
 	assert.Equal(t, 1, debits(t, w))
@@ -153,9 +145,13 @@ func TestRefundBeforeBetAcrossInstances(t *testing.T) {
 	assert.Equal(t, "PENDING_REFERENCE", pending.Body["status"])
 
 	require.Equal(t, http.StatusCreated, submit(t, instances[1], w, bet, "BET", "40.00", "").Status)
-	require.Eventually(t, func() bool {
-		res := call(t, instances[2], http.MethodGet, "/providers/provider-a/wagering/transactions/"+refund, "provider-a", "", nil)
-		return res.Body["status"] == "PROCESSED"
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		res, err := instances[2].client().Do(context.Background(), http.MethodGet,
+			"/providers/provider-a/wagering/transactions/"+refund, "provider-a", "", nil)
+		if !assert.NoError(collect, err) {
+			return
+		}
+		assert.Equal(collect, "PROCESSED", res.Body["status"])
 	}, 20*time.Second, 200*time.Millisecond, "resolved by the worker of whichever instance got it")
 	assert.Equal(t, "100.00", balance(t, w))
 
@@ -183,9 +179,13 @@ func TestZZCrashAndRestart(t *testing.T) {
 	assert.Equal(t, http.StatusOK, replay.Status)
 	assert.Equal(t, first.Body["transactionId"], replay.Body["transactionId"])
 	require.Equal(t, http.StatusCreated, submit(t, instances[0], w, lateBet, "BET", "20.00", "").Status)
-	require.Eventually(t, func() bool {
-		res := call(t, instances[1], http.MethodGet, "/providers/provider-a/wagering/transactions/"+refund, "provider-a", "", nil)
-		return res.Body["status"] == "PROCESSED"
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		res, err := instances[1].client().Do(context.Background(), http.MethodGet,
+			"/providers/provider-a/wagering/transactions/"+refund, "provider-a", "", nil)
+		if !assert.NoError(collect, err) {
+			return
+		}
+		assert.Equal(collect, "PROCESSED", res.Body["status"])
 	}, 30*time.Second, 200*time.Millisecond, "the pending reference survived the crash")
 	assert.Equal(t, "70.00", balance(t, w))
 }
@@ -210,9 +210,12 @@ func TestZZZFinalConsistency(t *testing.T) {
 	var negative int
 	require.NoError(t, pool.QueryRow(context.Background(), `SELECT count(*) FROM wallets WHERE balance_minor < 0`).Scan(&negative))
 	assert.Zero(t, negative)
-	require.Eventually(t, func() bool {
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
 		var pending int
-		_ = pool.QueryRow(context.Background(), `SELECT count(*) FROM outbox_events WHERE published_at IS NULL`).Scan(&pending)
-		return pending == 0
+		err := pool.QueryRow(context.Background(), `SELECT count(*) FROM outbox_events WHERE published_at IS NULL`).Scan(&pending)
+		if !assert.NoError(collect, err) {
+			return
+		}
+		assert.Zero(collect, pending)
 	}, 30*time.Second, 200*time.Millisecond, "every committed event was published by some instance")
 }

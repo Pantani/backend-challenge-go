@@ -62,9 +62,14 @@ func client(base string) testenv.Client {
 
 func (r runningApp) wallet(t *testing.T, id string) map[string]any {
 	t.Helper()
-	res := r.http.Call(t, http.MethodGet, "/wallets/"+id, "wallet-service", "", nil)
+	res, err := r.walletE(id)
+	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, res.Status)
 	return res.Body
+}
+
+func (r runningApp) walletE(id string) (testenv.Response, error) {
+	return r.http.Do(context.Background(), http.MethodGet, "/wallets/"+id, "wallet-service", "", nil)
 }
 
 func betBody(w testenv.Wallet, provider, ext, amount string) string {
@@ -158,14 +163,24 @@ func TestApplicationConsumesSQSAndPublishesEvents(t *testing.T) {
 	ext := uuid.NewString()
 	sendMessage(t, r.api, r.queues, "msg-"+ext, testenv.SubmitInput(w, "provider-a", ext, "BET", "15.00", ""))
 
-	require.Eventually(t, func() bool {
-		return r.wallet(t, walletID)["balance"].(map[string]any)["amount"] == "85.00"
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		res, err := r.walletE(walletID)
+		if !assert.NoError(collect, err) || !assert.Equal(collect, http.StatusOK, res.Status) {
+			return
+		}
+		assert.Equal(collect, "85.00", res.Body["balance"].(map[string]any)["amount"])
 	}, 20*time.Second, 200*time.Millisecond)
 	// Any running instance may publish them (the outbox is shared), so the
 	// publication is checked on the outbox itself.
 	wid, err := uuid.Parse(walletID)
 	require.NoError(t, err)
-	require.Eventually(t, func() bool { return unpublished(t, wid) == 0 }, 20*time.Second, 200*time.Millisecond,
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		pending, err := unpublished(wid)
+		if !assert.NoError(collect, err) {
+			return
+		}
+		assert.Zero(collect, pending)
+	}, 20*time.Second, 200*time.Millisecond,
 		"opening and bet events published after commit")
 }
 

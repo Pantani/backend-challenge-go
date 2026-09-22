@@ -43,12 +43,11 @@ func newRelayWithAttempts(t *testing.T, owner string, store app.OutboxStore, pub
 }
 
 // unpublished counts outbox rows of a wallet not yet published.
-func unpublished(t *testing.T, walletID uuid.UUID) int {
-	t.Helper()
+func unpublished(walletID uuid.UUID) (int, error) {
 	var n int
-	require.NoError(t, pool.QueryRow(context.Background(),
-		`SELECT count(*) FROM outbox_events WHERE partition_key = $1 AND published_at IS NULL`, walletID.String()).Scan(&n))
-	return n
+	err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM outbox_events WHERE partition_key = $1 AND published_at IS NULL`, walletID.String()).Scan(&n)
+	return n, err
 }
 
 // drain reads every message currently in a queue.
@@ -90,13 +89,26 @@ func TestTwoPublishersShareTheOutbox(t *testing.T) {
 	for i := range 5 {
 		s.submit(t, w, fmt.Sprintf("pub-%d", i), "BET", "1.00", "")
 	}
-	require.Equal(t, 12, unpublished(t, w.ID()), "committed events wait for a publisher (commit happened, publication did not)")
+	pending, err := unpublished(w.ID())
+	require.NoError(t, err)
+	require.Equal(t, 12, pending, "committed events wait for a publisher (commit happened, publication did not)")
 
 	pub := sqsadapter.NewPublisher(api, q.Events)
 	store := postgres.NewOutboxStore(pool)
 	relays := []*worker.Relay{newRelay(t, "relay-a", store, pub), newRelay(t, "relay-b", store, pub)}
-	testenv.Parallel(2, func(i int) bool { relays[i].Tick(context.Background()); return true })
-	require.Eventually(t, func() bool { relays[0].Tick(context.Background()); return unpublished(t, w.ID()) == 0 }, 10*time.Second, 100*time.Millisecond)
+	_, err = testenv.Parallel(2, func(i int) (struct{}, error) {
+		relays[i].Tick(context.Background())
+		return struct{}{}, nil
+	})
+	require.NoError(t, err)
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		relays[0].Tick(context.Background())
+		pending, err := unpublished(w.ID())
+		if !assert.NoError(collect, err) {
+			return
+		}
+		assert.Zero(collect, pending)
+	}, 10*time.Second, 100*time.Millisecond)
 
 	ids := eventIDs(t, drain(t, api, q.Events))
 	var mine int
@@ -149,11 +161,20 @@ func TestCrashBetweenPublishAndConfirmIsRecovered(t *testing.T) {
 	store := postgres.NewOutboxStore(pool)
 	newRelay(t, "crashing", forgetfulStore{store}, pub).Tick(context.Background())
 	require.GreaterOrEqual(t, pub.count(eventID), 1)
-	require.Equal(t, 2, unpublished(t, w.ID()), "not confirmed")
+	pending, err := unpublished(w.ID())
+	require.NoError(t, err)
+	require.Equal(t, 2, pending, "not confirmed")
 
 	// Another instance takes over once the lease expires, keeping the eventId.
 	survivor := newRelay(t, "survivor", store, pub)
-	require.Eventually(t, func() bool { survivor.Tick(context.Background()); return unpublished(t, w.ID()) == 0 }, 10*time.Second, 200*time.Millisecond)
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		survivor.Tick(context.Background())
+		pending, err := unpublished(w.ID())
+		if !assert.NoError(collect, err) {
+			return
+		}
+		assert.Zero(collect, pending)
+	}, 10*time.Second, 200*time.Millisecond)
 	assert.GreaterOrEqual(t, pub.count(eventID), 2, "republished with the same eventId")
 }
 
@@ -185,10 +206,19 @@ func TestPublicationRetriesWithBackoff(t *testing.T) {
 		WHERE partition_key = $1`, w.ID().String()).Scan(&attempts, &lastError))
 	assert.GreaterOrEqual(t, attempts, 1)
 	assert.Equal(t, "broker down", lastError)
-	assert.Equal(t, 2, unpublished(t, w.ID()))
+	pending, err := unpublished(w.ID())
+	require.NoError(t, err)
+	assert.Equal(t, 2, pending)
 
 	ok := newRelay(t, "retry", postgres.NewOutboxStore(pool), &failingPublisher{})
-	require.Eventually(t, func() bool { ok.Tick(context.Background()); return unpublished(t, w.ID()) == 0 }, 10*time.Second, 100*time.Millisecond)
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		ok.Tick(context.Background())
+		pending, err := unpublished(w.ID())
+		if !assert.NoError(collect, err) {
+			return
+		}
+		assert.Zero(collect, pending)
+	}, 10*time.Second, 100*time.Millisecond)
 }
 
 // localSenders trusts the LocalStack account id, the SenderId of every
@@ -247,9 +277,13 @@ func TestConsumerCrashAfterCommitIsRedeliveredAndDeduplicated(t *testing.T) {
 	// After the visibility timeout the message comes back to another instance.
 	other := newServices(t, defaultPolicy)
 	c := consumerFor(api, q, other.wagers)
-	require.Eventually(t, func() bool {
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
 		c.PollOnce(context.Background())
-		return queueDepth(t, api, q.Input) == 0
+		depth, err := queueDepth(api, q.Input)
+		if !assert.NoError(collect, err) {
+			return
+		}
+		assert.Zero(collect, depth)
 	}, 15*time.Second, 100*time.Millisecond)
 	assert.Equal(t, "90.00", s.balance(t, w), "the redelivery did not debit again")
 	assert.Equal(t, 1, s.debits(t, w))
@@ -260,15 +294,16 @@ func TestConsumerCrashAfterCommitIsRedeliveredAndDeduplicated(t *testing.T) {
 	assert.True(t, processed)
 }
 
-func queueDepth(t *testing.T, api sqsadapter.API, url string) int {
-	t.Helper()
+func queueDepth(api sqsadapter.API, url string) (int, error) {
 	out, err := api.GetQueueAttributes(context.Background(), &awssqs.GetQueueAttributesInput{QueueUrl: aws.String(url),
 		AttributeNames: []types.QueueAttributeName{"ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible"}})
-	require.NoError(t, err)
+	if err != nil {
+		return 0, err
+	}
 	var visible, hidden int
 	_, _ = fmt.Sscan(out.Attributes["ApproximateNumberOfMessages"], &visible)
 	_, _ = fmt.Sscan(out.Attributes["ApproximateNumberOfMessagesNotVisible"], &hidden)
-	return visible + hidden
+	return visible + hidden, nil
 }
 
 func TestInvalidMessagesGoToTheDLQ(t *testing.T) {
@@ -280,7 +315,9 @@ func TestInvalidMessagesGoToTheDLQ(t *testing.T) {
 	dead := drain(t, api, q.DLQ)
 	require.Len(t, dead, 1)
 	assert.Contains(t, dead[0], "bad-1")
-	assert.Zero(t, queueDepth(t, api, q.Input))
+	depth, err := queueDepth(api, q.Input)
+	require.NoError(t, err)
+	assert.Zero(t, depth)
 }
 
 // flakyProcessor always fails transiently (e.g. PostgreSQL unavailable).
@@ -298,9 +335,13 @@ func TestTransientFailuresAreRetriedThenRedrivenToTheDLQ(t *testing.T) {
 	sendMessage(t, api, q, s.prefix+"flaky", s.input(w, "provider-a", "flaky", "BET", "1.00", ""))
 
 	c := consumerFor(api, q, flakyProcessor{})
-	require.Eventually(t, func() bool {
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
 		c.PollOnce(context.Background())
-		return queueDepth(t, api, q.DLQ) == 1
+		depth, err := queueDepth(api, q.DLQ)
+		if !assert.NoError(collect, err) {
+			return
+		}
+		assert.Equal(collect, 1, depth)
 	}, 30*time.Second, 200*time.Millisecond, "after maxReceiveCount the redrive policy moves it")
 	assert.Equal(t, "100.00", s.balance(t, w))
 
@@ -321,17 +362,26 @@ func TestSameOperationThroughHTTPAndSQS(t *testing.T) {
 
 	cmd, err := app.NewSubmitCommand(in)
 	require.NoError(t, err)
-	results := testenv.Parallel(2, func(i int) error {
+	_, err = testenv.Parallel(2, func(i int) (struct{}, error) {
 		if i == 0 {
 			_, err := s.wagers.Submit(context.Background(), cmd)
-			return err
+			return struct{}{}, err
 		}
-		sendMessage(t, api, q, s.prefix+"cross-msg", in)
+		env := testenv.Envelope(s.prefix+"cross-msg", in)
+		if err := testenv.SendMessage(context.Background(), api, q.Input, env); err != nil {
+			return struct{}{}, err
+		}
 		consumerFor(api, q, s.wagers).PollOnce(context.Background())
-		return nil
+		return struct{}{}, nil
 	})
-	require.NoError(t, results[0])
-	require.Eventually(t, func() bool { return queueDepth(t, api, q.Input) == 0 }, 10*time.Second, 100*time.Millisecond)
+	require.NoError(t, err)
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		depth, err := queueDepth(api, q.Input)
+		if !assert.NoError(collect, err) {
+			return
+		}
+		assert.Zero(collect, depth)
+	}, 10*time.Second, 100*time.Millisecond)
 	assert.Equal(t, "90.00", s.balance(t, w))
 	assert.Equal(t, 1, s.debits(t, w))
 	assert.Equal(t, wager.StatusProcessed, s.tx(t, "provider-a", s.prefix+"cross").Status())
@@ -394,9 +444,19 @@ func TestOutboxKeepsPerWalletOrderWhenAnEventFails(t *testing.T) {
 	pub := &orderedPublisher{failOnce: order[0]}
 	store := postgres.NewOutboxStore(pool)
 	relays := []*worker.Relay{newRelay(t, "ordered-a", store, pub), newRelay(t, "ordered-b", store, pub)}
-	require.Eventually(t, func() bool {
-		testenv.Parallel(2, func(i int) bool { relays[i].Tick(context.Background()); return true })
-		return unpublished(t, w.ID()) == 0
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		_, err := testenv.Parallel(2, func(i int) (struct{}, error) {
+			relays[i].Tick(context.Background())
+			return struct{}{}, nil
+		})
+		if !assert.NoError(collect, err) {
+			return
+		}
+		pending, err := unpublished(w.ID())
+		if !assert.NoError(collect, err) {
+			return
+		}
+		assert.Zero(collect, pending)
 	}, 20*time.Second, 100*time.Millisecond)
 
 	var published []uuid.UUID
@@ -433,7 +493,14 @@ func TestPoisonOutboxEventIsDeadLetteredAndUnblocksItsWallet(t *testing.T) {
 
 	pub := &poisonPublisher{poison: poison}
 	relay := newRelayWithAttempts(t, "poison", postgres.NewOutboxStore(pool), pub, 3)
-	require.Eventually(t, func() bool { relay.Tick(context.Background()); return unpublished(t, w.ID()) == 1 }, 20*time.Second, 50*time.Millisecond,
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		relay.Tick(context.Background())
+		pending, err := unpublished(w.ID())
+		if !assert.NoError(collect, err) {
+			return
+		}
+		assert.Equal(collect, 1, pending)
+	}, 20*time.Second, 50*time.Millisecond,
 		"the event behind the poison one is published once the poison is dead-lettered")
 
 	var dead bool

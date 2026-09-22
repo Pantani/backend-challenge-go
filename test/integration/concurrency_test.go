@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/Pantani/backend-challenge-go/internal/app"
 	"github.com/Pantani/backend-challenge-go/internal/domain/wager"
 	"github.com/Pantani/backend-challenge-go/internal/domain/wallet"
+	"github.com/Pantani/backend-challenge-go/internal/testutil"
 	"github.com/Pantani/backend-challenge-go/test/testenv"
 )
 
@@ -36,11 +38,14 @@ func TestFiftyIdenticalBetsDebitOnce(t *testing.T) {
 	t.Parallel()
 	s := newServices(t, defaultPolicy)
 	w := s.openWallet(t, "1000.00")
-	results := testenv.Parallel(50, func(int) outcome { return s.submitAsync(w, "same-bet", "BET", "25.00", "") })
+	results, err := testenv.Parallel(50, func(int) (outcome, error) {
+		result := s.submitAsync(w, "same-bet", "BET", "25.00", "")
+		return result, result.err
+	})
+	require.NoError(t, err)
 
 	ids, replays := map[string]int{}, 0
 	for _, r := range results {
-		require.NoError(t, r.err)
 		ids[r.res.Transaction.ID().String()]++
 		replays += boolToInt(r.res.Replay)
 	}
@@ -62,11 +67,14 @@ func TestTwoBetsRaceOnSameBalance(t *testing.T) {
 	t.Parallel()
 	s := newServices(t, defaultPolicy)
 	w := s.openWallet(t, "100.00")
-	results := testenv.Parallel(2, func(i int) outcome { return s.submitAsync(w, []string{"bet-a", "bet-b"}[i], "BET", "80.00", "") })
+	results, err := testenv.Parallel(2, func(i int) (outcome, error) {
+		result := s.submitAsync(w, []string{"bet-a", "bet-b"}[i], "BET", "80.00", "")
+		return result, result.err
+	})
+	require.NoError(t, err)
 
 	statuses := map[wager.Status]int{}
 	for _, r := range results {
-		require.NoError(t, r.err)
 		statuses[r.res.Transaction.Status()]++
 	}
 	assert.Equal(t, map[wager.Status]int{wager.StatusProcessed: 1, wager.StatusRejected: 1}, statuses)
@@ -115,12 +123,17 @@ func TestIndependentWalletsProgressInParallel(t *testing.T) {
 func TestManyWalletsConcurrently(t *testing.T) {
 	t.Parallel()
 	s := newServices(t, defaultPolicy)
-	wallets := testenv.Parallel(10, func(int) *wallet.Wallet { return s.openWallet(t, "100.00") })
-	results := testenv.Parallel(100, func(i int) outcome {
-		return s.submitAsync(wallets[i%10], fmt.Sprintf("multi-%d", i), "BET", "10.00", "")
+	initialBalance := testutil.BRL(t, "100.00")
+	wallets, err := testenv.Parallel(10, func(int) (*wallet.Wallet, error) {
+		return s.wallets.Open(context.Background(), app.OpenWalletCommand{PlayerID: uuid.New(), InitialBalance: initialBalance})
 	})
+	require.NoError(t, err)
+	results, err := testenv.Parallel(100, func(i int) (outcome, error) {
+		result := s.submitAsync(wallets[i%10], fmt.Sprintf("multi-%d", i), "BET", "10.00", "")
+		return result, result.err
+	})
+	require.NoError(t, err)
 	for _, r := range results {
-		require.NoError(t, r.err)
 		require.Equal(t, wager.StatusProcessed, r.res.Transaction.Status())
 	}
 	for _, w := range wallets {
@@ -134,12 +147,13 @@ func TestConcurrentReversalsOnlyOneSucceeds(t *testing.T) {
 	s := newServices(t, defaultPolicy)
 	w := s.openWallet(t, "100.00")
 	s.submit(t, w, "rev-bet", "BET", "40.00", "")
-	results := testenv.Parallel(2, func(i int) outcome {
-		return s.submitAsync(w, []string{"rev-refund", "rev-rollback"}[i], []string{"REFUND", "ROLLBACK"}[i], "40.00", "rev-bet")
+	results, err := testenv.Parallel(2, func(i int) (outcome, error) {
+		result := s.submitAsync(w, []string{"rev-refund", "rev-rollback"}[i], []string{"REFUND", "ROLLBACK"}[i], "40.00", "rev-bet")
+		return result, result.err
 	})
+	require.NoError(t, err)
 	codes := map[wager.FailureCode]int{}
 	for _, r := range results {
-		require.NoError(t, r.err)
 		codes[r.res.Transaction.FailureCode()]++
 	}
 	assert.Equal(t, map[wager.FailureCode]int{"": 1, wager.CodeAlreadyReversed: 1}, codes)
@@ -158,11 +172,11 @@ func TestPendingReferenceResolvedOnceByCompetingWorkers(t *testing.T) {
 	// Three instances race for the same due operation (they may also pick
 	// up pending rows of other tests sharing the database).
 	workers := []services{s, newServices(t, defaultPolicy), newServices(t, defaultPolicy)}
-	testenv.Parallel(3, func(i int) error {
+	_, err := testenv.Parallel(3, func(i int) (struct{}, error) {
 		_, err := workers[i].wagers.ResolveDue(context.Background())
-		assert.NoError(t, err)
-		return err
+		return struct{}{}, err
 	})
+	require.NoError(t, err)
 	var credits int
 	require.NoError(t, pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM ledger_entries WHERE transaction_id = $1`, refund.Transaction.ID()).Scan(&credits))
