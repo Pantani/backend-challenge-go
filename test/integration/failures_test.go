@@ -20,7 +20,7 @@ import (
 )
 
 // inCancelledTx runs op inside a unit of work whose context is cancelled
-// first, so the statement fails like it would on a dropped connection.
+// first, exercising cancellation independently from connection loss.
 func inCancelledTx(t *testing.T, op func(ctx context.Context, r app.Repositories) error) error {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -31,7 +31,7 @@ func inCancelledTx(t *testing.T, op func(ctx context.Context, r app.Repositories
 	})
 }
 
-func TestRepositoriesFailOnBrokenConnections(t *testing.T) {
+func TestRepositoriesFailOnCancelledContext(t *testing.T) {
 	t.Parallel()
 	s := newServices(t, defaultPolicy)
 	w := s.openWallet(t, "10.00")
@@ -83,11 +83,12 @@ func TestRepositoriesFailOnBrokenConnections(t *testing.T) {
 	}
 }
 
-func TestQueriesFailOnBrokenConnections(t *testing.T) {
+func TestQueriesFailOnCancelledContext(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	q, store := postgres.NewQueries(pool), postgres.NewOutboxStore(pool)
+	claimID := uuid.New()
 	calls := map[string]func() error{
 		"wallet":    func() error { _, err := q.GetWallet(ctx, uuid.New()); return err },
 		"ledger":    func() error { _, err := q.ListLedger(ctx, uuid.New(), 0, 1); return err },
@@ -95,10 +96,14 @@ func TestQueriesFailOnBrokenConnections(t *testing.T) {
 		"tx ext":    func() error { _, err := q.GetTransactionByExternal(ctx, "p", "e"); return err },
 		"reconcile": func() error { _, err := q.Reconcile(ctx, uuid.New()); return err },
 		"due":       func() error { _, err := q.ListDuePending(ctx, time.Now(), 1); return err },
-		"claim":     func() error { _, err := store.Claim(ctx, "o", time.Now(), time.Second, 1); return err },
-		"published": func() error { _, err := store.MarkPublished(ctx, uuid.New(), "o", time.Now()); return err },
-		"failed":    func() error { return store.MarkFailed(ctx, uuid.New(), "o", time.Now(), "x") },
-		"dead":      func() error { return store.MarkDead(ctx, uuid.New(), "o", time.Now(), "x") },
+		"claim":     func() error { _, _, err := store.Claim(ctx, "o", claimID, time.Now(), time.Second); return err },
+		"attempt": func() error {
+			_, _, err := store.StartAttempt(ctx, uuid.New(), claimID, time.Now(), time.Second)
+			return err
+		},
+		"published": func() error { _, err := store.MarkPublished(ctx, uuid.New(), claimID, time.Now()); return err },
+		"failed":    func() error { _, err := store.MarkFailed(ctx, uuid.New(), claimID, time.Now(), "x"); return err },
+		"dead":      func() error { _, err := store.MarkDead(ctx, uuid.New(), claimID, time.Now(), "x"); return err },
 		"oldest":    func() error { _, _, err := store.OldestPending(ctx); return err },
 		"ping":      func() error { return postgres.Ping(ctx, pool) },
 		"begin":     func() error { return postgres.NewUnitOfWork(pool).Do(ctx, nil) },
@@ -108,6 +113,30 @@ func TestQueriesFailOnBrokenConnections(t *testing.T) {
 	}
 }
 
+func TestTerminatedConnectionFailsAndPoolRecovers(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	disposable, err := postgres.NewPool(ctx, postgres.Config{URL: env.DatabaseURL, MaxConns: 1,
+		LockTimeout: time.Second, StatementTimeout: time.Second})
+	require.NoError(t, err)
+	t.Cleanup(disposable.Close)
+	conn, err := disposable.Acquire(ctx)
+	require.NoError(t, err)
+	t.Cleanup(conn.Release)
+	pid := conn.Conn().PgConn().PID()
+	var terminated bool
+	require.NoError(t, pool.QueryRow(ctx, `SELECT pg_terminate_backend($1, 5000)`, pid).Scan(&terminated))
+	require.True(t, terminated)
+	_, err = conn.Exec(ctx, `SELECT 1`)
+	require.Error(t, err, "a killed physical connection must not execute")
+	conn.Release()
+	require.NoError(t, postgres.Ping(ctx, disposable))
+	var replacementPID uint32
+	require.NoError(t, disposable.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&replacementPID))
+	require.NotEqual(t, pid, replacementPID, "the pool replaced the terminated backend")
+}
+
 func TestClosedPoolIsUnavailable(t *testing.T) {
 	t.Parallel()
 	closed, err := postgres.NewPool(context.Background(), postgres.Config{URL: env.DatabaseURL, MaxConns: 1, LockTimeout: time.Second, StatementTimeout: time.Second})
@@ -115,7 +144,7 @@ func TestClosedPoolIsUnavailable(t *testing.T) {
 	closed.Close()
 	_, err = postgres.NewQueries(closed).GetWallet(context.Background(), uuid.New())
 	require.ErrorIs(t, err, app.ErrUnavailable)
-	err = postgres.NewOutboxStore(closed).MarkDead(context.Background(), uuid.New(), "o", time.Now(), "x")
+	_, err = postgres.NewOutboxStore(closed).MarkDead(context.Background(), uuid.New(), uuid.New(), time.Now(), "x")
 	require.ErrorIs(t, err, app.ErrUnavailable)
 }
 
@@ -214,7 +243,7 @@ func TestCorruptRowsAreReportedNotHidden(t *testing.T) {
 	t.Parallel()
 	w, tx := uuid.NewString(), uuid.NewString()
 	// XYZ passes the schema's format check but is not a supported currency.
-	require.Empty(t, sqlState(t,
+	require.NoError(t, execStatements(t,
 		`INSERT INTO wallets VALUES ('`+w+`', gen_random_uuid(), 'XYZ', 100, 1, now(), now())`,
 		insertTransaction(txRow{ID: tx, WalletID: w, Kind: "WIN", Status: "PROCESSED", Amount: 100, Currency: "XYZ", Provider: "corrupt", Result: ptr(100)}),
 		insertLedgerEntry(w, tx, "CREDIT", 100, 0, 100, "XYZ")))

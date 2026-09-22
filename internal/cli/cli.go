@@ -46,6 +46,15 @@ type migrator interface {
 	Close() error
 }
 
+// application is the lifecycle surface the CLI owns. Keeping it smaller than
+// fx.App makes startup and shutdown behavior deterministic in tests.
+type application interface {
+	Err() error
+	Start(context.Context) error
+	Stop(context.Context) error
+	Wait() <-chan fx.ShutdownSignal
+}
+
 // Constructors of the external dependencies, replaceable in tests.
 var (
 	newMigrator  = defaultMigrator
@@ -61,7 +70,7 @@ func defaultMigrator(databaseURL string) (migrator, error) {
 	return m, nil
 }
 
-func defaultApp(cfg config.Config) *fx.App { return bootstrap.New(cfg) }
+func defaultApp(ctx context.Context, cfg config.Config) application { return bootstrap.New(ctx, cfg) }
 
 // Run executes the command in args and returns the process exit code:
 // ExitUsage for an unknown command or bad arguments, ExitError for any other
@@ -117,13 +126,16 @@ func serveCmd(ctx context.Context, lookup config.Lookup) error {
 func serve(ctx context.Context, cfg config.Config) error {
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	application := newApp(cfg)
+	startCtx, cancelStart := context.WithTimeout(ctx, cfg.StartupTimeout)
+	defer cancelStart()
+	application := newApp(startCtx, cfg)
 	if err := application.Err(); err != nil {
 		return fmt.Errorf("build application: %w", err)
 	}
-	if err := application.Start(ctx); err != nil {
+	if err := application.Start(startCtx); err != nil {
 		return err
 	}
+	cancelStart()
 	<-ctx.Done()
 	stop()
 	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.ShutdownTimeout)

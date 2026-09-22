@@ -7,18 +7,21 @@ package e2e_test
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/semaphore"
 
 	sqsadapter "github.com/Pantani/backend-challenge-go/internal/adapter/sqs"
 	"github.com/Pantani/backend-challenge-go/internal/testutil"
@@ -32,18 +35,26 @@ var (
 	sqsClient sqsadapter.API
 	queues    sqsadapter.Queues
 	instances []*instance
-	tokens    = tokenCache{values: map[string]cachedToken{}}
+	tokens    = newTokenCache(func(ctx context.Context, client string) (string, error) { return env.Token(ctx, client) })
+	fixture   = &e2eFixture{}
 )
 
 func TestMain(m *testing.M) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	var err error
 	if env, err = testenv.Start(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "start containers:", err)
+		cancel()
 		os.Exit(1)
 	}
 	code := setupAndRun(ctx, m)
-	env.Stop(ctx)
+	cancel()
+	cleanup, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
+	if err := errors.Join(fixture.Close(cleanup), env.Stop(cleanup)); err != nil {
+		fmt.Fprintln(os.Stderr, "cleanup:", err)
+		code = 1
+	}
+	cleanupCancel()
 	os.Exit(code)
 }
 
@@ -52,9 +63,45 @@ func setupAndRun(ctx context.Context, m *testing.M) int {
 		fmt.Fprintln(os.Stderr, "prepare:", err)
 		return 1
 	}
-	defer pool.Close()
-	defer stopAll()
 	return m.Run()
+}
+
+// e2eFixture owns partial setup as well as all successful acquisitions.
+type e2eFixture struct {
+	tempDir   string
+	pool      *pgxpool.Pool
+	instances []*instance
+	closeOnce sync.Once
+	closeErr  error
+	poolDone  chan struct{}
+}
+
+func (f *e2eFixture) Close(ctx context.Context) error {
+	f.closeOnce.Do(func() { f.closeErr = f.closeResources(ctx) })
+	return f.closeErr
+}
+
+func (f *e2eFixture) closeResources(ctx context.Context) error {
+	errs := []error{f.closeProcesses(ctx)}
+	if f.pool != nil {
+		f.poolDone = make(chan struct{})
+		go func() {
+			f.pool.Close()
+			close(f.poolDone)
+		}()
+		errs = append(errs, waitDone(ctx, f.poolDone))
+	}
+	if f.tempDir != "" {
+		errs = append(errs, os.RemoveAll(f.tempDir))
+	}
+	return errors.Join(errs...)
+}
+
+func (f *e2eFixture) closeProcesses(ctx context.Context) error {
+	_, err := testenv.Parallel(len(f.instances), func(index int) (struct{}, error) {
+		return struct{}{}, f.instances[index].stop(ctx)
+	})
+	return err
 }
 
 // prepare builds the binary with coverage, migrates, provisions the queues
@@ -64,9 +111,15 @@ func prepare(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	fixture.tempDir = dir
 	binary = filepath.Join(dir, "wallet")
+	root, err := testenv.RepoRoot(".")
+	if err != nil {
+		return err
+	}
 	build := exec.CommandContext(ctx, "go", "build", "-cover", "-covermode=atomic", "-coverpkg=./...", "-o", binary, "./cmd/wallet")
-	build.Dir = testenv.RepoRoot()
+	build.Dir = root
+	build.WaitDelay = time.Second
 	if out, err := build.CombinedOutput(); err != nil {
 		return fmt.Errorf("build: %w: %s", err, out)
 	}
@@ -83,6 +136,7 @@ func connect(ctx context.Context) error {
 	if pool, err = pgxpool.New(ctx, env.DatabaseURL); err != nil {
 		return err
 	}
+	fixture.pool = pool
 	if sqsClient, err = sqsadapter.NewClient(ctx, sqsadapter.ClientConfig{Region: "us-east-1", Endpoint: env.SQSEndpoint}); err != nil {
 		return err
 	}
@@ -102,8 +156,9 @@ func connect(ctx context.Context) error {
 
 func command(ctx context.Context, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, binary, args...)
+	cmd.WaitDelay = time.Second
 	cmd.Env = os.Environ()
-	for k, v := range env.Vars(map[string]string{"LOG_LEVEL": "info", "SQS_VISIBILITY_TIMEOUT": "10s", "SQS_PROCESS_TIMEOUT": "8s", "SQS_ACK_TIMEOUT": "1s"}) {
+	for k, v := range env.Vars(map[string]string{"LOG_LEVEL": "info", "SQS_VISIBILITY_TIMEOUT": "2m", "SQS_PROCESS_TIMEOUT": "8s", "SQS_ACK_TIMEOUT": "1s"}) {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
 	if dir := os.Getenv("E2E_GOCOVERDIR"); dir != "" {
@@ -114,55 +169,97 @@ func command(ctx context.Context, args ...string) *exec.Cmd {
 
 // instance is one independent wallet process.
 type instance struct {
-	name string
-	port int
-	cmd  *exec.Cmd
+	*processRun
+	name    string
+	address string
+}
+
+// processRun is immutable ownership of one successfully started execution.
+type processRun struct {
+	cmd      *exec.Cmd
+	done     chan struct{}
+	waitErr  error
+	stopped  bool
+	killOnce sync.Once
+	killDone chan struct{}
+	killErr  error
 	// logs is written by the exec copier goroutine while the process runs.
 	logs testutil.SyncBuffer
 }
 
-func (i *instance) base() string { return fmt.Sprintf("http://127.0.0.1:%d", i.port) }
+func (i *instance) base() string { return "http://" + i.address }
 
 // client drives this instance with cached Keycloak tokens.
 func (i *instance) client() testenv.Client { return testenv.Client{Base: i.base(), Token: tokens.get} }
 
-func freePort(ctx context.Context) (int, error) {
-	l, err := (&net.ListenConfig{}).Listen(ctx, "tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
-	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port, nil
-}
-
-func (i *instance) start() error { return i.startWith(context.Background()) }
-
 // startWith launches the process; it is not bound to ctx, which only bounds
 // the startup (a test must be able to kill it explicitly).
 func (i *instance) startWith(ctx context.Context) error {
-	port, err := freePort(ctx)
-	if err != nil {
+	cmd := command(context.WithoutCancel(ctx), "serve")
+	cmd.Env = append(cmd.Env, "HTTP_ADDR=127.0.0.1:0", "INSTANCE_ID="+i.name)
+	return i.startCommand(ctx, cmd, fixture)
+}
+
+func (i *instance) startCommand(ctx context.Context, cmd *exec.Cmd, owner *e2eFixture) error {
+	run := &processRun{cmd: cmd, done: make(chan struct{}), killDone: make(chan struct{})}
+	cmd.WaitDelay = time.Second
+	cmd.Stdout, cmd.Stderr = &run.logs, &run.logs
+	if err := cmd.Start(); err != nil {
 		return err
 	}
-	i.port = port
-	i.cmd = command(context.WithoutCancel(ctx), "serve")
-	i.cmd.Env = append(i.cmd.Env, fmt.Sprintf("HTTP_ADDR=127.0.0.1:%d", port), "INSTANCE_ID="+i.name)
-	i.cmd.Stdout, i.cmd.Stderr = &i.logs, &i.logs
-	if err := i.cmd.Start(); err != nil {
-		return err
-	}
+	i.processRun, i.address = run, ""
+	owner.instances = append(owner.instances, &instance{name: i.name, processRun: run})
+	go func() {
+		run.waitErr = cmd.Wait()
+		close(run.done)
+	}()
 	return i.waitReady(ctx)
 }
 
 func (i *instance) waitReady(ctx context.Context) error {
-	deadline := time.Now().Add(60 * time.Second)
-	for time.Now().Before(deadline) {
-		if status, _ := get(ctx, i.base()+"/health/ready"); status == http.StatusOK {
-			return nil
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-i.done:
+			return errors.Join(fmt.Errorf("%s exited before readiness: %s", i.name, i.logs.String()), i.waitErr)
+		case <-ctx.Done():
+			return fmt.Errorf("%s readiness: %w: %s", i.name, ctx.Err(), i.logs.String())
+		case <-ticker.C:
+			if i.ready(ctx) {
+				return nil
+			}
 		}
-		time.Sleep(200 * time.Millisecond)
 	}
-	return fmt.Errorf("%s not ready: %s", i.name, i.logs.String())
+}
+
+func (i *instance) ready(ctx context.Context) bool {
+	if i.address == "" {
+		i.address = listeningAddress(i.logs.String())
+	}
+	if i.address == "" {
+		return false
+	}
+	status, err := get(ctx, i.base()+"/health/ready")
+	return err == nil && status == http.StatusOK
+}
+
+func listeningAddress(logs string) string {
+	for _, line := range strings.Split(logs, "\n") {
+		var record struct {
+			Message string `json:"msg"`
+			Address string `json:"addr"`
+		}
+		if json.Unmarshal([]byte(line), &record) != nil {
+			continue
+		}
+		if record.Message == "http server listening" {
+			return record.Address
+		}
+	}
+	return ""
 }
 
 func get(ctx context.Context, url string) (int, error) {
@@ -170,32 +267,92 @@ func get(ctx context.Context, url string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
 	if err != nil {
 		return 0, err
 	}
-	_ = resp.Body.Close()
-	return resp.StatusCode, nil
+	return resp.StatusCode, resp.Body.Close()
 }
 
-// kill simulates an abrupt crash (no graceful shutdown).
-func (i *instance) kill() {
-	_ = i.cmd.Process.Kill()
-	_ = i.cmd.Wait()
+// kill simulates an abrupt crash and reaps the child before restart.
+func (i *instance) kill(ctx context.Context) error {
+	killErr := i.processRun.kill(ctx)
+	err := waitDone(ctx, i.done)
+	i.stopped = err == nil
+	return errors.Join(killErr, err)
 }
 
-// stop sends SIGTERM and waits for the graceful shutdown.
-func (i *instance) stop() error {
-	if err := i.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+// stop reserves half the available deadline for forced termination and reap.
+// The 30-second cap allows the service's 15-second graceful shutdown budget.
+func (i *instance) stop(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if i.stopped {
+		return nil
+	}
+	select {
+	case <-i.done:
+		i.stopped = true
+		return i.waitErr
+	default:
+	}
+	err := i.cmd.Process.Signal(syscall.SIGTERM)
+	return errors.Join(processSignalError(err), i.awaitStop(ctx))
+}
+
+func (i *instance) awaitStop(ctx context.Context) error {
+	deadline, _ := ctx.Deadline() // stop always supplies a bounded context.
+	graceful, cancel := context.WithTimeout(ctx, time.Until(deadline)/2)
+	defer cancel()
+	if err := waitDone(graceful, i.done); err != nil {
+		return errors.Join(fmt.Errorf("%s graceful shutdown: %w", i.name, err), i.kill(ctx))
+	}
+	i.stopped = true
+	return i.waitErr
+}
+
+func (r *processRun) kill(ctx context.Context) error {
+	r.killOnce.Do(func() {
+		go func() {
+			r.killErr = processSignalError(r.cmd.Process.Kill())
+			close(r.killDone)
+		}()
+	})
+	if err := waitDone(ctx, r.killDone); err != nil {
 		return err
 	}
-	return i.cmd.Wait()
+	return r.killErr
 }
 
-func stopAll() {
-	for _, i := range instances {
-		_ = i.stop()
+func waitDone(ctx context.Context, done <-chan struct{}) error {
+	select {
+	case <-done:
+		return nil
+	default:
 	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func awaitValue[T any](ctx context.Context, values <-chan T) (T, error) {
+	select {
+	case value := <-values:
+		return value, nil
+	case <-ctx.Done():
+		var zero T
+		return zero, ctx.Err()
+	}
+}
+
+func processSignalError(err error) error {
+	if errors.Is(err, os.ErrProcessDone) {
+		return nil
+	}
+	return err
 }
 
 // tokenRefresh renews cached tokens well before their 5-minute lifetime.
@@ -207,18 +364,25 @@ type cachedToken struct {
 }
 
 type tokenCache struct {
-	mu     sync.Mutex
+	mu     *semaphore.Weighted
 	values map[string]cachedToken
+	fetch  func(context.Context, string) (string, error)
+}
+
+func newTokenCache(fetch func(context.Context, string) (string, error)) *tokenCache {
+	return &tokenCache{mu: semaphore.NewWeighted(1), values: make(map[string]cachedToken), fetch: fetch}
 }
 
 // get returns a cached token, fetching a new one when it is about to expire.
-func (c *tokenCache) get(client string) (string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (c *tokenCache) get(ctx context.Context, client string) (string, error) {
+	if err := c.mu.Acquire(ctx, 1); err != nil {
+		return "", err
+	}
+	defer c.mu.Release(1)
 	if tok, ok := c.values[client]; ok && time.Since(tok.issuedAt) < tokenRefresh {
 		return tok.value, nil
 	}
-	value, err := env.Token(context.Background(), client)
+	value, err := c.fetch(ctx, client)
 	if err != nil {
 		return "", err
 	}

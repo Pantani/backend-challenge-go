@@ -233,20 +233,27 @@ type OutboxMessage struct {
 	OccurredAt time.Time
 	// Attempts counts the publications tried so far.
 	Attempts int
+	// ClaimID identifies this acquisition and fences stale relay mutations.
+	ClaimID uuid.UUID
 }
 
 // OutboxStore is used by the relay, outside business transactions.
 type OutboxStore interface {
-	// Claim leases up to limit due records to owner until now+lease. Records
-	// whose lease expired (a crashed publisher) are claimable again.
-	Claim(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]OutboxMessage, error)
-	// MarkPublished confirms a publication; false when the lease was lost.
-	MarkPublished(ctx context.Context, eventID uuid.UUID, owner string, now time.Time) (bool, error)
-	// MarkFailed releases the lease and schedules the next attempt.
-	MarkFailed(ctx context.Context, eventID uuid.UUID, owner string, next time.Time, cause string) error
+	// Claim leases one due partition head to claimID until now+lease. Records
+	// whose lease expired are claimable again with a different token.
+	Claim(ctx context.Context, owner string, claimID uuid.UUID, now time.Time, lease time.Duration) (OutboxMessage, bool, error)
+	// StartAttempt counts a publication and renews its lease to now+lease only
+	// while claimID still owns eventID and its current lease is live at now.
+	StartAttempt(
+		ctx context.Context, eventID, claimID uuid.UUID, now time.Time, lease time.Duration,
+	) (int, bool, error)
+	// MarkPublished confirms a publication; false when the claim was lost.
+	MarkPublished(ctx context.Context, eventID, claimID uuid.UUID, now time.Time) (bool, error)
+	// MarkFailed releases the claim and schedules the next attempt.
+	MarkFailed(ctx context.Context, eventID, claimID uuid.UUID, next time.Time, cause string) (bool, error)
 	// MarkDead dead-letters a record that exhausted its attempts, so it stops
 	// blocking the later records of its partition (kept for audit/replay).
-	MarkDead(ctx context.Context, eventID uuid.UUID, owner string, now time.Time, cause string) error
+	MarkDead(ctx context.Context, eventID, claimID uuid.UUID, now time.Time, cause string) (bool, error)
 	// OldestPending returns the occurrence of the oldest unpublished record.
 	OldestPending(ctx context.Context) (time.Time, bool, error)
 }

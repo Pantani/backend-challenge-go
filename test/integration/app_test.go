@@ -27,7 +27,7 @@ import (
 type runningApp struct {
 	http   testenv.Client
 	group  *worker.Group
-	app    *fx.App
+	app    *bootstrap.Application
 	api    sqsadapter.API
 	queues sqsadapter.Queues
 }
@@ -36,35 +36,47 @@ func queueVars(names sqsadapter.QueueNames) map[string]string {
 	return map[string]string{"SQS_INPUT_QUEUE": names.Input, "SQS_DLQ": names.DLQ, "SQS_EVENTS_QUEUE": names.Events}
 }
 
-func newApp(t *testing.T, overrides map[string]string) (*fx.App, *bootstrap.Addr, *worker.Group) {
+func newApp(t *testing.T, overrides map[string]string) (*bootstrap.Application, *bootstrap.Addr, *worker.Group, context.Context, context.CancelFunc) {
 	t.Helper()
 	cfg, err := env.Config(overrides)
 	require.NoError(t, err)
 	var addr *bootstrap.Addr
 	var group *worker.Group
-	a := bootstrap.New(cfg, fx.Replace(bootstrap.LogOutput{Writer: io.Discard}), fx.Populate(&addr, &group))
-	return a, addr, group
+	startCtx, cancelStart := context.WithTimeout(context.Background(), cfg.StartupTimeout)
+	a := bootstrap.New(startCtx, cfg, fx.Replace(bootstrap.LogOutput{Writer: io.Discard}), fx.Populate(&addr, &group))
+	return a, addr, group, startCtx, cancelStart
 }
 
 func startApp(t *testing.T) runningApp {
 	t.Helper()
 	api, q, names := provisionQueues(t, 3)
-	a, addr, group := newApp(t, queueVars(names))
-	require.NoError(t, a.Start(context.Background()))
-	t.Cleanup(func() { _ = a.Stop(context.Background()) })
+	a, addr, group, startCtx, cancelStart := newApp(t, queueVars(names))
+	defer cancelStart()
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer stopCancel()
+		require.NoError(t, a.Stop(stopCtx))
+	})
+	require.NoError(t, a.Start(startCtx))
+	cancelStart()
 	return runningApp{http: client("http://" + addr.String()), group: group, app: a, api: api, queues: q}
 }
 
 // client drives the API at base, authenticating with Keycloak tokens.
 func client(base string) testenv.Client {
-	return testenv.Client{Base: base, Token: func(c string) (string, error) { return env.Token(context.Background(), c) }}
+	return testenv.Client{Base: base, Token: env.Token}
 }
 
 func (r runningApp) wallet(t *testing.T, id string) map[string]any {
 	t.Helper()
-	res := r.http.Call(t, http.MethodGet, "/wallets/"+id, "wallet-service", "", nil)
+	res, err := r.walletE(id)
+	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, res.Status)
 	return res.Body
+}
+
+func (r runningApp) walletE(id string) (testenv.Response, error) {
+	return r.http.Do(context.Background(), http.MethodGet, "/wallets/"+id, "wallet-service", "", nil)
 }
 
 func betBody(w testenv.Wallet, provider, ext, amount string) string {
@@ -158,22 +170,34 @@ func TestApplicationConsumesSQSAndPublishesEvents(t *testing.T) {
 	ext := uuid.NewString()
 	sendMessage(t, r.api, r.queues, "msg-"+ext, testenv.SubmitInput(w, "provider-a", ext, "BET", "15.00", ""))
 
-	require.Eventually(t, func() bool {
-		return r.wallet(t, walletID)["balance"].(map[string]any)["amount"] == "85.00"
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		res, err := r.walletE(walletID)
+		if !assert.NoError(collect, err) || !assert.Equal(collect, http.StatusOK, res.Status) {
+			return
+		}
+		assert.Equal(collect, "85.00", res.Body["balance"].(map[string]any)["amount"])
 	}, 20*time.Second, 200*time.Millisecond)
 	// Any running instance may publish them (the outbox is shared), so the
 	// publication is checked on the outbox itself.
 	wid, err := uuid.Parse(walletID)
 	require.NoError(t, err)
-	require.Eventually(t, func() bool { return unpublished(t, wid) == 0 }, 20*time.Second, 200*time.Millisecond,
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		pending, err := unpublished(wid)
+		if !assert.NoError(collect, err) {
+			return
+		}
+		assert.Zero(collect, pending)
+	}, 20*time.Second, 200*time.Millisecond,
 		"opening and bet events published after commit")
 }
 
 func TestApplicationStopsWorkersOnShutdown(t *testing.T) {
 	t.Parallel()
 	_, _, names := provisionQueues(t, 3)
-	a, addr, group := newApp(t, queueVars(names))
-	require.NoError(t, a.Start(context.Background()))
+	a, addr, group, startCtx, cancelStart := newApp(t, queueVars(names))
+	defer cancelStart()
+	require.NoError(t, a.Start(startCtx))
+	cancelStart()
 	require.Positive(t, group.Running())
 	base := "http://" + addr.String()
 
@@ -198,19 +222,25 @@ func TestApplicationRefusesToStartWithBrokenDependencies(t *testing.T) {
 		"database down": {"DATABASE_URL": "postgres://wallet:wallet@127.0.0.1:1/wallet?sslmode=disable"},
 		"bad database":  {"DATABASE_URL": "postgres://%%%"},
 		"bad listen":    {"HTTP_ADDR": "256.0.0.1:1"},
-		"sender policy": {"SQS_SENDER_PROVIDERS": "missing-equals"},
 	}
 	for name, overrides := range cases {
 		vars := queueVars(names)
 		for k, v := range overrides {
 			vars[k] = v
 		}
-		a, _, _ := newApp(t, vars)
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		err := a.Start(ctx)
-		cancel()
+		a, _, _, startCtx, cancelStart := newApp(t, vars)
+		err := a.Start(startCtx)
+		cancelStart()
 		assert.Error(t, err, name)
 	}
+
+	cfg, err := env.Config(queueVars(names))
+	require.NoError(t, err)
+	cfg.SQSSenderProviders = "missing-equals"
+	startCtx, cancelStart := context.WithTimeout(context.Background(), cfg.StartupTimeout)
+	defer cancelStart()
+	app := bootstrap.New(startCtx, cfg, fx.Replace(bootstrap.LogOutput{Writer: io.Discard}))
+	assert.Error(t, app.Err(), "programmatic sender policy bypasses environment validation but not bootstrap validation")
 }
 
 // hookRecorder keeps the stop hooks in execution order (by the function
@@ -244,9 +274,12 @@ func TestFxStopsServerThenWorkersThenPool(t *testing.T) {
 	cfg, err := env.Config(queueVars(names))
 	require.NoError(t, err)
 	rec := &hookRecorder{}
-	a := bootstrap.New(cfg, fx.Replace(bootstrap.LogOutput{Writer: io.Discard}),
+	startCtx, cancelStart := context.WithTimeout(context.Background(), cfg.StartupTimeout)
+	defer cancelStart()
+	a := bootstrap.New(startCtx, cfg, fx.Replace(bootstrap.LogOutput{Writer: io.Discard}),
 		fx.WithLogger(func() fxevent.Logger { return rec }))
-	require.NoError(t, a.Start(context.Background()))
+	require.NoError(t, a.Start(startCtx))
+	cancelStart()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	require.NoError(t, a.Stop(ctx))
@@ -270,6 +303,7 @@ func TestFxGraphIsValid(t *testing.T) {
 func TestApplicationRefusesToStartWithBrokenAWSConfig(t *testing.T) {
 	t.Setenv("AWS_PROFILE", "profile-that-does-not-exist")
 	t.Setenv("AWS_CONFIG_FILE", t.TempDir()+"/missing")
-	a, _, _ := newApp(t, nil)
+	a, _, _, _, cancelStart := newApp(t, nil)
+	defer cancelStart()
 	require.Error(t, a.Err())
 }

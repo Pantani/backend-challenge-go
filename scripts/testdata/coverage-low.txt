@@ -1,0 +1,4 @@
+mode: atomic
+example.com/wallet/cmd/wallet/main.go:1.1,1.2 1799 1
+example.com/wallet/cmd/wallet/main.go:2.1,2.2 201 0
+example.com/wallet/internal/service/service.go:1.1,1.2 1 1

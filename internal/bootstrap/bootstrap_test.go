@@ -109,7 +109,7 @@ func TestEveryConstructorRunsAndStartFailsAtThePing(t *testing.T) {
 	t.Parallel()
 	var g graph
 	rec := &recorder{}
-	a := bootstrap.New(testConfig(t, nil), fakeSQS(), fx.Populate(&g),
+	a := bootstrap.New(context.Background(), testConfig(t, nil), fakeSQS(), fx.Populate(&g),
 		fx.WithLogger(func() fxevent.Logger { return rec }))
 	require.NoError(t, a.Err(), "the whole graph is constructed without Docker")
 	assert.Equal(t, "http://sqs.local/wager-transactions.fifo", g.Queues.Input)
@@ -132,12 +132,11 @@ func TestEveryConstructorRunsAndStartFailsAtThePing(t *testing.T) {
 
 func TestConstructionErrorsSurfaceThroughErr(t *testing.T) {
 	t.Parallel()
-	cases := map[string]map[string]string{
-		"sender policy": {"SQS_SENDER_PROVIDERS": "missing-equals"},
-		"bad database":  {"DATABASE_URL": "postgres://%%%"},
-	}
-	for name, overrides := range cases {
-		a := bootstrap.New(testConfig(t, overrides), fakeSQS())
-		require.Error(t, a.Err(), name)
-	}
+	senderCfg := testConfig(t, nil)
+	senderCfg.SQSSenderProviders = "missing-equals"
+	require.Error(t, bootstrap.New(context.Background(), senderCfg, fakeSQS()).Err(),
+		"programmatic configuration is still checked by the consumer constructor")
+
+	badDatabase := testConfig(t, map[string]string{"DATABASE_URL": "postgres://%%%"})
+	require.Error(t, bootstrap.New(context.Background(), badDatabase, fakeSQS()).Err())
 }

@@ -19,6 +19,7 @@ var errInvalidSend = errors.New("fake sqs: invalid SendMessage input")
 type fakeAPI struct {
 	mu         sync.Mutex
 	receive    func(ctx context.Context) (*sqs.ReceiveMessageOutput, error)
+	received   []*sqs.ReceiveMessageInput
 	errs       map[string]error
 	deleted    []string
 	visibility map[string]int32
@@ -28,6 +29,8 @@ type fakeAPI struct {
 	created     []*sqs.CreateQueueInput
 	configured  []*sqs.SetQueueAttributesInput
 	attrQueries int
+	deleteCalls []string
+	calls       []string
 }
 
 func newFakeAPI() *fakeAPI {
@@ -81,30 +84,37 @@ func (f *fakeAPI) GetQueueAttributes(ctx context.Context, in *sqs.GetQueueAttrib
 	}}, nil
 }
 
-func (f *fakeAPI) ReceiveMessage(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+func (f *fakeAPI) ReceiveMessage(ctx context.Context, in *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	f.mu.Lock()
+	f.received = append(f.received, in)
 	receive := f.receive
 	f.mu.Unlock()
 	return receive(ctx)
 }
 
 func (f *fakeAPI) DeleteMessage(ctx context.Context, in *sqs.DeleteMessageInput, _ ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error) {
+	receipt := aws.ToString(in.ReceiptHandle)
+	f.recordCall("delete:" + receipt)
+	f.mu.Lock()
+	f.deleteCalls = append(f.deleteCalls, receipt)
+	f.mu.Unlock()
 	if err := f.err(ctx, "delete"); err != nil {
 		return nil, err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.deleted = append(f.deleted, aws.ToString(in.ReceiptHandle))
+	f.deleted = append(f.deleted, receipt)
 	if deadline, ok := ctx.Deadline(); ok {
-		f.budgets[aws.ToString(in.ReceiptHandle)] = time.Until(deadline)
+		f.budgets[receipt] = time.Until(deadline)
 	}
 	return &sqs.DeleteMessageOutput{}, nil
 }
 
 func (f *fakeAPI) ChangeMessageVisibility(ctx context.Context, in *sqs.ChangeMessageVisibilityInput, _ ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error) {
+	f.recordCall("visibility:" + aws.ToString(in.ReceiptHandle))
 	if err := f.err(ctx, "visibility"); err != nil {
 		return nil, err
 	}
@@ -127,6 +137,7 @@ func (f *fakeAPI) SetQueueAttributes(ctx context.Context, in *sqs.SetQueueAttrib
 // SendMessage enforces what a FIFO queue enforces: a group id, a
 // deduplication id and UTF-8 string attributes.
 func (f *fakeAPI) SendMessage(ctx context.Context, in *sqs.SendMessageInput, _ ...func(*sqs.Options)) (*sqs.SendMessageOutput, error) {
+	f.recordCall("send:" + aws.ToString(in.MessageDeduplicationId))
 	if err := f.err(ctx, "send"); err != nil {
 		return nil, err
 	}
@@ -137,6 +148,12 @@ func (f *fakeAPI) SendMessage(ctx context.Context, in *sqs.SendMessageInput, _ .
 	defer f.mu.Unlock()
 	f.sent = append(f.sent, in)
 	return &sqs.SendMessageOutput{}, nil
+}
+
+func (f *fakeAPI) recordCall(call string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, call)
 }
 
 func validateSend(in *sqs.SendMessageInput) error {

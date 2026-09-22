@@ -74,7 +74,7 @@ func (c *FakeClock) Now() time.Time {
 	return c.now
 }
 
-// Advance moves the clock forward by d.
+// Advance moves the clock by d; a negative duration moves it backwards.
 func (c *FakeClock) Advance(d time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

@@ -21,17 +21,26 @@ const maxJWKSBytes = 1 << 20
 // a refresh at most once per refresh interval, so a flood of forged tokens
 // with random key ids cannot turn the API into a JWKS request amplifier.
 type keySet struct {
-	url      string
-	client   *http.Client
-	interval time.Duration
-	algs     []jose.SignatureAlgorithm
+	url          string
+	client       *http.Client
+	fetchTimeout time.Duration
+	interval     time.Duration
+	algs         []jose.SignatureAlgorithm
 
-	// mu guards the cache; fetchMu serialises refreshes so concurrent misses
-	// share one request without blocking readers of the cache.
-	mu        sync.Mutex
-	fetchMu   sync.Mutex
-	keys      []jose.JSONWebKey
-	lastFetch time.Time
+	// mu guards both the immutable cache snapshot and refresh coordination.
+	mu          sync.Mutex
+	keys        []jose.JSONWebKey
+	lastAttempt time.Time
+	lastSuccess time.Time
+	lastErr     error
+	refreshing  bool
+	current     *refreshState
+}
+
+type refreshState struct {
+	done chan struct{}
+	keys []jose.JSONWebKey
+	err  error
 }
 
 // VerifySignature implements oidc.KeySet: it returns the payload of jwt when
@@ -78,41 +87,84 @@ func (k *keySet) cached() []jose.JSONWebKey {
 	return k.keys
 }
 
-// refresh fetches the JWKS unless one was fetched within the interval, in
-// which case the cached keys are returned so callers fail fast. Concurrent
-// callers share a single fetch. Failed fetches also count against the
-// interval so an unavailable IdP is not hammered.
+// refresh joins or starts shared refresh work. The network operation is not
+// owned by any caller, so one canceled verification only stops its own wait.
 func (k *keySet) refresh(ctx context.Context) ([]jose.JSONWebKey, error) {
-	if keys, ok := k.fresh(); ok {
-		return keys, nil
+	state, start, keys, err := k.prepareRefresh()
+	if state == nil {
+		return keys, err
 	}
-	k.fetchMu.Lock()
-	defer k.fetchMu.Unlock()
-	// A caller that queued behind an in-flight fetch reuses its result.
-	if keys, ok := k.fresh(); ok {
-		return keys, nil
+	if start {
+		k.startRefresh(context.WithoutCancel(ctx), state)
 	}
-	keys, err := k.fetch(ctx)
-	// The interval starts when the fetch ends, so an in-flight fetch never
-	// makes an empty or stale cache look fresh to other verifications.
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	k.lastFetch = time.Now()
-	if err != nil {
-		return nil, err
-	}
-	k.keys = keys
-	return keys, nil
+	return k.waitRefresh(ctx, state)
 }
 
-// fresh returns the cached keys when a fetch happened within the interval.
-func (k *keySet) fresh() ([]jose.JSONWebKey, bool) {
+// startRefresh receives a cancellation-detached context: shared work must
+// outlive any one verifier request and is bounded inside runRefresh.
+func (k *keySet) startRefresh(ctx context.Context, state *refreshState) {
+	go k.runRefresh(ctx, state)
+}
+
+// prepareRefresh returns the current shared attempt, starts a new attempt, or
+// returns the cooldown result. lastAttempt throttles failures independently
+// from lastSuccess, which records only a cache replacement.
+func (k *keySet) prepareRefresh() (*refreshState, bool, []jose.JSONWebKey, error) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	if k.lastFetch.IsZero() || time.Since(k.lastFetch) >= k.interval {
-		return nil, false
+	if k.refreshing {
+		return k.current, false, nil, nil
 	}
-	return k.keys, true
+	if !k.lastAttempt.IsZero() && time.Since(k.lastAttempt) < k.interval {
+		return nil, false, k.keys, k.cooldownError()
+	}
+	state := &refreshState{done: make(chan struct{})}
+	k.current = state
+	k.refreshing = true
+	k.lastAttempt = time.Now()
+	return state, true, nil, nil
+}
+
+func (k *keySet) cooldownError() error {
+	if k.lastErr == nil {
+		return nil
+	}
+	return fmt.Errorf("JWKS refresh cooldown active: %w", k.lastErr)
+}
+
+// waitRefresh waits for the caller's prepared attempt or its own
+// cancellation, whichever happens first. The explicit state keeps a waiter
+// bound to its attempt even when a later refresh replaces k.current.
+func (k *keySet) waitRefresh(ctx context.Context, state *refreshState) ([]jose.JSONWebKey, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-state.done:
+		return state.keys, state.err
+	}
+}
+
+func (k *keySet) runRefresh(base context.Context, state *refreshState) {
+	ctx, cancel := context.WithTimeout(base, k.fetchTimeout)
+	defer cancel()
+	keys, err := k.fetch(ctx)
+	if err != nil {
+		err = fmt.Errorf("%w: %w", ErrJWKSUnavailable, err)
+	}
+
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	state.keys = keys
+	state.err = err
+	k.refreshing = false
+	if err == nil {
+		k.keys = keys
+		k.lastSuccess = time.Now()
+		k.lastErr = nil
+	} else {
+		k.lastErr = err
+	}
+	close(state.done)
 }
 
 // fetch downloads and parses the JWKS document.

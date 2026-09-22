@@ -9,11 +9,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -50,6 +50,7 @@ type Env struct {
 	KeycloakURL string
 	mu          sync.Mutex
 	containers  []testcontainers.Container
+	root        string
 }
 
 func (e *Env) track(c testcontainers.Container) {
@@ -65,36 +66,64 @@ func (e *Env) Issuer() string { return e.KeycloakURL + "/realms/wallet" }
 func (e *Env) JWKSURL() string { return e.Issuer() + "/protocol/openid-connect/certs" }
 
 // RepoRoot finds the module root (the directory holding go.mod).
-func RepoRoot() string {
-	_, file, _, _ := runtime.Caller(0)
-	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+func RepoRoot(start string) (string, error) {
+	dir, err := filepath.Abs(start)
+	if err != nil {
+		return "", fmt.Errorf("resolve module directory: %w", err)
+	}
+	for {
+		if info, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil && !info.IsDir() {
+			return dir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", fmt.Errorf("go.mod not found above %s", start)
+		}
+		dir = parent
+	}
 }
 
 // Start launches the three containers in parallel. AWS credentials for
 // LocalStack are exported to the process environment.
 func Start(ctx context.Context) (*Env, error) {
-	for k, v := range map[string]string{"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test", "AWS_REGION": "us-east-1"} {
-		if err := os.Setenv(k, v); err != nil {
-			return nil, err
-		}
+	root, err := RepoRoot(".")
+	if err != nil {
+		return nil, err
 	}
-	env := &Env{}
+	if err := setAWSVariables(); err != nil {
+		return nil, err
+	}
+	env := &Env{root: root}
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return env.startPostgres(gctx) })
 	g.Go(func() error { return env.startLocalStack(gctx) })
 	g.Go(func() error { return env.startKeycloak(gctx) })
 	if err := g.Wait(); err != nil {
-		env.Stop(context.WithoutCancel(ctx))
-		return nil, err
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+		defer cancel()
+		return nil, errors.Join(err, env.Stop(cleanup))
 	}
 	return env, nil
 }
 
-// Stop terminates the containers.
-func (e *Env) Stop(ctx context.Context) {
-	for _, c := range e.containers {
-		_ = c.Terminate(ctx)
+func setAWSVariables() error {
+	for k, v := range map[string]string{"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test", "AWS_REGION": "us-east-1"} {
+		if err := os.Setenv(k, v); err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+// Stop terminates the containers.
+func (e *Env) Stop(ctx context.Context) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var errs []error
+	for _, c := range e.containers {
+		errs = append(errs, c.Terminate(ctx))
+	}
+	return errors.Join(errs...)
 }
 
 func (e *Env) startPostgres(ctx context.Context) error {
@@ -132,7 +161,7 @@ func (e *Env) startKeycloak(ctx context.Context) error {
 			Env:          map[string]string{"KC_BOOTSTRAP_ADMIN_USERNAME": "admin", "KC_BOOTSTRAP_ADMIN_PASSWORD": "admin"},
 			ExposedPorts: []string{"8080/tcp", "9000/tcp"},
 			Files: []testcontainers.ContainerFile{{
-				HostFilePath:      filepath.Join(RepoRoot(), "deploy", "keycloak", "realm-wallet.json"),
+				HostFilePath:      filepath.Join(e.root, "deploy", "keycloak", "realm-wallet.json"),
 				ContainerFilePath: "/opt/keycloak/data/import/realm-wallet.json", FileMode: 0o644,
 			}},
 			WaitingFor: wait.ForHTTP("/health/ready").WithPort("9000/tcp").WithStartupTimeout(4 * time.Minute),
@@ -158,16 +187,43 @@ func (e *Env) Token(ctx context.Context, clientID string) (string, error) {
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", tokenStatusError(resp)
+	}
+	return decodeToken(resp.Body)
+}
+
+// Only OAuth error codes are safe to disclose: arbitrary upstream bodies may
+// contain credentials or tokens, including values unknown to this client.
+func tokenStatusError(resp *http.Response) error {
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 512))
+	if err != nil {
+		return fmt.Errorf("keycloak HTTP %d: read error body: %w", resp.StatusCode, err)
+	}
+	var body struct {
+		Error string `json:"error"`
+	}
+	excerpt := "[redacted response body]"
+	if json.Unmarshal(data, &body) == nil {
+		switch body.Error {
+		case "invalid_client", "invalid_grant", "invalid_request", "unauthorized_client", "unsupported_grant_type":
+			excerpt = body.Error
+		}
+	}
+	return fmt.Errorf("keycloak HTTP %d: %s", resp.StatusCode, excerpt)
+}
+
+func decodeToken(r io.Reader) (string, error) {
 	var body struct {
 		AccessToken string `json:"access_token"`
 		Error       string `json:"error_description"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(r).Decode(&body); err != nil {
 		return "", err
 	}
 	if body.AccessToken == "" {
@@ -184,11 +240,12 @@ func (e *Env) Vars(overrides map[string]string) map[string]string {
 		"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test",
 		"OIDC_ISSUER": e.Issuer(), "OIDC_JWKS_URL": e.JWKSURL(), "OIDC_AUDIENCE": "wallet-api",
 		"HTTP_ADDR": "127.0.0.1:0", "LOG_LEVEL": "warn",
-		"SQS_WAIT_TIME": "1s", "SQS_VISIBILITY_TIMEOUT": "5s", "SQS_PROCESS_TIMEOUT": "4s", "SQS_ACK_TIMEOUT": "500ms",
+		"SQS_WAIT_TIME": "1s", "SQS_VISIBILITY_TIMEOUT": "1m", "SQS_PROCESS_TIMEOUT": "4s", "SQS_ACK_TIMEOUT": "500ms",
 		"SQS_RETRY_BASE": "1s", "SQS_RETRY_MAX": "2s", "SQS_MAX_RECEIVE_COUNT": "3",
 		"PENDING_INTERVAL": "100ms", "PENDING_BASE_DELAY": "200ms", "PENDING_MAX_DELAY": "1s", "PENDING_MAX_ATTEMPTS": "5",
-		"OUTBOX_INTERVAL": "100ms", "OUTBOX_LEASE": "2s", "OUTBOX_PUBLISH_TIMEOUT": "1s", "OUTBOX_RETRY_BASE": "200ms", "OUTBOX_RETRY_MAX": "1s",
-		"SHUTDOWN_TIMEOUT": "15s",
+		"OUTBOX_INTERVAL": "100ms", "OUTBOX_LEASE": "2s", "OUTBOX_PUBLISH_TIMEOUT": "1s", "OUTBOX_FINALIZE_TIMEOUT": "500ms",
+		"OUTBOX_RETRY_BASE": "200ms", "OUTBOX_RETRY_MAX": "1s",
+		"SHUTDOWN_TIMEOUT": "61s",
 	}
 	for k, v := range overrides {
 		vars[k] = v

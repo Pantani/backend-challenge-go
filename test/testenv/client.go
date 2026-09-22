@@ -41,17 +41,24 @@ type Wallet struct {
 // Authorization header.
 type Client struct {
 	Base  string
-	Token func(client string) (string, error)
+	Token func(ctx context.Context, client string) (string, error)
+	HTTP  http.Client
 }
 
 // Do sends a request and returns transport errors instead of failing, so it
 // is safe from worker goroutines.
 func (c Client) Do(ctx context.Context, method, path, client, body string, headers map[string]string) (Response, error) {
+	httpClient := c.HTTP
+	if httpClient.Timeout <= 0 {
+		httpClient.Timeout = 10 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, httpClient.Timeout)
+	defer cancel()
 	req, err := c.request(ctx, method, path, client, body, headers)
 	if err != nil {
 		return Response{}, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return Response{}, err
 	}
@@ -69,7 +76,7 @@ func (c Client) request(ctx context.Context, method, path, client, body string, 
 		return nil, err
 	}
 	if client != "" {
-		tok, err := c.Token(client)
+		tok, err := c.Token(ctx, client)
 		if err != nil {
 			return nil, err
 		}
@@ -84,7 +91,7 @@ func (c Client) request(ctx context.Context, method, path, client, body string, 
 // Call is Do on the test goroutine: transport errors fail the test.
 func (c Client) Call(t *testing.T, method, path, client, body string, headers map[string]string) Response {
 	t.Helper()
-	res, err := c.Do(context.Background(), method, path, client, body, headers)
+	res, err := c.Do(t.Context(), method, path, client, body, headers)
 	require.NoError(t, err)
 	return res
 }
@@ -163,9 +170,10 @@ func CountDebits(ctx context.Context, pool *pgxpool.Pool, walletID string) (int,
 }
 
 // Parallel runs fn n times at once (every goroutine waits on a start gate)
-// and collects the results in call order.
-func Parallel[T any](n int, fn func(i int) T) []T {
-	out := make([]T, n)
+// and collects the results and joined worker errors in call order.
+func Parallel[T any](n int, fn func(i int) (T, error)) ([]T, error) {
+	values := make([]T, n)
+	errs := make([]error, n)
 	var wg, ready sync.WaitGroup
 	ready.Add(n)
 	start := make(chan struct{})
@@ -173,11 +181,11 @@ func Parallel[T any](n int, fn func(i int) T) []T {
 		wg.Go(func() {
 			ready.Done()
 			<-start
-			out[i] = fn(i)
+			values[i], errs[i] = fn(i)
 		})
 	}
 	ready.Wait()
 	close(start)
 	wg.Wait()
-	return out
+	return values, errors.Join(errs...)
 }

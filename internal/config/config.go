@@ -6,16 +6,24 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"slices"
 	"strconv"
 	"time"
 
+	sqsadapter "github.com/Pantani/backend-challenge-go/internal/adapter/sqs"
 	"github.com/Pantani/backend-challenge-go/internal/observability"
 )
 
-// maxSQSDuration is the longest visibility timeout SQS accepts.
-const maxSQSDuration = 12 * time.Hour
+const (
+	// maxSQSDuration is the longest visibility timeout SQS accepts.
+	maxSQSDuration        = 12 * time.Hour
+	maxSQSWaitTime        = 20 * time.Second
+	shutdownCleanupBudget = 5 * time.Second
+	httpWriteBudget       = 30 * time.Second
+	maxDuration           = time.Duration(1<<63 - 1)
+)
 
 // Database is the PostgreSQL subset of the configuration, enough for
 // `wallet migrate`.
@@ -47,18 +55,18 @@ type SQS struct {
 	SQSConsumers int
 	// SQSMaxMessages is the batch size of one receive (1..10).
 	SQSMaxMessages int
-	// SQSWaitTime is the long-polling wait (0..20s).
+	// SQSWaitTime is the long-polling wait (0..20s, in whole seconds).
 	SQSWaitTime time.Duration
-	// SQSVisibilityTimeout hides a received message from other consumers;
-	// SQSProcessTimeout bounds the handling of one message and
-	// SQSAckTimeout the broker follow-up (delete, retry visibility, DLQ
-	// copy). Their sum must stay below the visibility timeout so a message is
-	// never handled twice at once.
+	// SQSVisibilityTimeout hides a received batch from other consumers;
+	// SQSProcessTimeout bounds one message and SQSAckTimeout its broker
+	// follow-up. Visibility must exceed their sum multiplied by the maximum
+	// batch size because messages are handled serially. The SQS API represents
+	// visibility in whole seconds, so this value must not have a fraction.
 	SQSVisibilityTimeout time.Duration
 	SQSProcessTimeout    time.Duration
 	SQSAckTimeout        time.Duration
 	// SQSRetryBase and SQSRetryMax bound the visibility backoff of a retried
-	// message.
+	// message. Both values must use whole seconds, matching the SQS API.
 	SQSRetryBase time.Duration
 	SQSRetryMax  time.Duration
 	// SQSMaxReceiveCount is the redrive policy: receives before the DLQ.
@@ -77,8 +85,10 @@ type Config struct {
 	LogLevel string
 	// HTTPAddr is the listen address (":0" picks a free port).
 	HTTPAddr string
-	// ShutdownTimeout bounds the whole graceful stop; it must exceed
-	// SQSProcessTimeout so an in-flight message can complete.
+	// StartupTimeout bounds dependency construction and application start.
+	StartupTimeout time.Duration
+	// ShutdownTimeout bounds the whole graceful stop. HTTP drains before the
+	// worker group, then the final cleanup budget remains available.
 	ShutdownTimeout time.Duration
 	// ReadyTimeout bounds the /health/ready dependency checks and is also
 	// added to the start budget of the application.
@@ -114,8 +124,10 @@ type Config struct {
 	// OutboxRetryBase and OutboxRetryMax bound the publication backoff.
 	OutboxRetryBase time.Duration
 	OutboxRetryMax  time.Duration
-	// OutboxPublishTimeout bounds one publication (send plus confirmation).
+	// OutboxPublishTimeout bounds one broker publication.
 	OutboxPublishTimeout time.Duration
+	// OutboxFinalizeTimeout is shared by attempt accounting and its durable outcome.
+	OutboxFinalizeTimeout time.Duration
 	// OutboxMaxAttempts dead-letters an event after that many failures.
 	OutboxMaxAttempts int
 }
@@ -140,8 +152,9 @@ func Load(lookup Lookup) (Config, error) {
 	host, _ := os.Hostname()
 	c := Config{
 		InstanceID: r.str("INSTANCE_ID", host), LogLevel: r.str("LOG_LEVEL", "info"),
-		HTTPAddr: r.str("HTTP_ADDR", ":8080"), ShutdownTimeout: r.dur("SHUTDOWN_TIMEOUT", 30*time.Second),
-		ReadyTimeout: r.dur("READY_TIMEOUT", 2*time.Second), ConflictRetries: r.int("CONFLICT_RETRIES", 5),
+		HTTPAddr: r.str("HTTP_ADDR", ":8080"), StartupTimeout: r.dur("STARTUP_TIMEOUT", 25*time.Second),
+		ShutdownTimeout: r.dur("SHUTDOWN_TIMEOUT", 61*time.Second),
+		ReadyTimeout:    r.dur("READY_TIMEOUT", 2*time.Second), ConflictRetries: r.int("CONFLICT_RETRIES", 5),
 		Database: r.database(), SQS: r.sqs(),
 
 		OIDCIssuer:   r.str("OIDC_ISSUER", "http://localhost:8180/realms/wallet"),
@@ -194,7 +207,7 @@ func (r *reader) sqs() SQS {
 		SQSEventsQueue:  r.str("SQS_EVENTS_QUEUE", "wallet-events.fifo"),
 		SQSConsumerName: r.str("SQS_CONSUMER_NAME", "wager-transactions-consumer"),
 		SQSConsumers:    r.int("SQS_CONSUMERS", 2), SQSMaxMessages: r.int("SQS_MAX_MESSAGES", 10),
-		SQSWaitTime: r.dur("SQS_WAIT_TIME", 10*time.Second), SQSVisibilityTimeout: r.dur("SQS_VISIBILITY_TIMEOUT", 30*time.Second),
+		SQSWaitTime: r.dur("SQS_WAIT_TIME", 10*time.Second), SQSVisibilityTimeout: r.dur("SQS_VISIBILITY_TIMEOUT", 5*time.Minute),
 		SQSProcessTimeout: r.dur("SQS_PROCESS_TIMEOUT", 20*time.Second), SQSAckTimeout: r.dur("SQS_ACK_TIMEOUT", 5*time.Second),
 		SQSRetryBase: r.dur("SQS_RETRY_BASE", 2*time.Second), SQSRetryMax: r.dur("SQS_RETRY_MAX", 60*time.Second),
 		SQSMaxReceiveCount: r.int("SQS_MAX_RECEIVE_COUNT", 5),
@@ -211,6 +224,7 @@ func (r *reader) loadWorkers(c *Config) {
 	c.OutboxLease = r.dur("OUTBOX_LEASE", 30*time.Second)
 	c.OutboxRetryBase, c.OutboxRetryMax = r.dur("OUTBOX_RETRY_BASE", time.Second), r.dur("OUTBOX_RETRY_MAX", time.Minute)
 	c.OutboxPublishTimeout = r.dur("OUTBOX_PUBLISH_TIMEOUT", 10*time.Second)
+	c.OutboxFinalizeTimeout = r.dur("OUTBOX_FINALIZE_TIMEOUT", 5*time.Second)
 	c.OutboxMaxAttempts = r.int("OUTBOX_MAX_ATTEMPTS", 20)
 }
 
@@ -232,26 +246,59 @@ func check(rules []rule) error {
 }
 
 func (d Database) validate() error {
-	return check([]rule{
+	return errors.Join(check([]rule{
 		{d.DatabaseURL != "", "DATABASE_URL is required"},
-		{d.DBMaxConns > 0, "DB_MAX_CONNS must be positive"},
-		{positiveDurations(d.DBLockTimeout, d.DBStatementTimeout), "DB_LOCK_TIMEOUT and DB_STATEMENT_TIMEOUT must be positive"},
-	})
+		{d.DBMaxConns > 0 && d.DBMaxConns <= math.MaxInt32, "DB_MAX_CONNS must be between 1 and 2147483647"},
+	}), wholeMilliseconds("DB_LOCK_TIMEOUT", d.DBLockTimeout),
+		wholeMilliseconds("DB_STATEMENT_TIMEOUT", d.DBStatementTimeout))
 }
 
 func (s SQS) validate() error {
-	return check([]rule{
-		{positive(s.SQSConsumers, s.SQSMaxReceiveCount), "SQS_CONSUMERS and SQS_MAX_RECEIVE_COUNT must be positive"},
+	budget, budgetOK := batchBudget(s.SQSMaxMessages, s.SQSProcessTimeout, s.SQSAckTimeout)
+	_, senderPolicyErr := sqsadapter.ParseSenderPolicy(s.SQSSenderProviders)
+	return errors.Join(check([]rule{
+		{s.SQSConsumers > 0, "SQS_CONSUMERS must be positive"},
+		{s.SQSMaxReceiveCount > 0, "SQS_MAX_RECEIVE_COUNT must be positive"},
 		{between(s.SQSMaxMessages, 1, 10), "SQS_MAX_MESSAGES must be between 1 and 10"},
-		{between(int(s.SQSWaitTime), 0, int(20*time.Second)), "SQS_WAIT_TIME must be between 0s and 20s"},
-		{positiveDurations(s.SQSVisibilityTimeout, s.SQSProcessTimeout, s.SQSAckTimeout, s.SQSRetryBase, s.SQSRetryMax),
-			"SQS visibility, process, ack and retry durations must be positive"},
-		{s.SQSProcessTimeout+s.SQSAckTimeout < s.SQSVisibilityTimeout,
-			"SQS_PROCESS_TIMEOUT plus SQS_ACK_TIMEOUT must be lower than SQS_VISIBILITY_TIMEOUT"},
+		{s.SQSWaitTime >= 0 && s.SQSWaitTime <= maxSQSWaitTime, "SQS_WAIT_TIME must be between 0s and 20s"},
+		{s.SQSVisibilityTimeout > 0, "SQS_VISIBILITY_TIMEOUT must be positive"},
+		{s.SQSProcessTimeout > 0, "SQS_PROCESS_TIMEOUT must be positive"},
+		{s.SQSAckTimeout > 0, "SQS_ACK_TIMEOUT must be positive"},
+		{s.SQSRetryBase > 0, "SQS_RETRY_BASE must be positive"},
+		{s.SQSRetryMax > 0, "SQS_RETRY_MAX must be positive"},
+		{budgetOK && s.SQSVisibilityTimeout > budget,
+			"SQS_VISIBILITY_TIMEOUT must exceed the whole receive batch budget: SQS_MAX_MESSAGES * (SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT)"},
 		{s.SQSRetryBase <= s.SQSRetryMax, "SQS_RETRY_BASE must not exceed SQS_RETRY_MAX"},
-		{s.SQSVisibilityTimeout <= maxSQSDuration && s.SQSRetryMax <= maxSQSDuration,
-			"SQS_VISIBILITY_TIMEOUT and SQS_RETRY_MAX must not exceed 12h"},
-	})
+		{s.SQSVisibilityTimeout <= maxSQSDuration, "SQS_VISIBILITY_TIMEOUT must not exceed 12h"},
+		{s.SQSRetryBase <= maxSQSDuration, "SQS_RETRY_BASE must not exceed 12h"},
+		{s.SQSRetryMax <= maxSQSDuration, "SQS_RETRY_MAX must not exceed 12h"},
+	}), wholeSeconds("SQS_WAIT_TIME", s.SQSWaitTime),
+		wholeSeconds("SQS_VISIBILITY_TIMEOUT", s.SQSVisibilityTimeout),
+		wholeSeconds("SQS_RETRY_BASE", s.SQSRetryBase),
+		wholeSeconds("SQS_RETRY_MAX", s.SQSRetryMax), namedSenderPolicyError(senderPolicyErr))
+}
+
+func namedSenderPolicyError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("SQS_SENDER_PROVIDERS: %w", err)
+}
+
+// batchBudget returns the worst-case serial processing and acknowledgement
+// time for one receive without allowing time.Duration arithmetic to wrap.
+func batchBudget(maxMessages int, process, ack time.Duration) (time.Duration, bool) {
+	if maxMessages <= 0 || process <= 0 || ack <= 0 {
+		return 0, false
+	}
+	if process > maxDuration-ack {
+		return 0, false
+	}
+	perMessage := process + ack
+	if perMessage > maxDuration/time.Duration(maxMessages) {
+		return 0, false
+	}
+	return time.Duration(maxMessages) * perMessage, true
 }
 
 // validate enforces relationships between settings.
@@ -265,12 +312,54 @@ func (c Config) validate() error {
 			"batch sizes and attempts must be positive"},
 		{between(int(c.PendingBaseDelay), 1, int(c.PendingMaxDelay)), "PENDING_BASE_DELAY must be in (0, PENDING_MAX_DELAY]"},
 		{positiveDurations(c.PendingInterval, c.OutboxInterval, c.OutboxLease, c.OutboxRetryBase, c.OutboxRetryMax,
-			c.OutboxPublishTimeout, c.ShutdownTimeout, c.ReadyTimeout), "worker intervals, leases, retries and timeouts must be positive"},
+			c.OutboxPublishTimeout, c.OutboxFinalizeTimeout, c.ReadyTimeout),
+			"worker intervals, leases, retries and timeouts must be positive"},
+		{c.StartupTimeout > 0, "STARTUP_TIMEOUT must be positive"},
+		{c.ShutdownTimeout > 0, "SHUTDOWN_TIMEOUT must be positive"},
 		{c.OutboxRetryBase <= c.OutboxRetryMax, "OUTBOX_RETRY_BASE must not exceed OUTBOX_RETRY_MAX"},
-		{c.OutboxPublishTimeout < c.OutboxLease, "OUTBOX_PUBLISH_TIMEOUT must be lower than OUTBOX_LEASE"},
-		{c.ShutdownTimeout > c.SQSProcessTimeout+c.SQSAckTimeout, "SHUTDOWN_TIMEOUT must exceed SQS_PROCESS_TIMEOUT plus SQS_ACK_TIMEOUT"},
-		{c.ShutdownTimeout > c.OutboxPublishTimeout, "SHUTDOWN_TIMEOUT must exceed OUTBOX_PUBLISH_TIMEOUT"},
-	}))
+		{outboxBudgetFits(c.OutboxPublishTimeout, c.OutboxFinalizeTimeout, c.OutboxLease),
+			"OUTBOX_PUBLISH_TIMEOUT plus OUTBOX_FINALIZE_TIMEOUT must be lower than OUTBOX_LEASE"},
+	}), c.validateShutdown())
+}
+
+// validateShutdown reserves cleanup time after the serial HTTP and worker
+// drain phases. Each worker operation may finish concurrently with its peers.
+func (c Config) validateShutdown() error {
+	drain, ok := shutdownDrain(c.ShutdownTimeout)
+	return check([]rule{
+		{ok && httpWriteBudget < drain,
+			"SHUTDOWN_TIMEOUT must leave more than 30s for HTTP writes before cleanup"},
+		{ok && durationSum3LessThan(httpWriteBudget, c.SQSProcessTimeout, c.SQSAckTimeout, drain),
+			"SHUTDOWN_TIMEOUT must cover HTTP writes plus SQS processing and acknowledgement before cleanup"},
+		{ok && durationSum3LessThan(httpWriteBudget, c.OutboxPublishTimeout, c.OutboxFinalizeTimeout, drain),
+			"SHUTDOWN_TIMEOUT must cover HTTP writes plus outbox publication and finalization before cleanup"},
+		{ok && durationSumLessThan(httpWriteBudget, c.DBStatementTimeout, drain),
+			"SHUTDOWN_TIMEOUT must cover HTTP writes plus DB_STATEMENT_TIMEOUT before cleanup"},
+	})
+}
+
+func durationSum3LessThan(first, second, third, limit time.Duration) bool {
+	return first >= 0 && second >= 0 && third >= 0 && first < limit &&
+		second < limit-first && third < limit-first-second
+}
+
+func shutdownDrain(timeout time.Duration) (time.Duration, bool) {
+	if timeout <= shutdownCleanupBudget {
+		return 0, false
+	}
+	return timeout - shutdownCleanupBudget, true
+}
+
+// durationSumLessThan compares a serial pair with a limit without adding the
+// durations, which would allow time.Duration overflow to reverse the result.
+func durationSumLessThan(left, right, limit time.Duration) bool {
+	return left >= 0 && right >= 0 && left < limit && right < limit-left
+}
+
+// outboxBudgetFits validates the serial publication and finalization budget
+// using subtraction so time.Duration addition cannot overflow.
+func outboxBudgetFits(publish, finalize, lease time.Duration) bool {
+	return publish > 0 && finalize > 0 && lease > 0 && publish < lease && finalize < lease-publish
 }
 
 func nonEmpty(values ...string) bool {
@@ -283,6 +372,26 @@ func positive(values ...int) bool {
 
 func positiveDurations(values ...time.Duration) bool {
 	return !slices.ContainsFunc(values, func(d time.Duration) bool { return d <= 0 })
+}
+
+// wholeSeconds protects a duration serialized to an integer-seconds SQS field
+// from being silently truncated by the adapter.
+func wholeSeconds(name string, value time.Duration) error {
+	if value < 0 || value%time.Second != 0 {
+		return fmt.Errorf("%s must use whole seconds", name)
+	}
+	return nil
+}
+
+func wholeMilliseconds(name string, value time.Duration) error {
+	return wholeUnit(name, value, time.Millisecond, "milliseconds")
+}
+
+func wholeUnit(name string, value, unit time.Duration, label string) error {
+	if value < unit || value%unit != 0 {
+		return fmt.Errorf("%s must be positive whole %s", name, label)
+	}
+	return nil
 }
 
 func between(v, lo, hi int) bool { return v >= lo && v <= hi }
