@@ -463,26 +463,38 @@ func waitUntil(deadline time.Time) {
 	}
 }
 
+const (
+	slowBatchOldVisibility    = 2 * time.Second
+	slowBatchVisibility       = 4 * time.Second
+	slowBatchProcessBudget    = 1940 * time.Millisecond
+	slowBatchAckBudget        = 50 * time.Millisecond
+	slowBatchHeadReleaseAfter = 1400 * time.Millisecond
+	slowBatchProbeUntilAfter  = 2400 * time.Millisecond
+	slowBatchMinHeadroom      = 400 * time.Millisecond
+)
+
+func TestSlowBatchTimingBudget(t *testing.T) {
+	t.Parallel()
+	perMessage := slowBatchProcessBudget + slowBatchAckBudget
+	tailHeld := slowBatchProbeUntilAfter - slowBatchHeadReleaseAfter
+	assert.Less(t, perMessage, slowBatchOldVisibility)
+	assert.Greater(t, slowBatchVisibility, 2*perMessage)
+	assert.Greater(t, slowBatchProbeUntilAfter, slowBatchOldVisibility)
+	assert.GreaterOrEqual(t, slowBatchProcessBudget-slowBatchHeadReleaseAfter, slowBatchMinHeadroom)
+	assert.GreaterOrEqual(t, slowBatchProcessBudget-tailHeld, slowBatchMinHeadroom)
+}
+
 func TestVisibilityProtectsSlowBatchFromSecondConsumer(t *testing.T) {
 	t.Parallel()
 	// The former per-message rule accepts 1.99s < 2s, while the complete
 	// two-message batch requires a visibility window strictly above 3.98s.
-	// The gates retain at least 200ms of processing headroom per item.
-	const (
-		oldVisibility    = 2 * time.Second
-		visibility       = 4 * time.Second
-		processBudget    = 1940 * time.Millisecond
-		ackBudget        = 50 * time.Millisecond
-		headReleaseAfter = 1600 * time.Millisecond
-		probeUntilAfter  = 3300 * time.Millisecond
-		minHeadroom      = 200 * time.Millisecond
-	)
+	// The gates retain at least 400ms of processing headroom per item.
 	s := newServices(t, defaultPolicy)
 	api, q, _ := provisionQueues(t, 20)
 	_, err := api.SetQueueAttributes(context.Background(), &awssqs.SetQueueAttributesInput{
 		QueueUrl: aws.String(q.Input),
 		Attributes: map[string]string{
-			string(types.QueueAttributeNameVisibilityTimeout): strconv.Itoa(int(visibility.Seconds())),
+			string(types.QueueAttributeNameVisibilityTimeout): strconv.Itoa(int(slowBatchVisibility.Seconds())),
 		},
 	})
 	require.NoError(t, err)
@@ -494,7 +506,7 @@ func TestVisibilityProtectsSlowBatchFromSecondConsumer(t *testing.T) {
 
 	receiveCtx, stopReceive := context.WithTimeout(context.Background(), 10*time.Second)
 	defer stopReceive()
-	batch, receivedAt, err := receiveFullBatch(receiveCtx, api, q.Input, int32(visibility.Seconds()), 2)
+	batch, receivedAt, err := receiveFullBatch(receiveCtx, api, q.Input, int32(slowBatchVisibility.Seconds()), 2)
 	require.NoError(t, err)
 	require.Len(t, batch.Messages, 2)
 
@@ -504,7 +516,7 @@ func TestVisibilityProtectsSlowBatchFromSecondConsumer(t *testing.T) {
 	processorA := newGatedBatchProcessor(headGate, tailGate)
 	consumerConfig := sqsadapter.ConsumerConfig{
 		Name: "slow-batch", QueueURL: q.Input, DLQURL: q.DLQ, MaxMessages: 2, WaitTime: 3 * time.Second,
-		VisibilityTimeout: visibility, ProcessTimeout: processBudget, AckTimeout: ackBudget,
+		VisibilityTimeout: slowBatchVisibility, ProcessTimeout: slowBatchProcessBudget, AckTimeout: slowBatchAckBudget,
 		RetryBase: time.Second, RetryMax: time.Second, Senders: localSenders,
 	}
 	logger := observability.NewLogger(io.Discard, "error", "slow-batch")
@@ -527,27 +539,27 @@ func TestVisibilityProtectsSlowBatchFromSecondConsumer(t *testing.T) {
 	doneB := runAsync(func() { consumerB.Run(ctxB) })
 	await(t, observedB.started, time.Second, "consumer B did not start receiving while A was blocked")
 
-	waitUntil(receivedAt.Add(headReleaseAfter))
+	waitUntil(receivedAt.Add(slowBatchHeadReleaseAfter))
 	headGate.release()
 	head := await(t, processorA.finished, time.Second, "consumer A did not finish the batch head")
 	assert.NoError(t, head.err)
 	assert.Equal(t, expectedIDs[0], head.messageID)
-	assert.GreaterOrEqual(t, processBudget-head.duration, minHeadroom)
+	assert.GreaterOrEqual(t, slowBatchProcessBudget-head.duration, slowBatchMinHeadroom)
 	assert.Equal(t, expectedIDs[1], await(t, processorA.started, time.Second, "consumer A did not start the batch tail"))
 
-	waitUntil(receivedAt.Add(probeUntilAfter))
+	waitUntil(receivedAt.Add(slowBatchProbeUntilAfter))
 	canceledAfter := time.Since(receivedAt)
 	cancelB()
-	await(t, doneB, time.Second, "consumer B did not stop after cancellation")
-	receives := summarizeReceives(t, observedB.results, headReleaseAfter, oldVisibility, canceledAfter)
-
 	tailGate.release()
+	await(t, doneB, time.Second, "consumer B did not stop after cancellation")
+	receives := summarizeReceives(t, observedB.results, slowBatchHeadReleaseAfter, slowBatchOldVisibility, canceledAfter)
+
 	tail := await(t, processorA.finished, time.Second, "consumer A did not finish the batch tail")
 	await(t, doneA, time.Second, "consumer A did not finish the exact batch")
 	assert.NoError(t, tail.err)
 	assert.Equal(t, expectedIDs[1], tail.messageID)
-	assert.GreaterOrEqual(t, processBudget-tail.duration, minHeadroom)
-	assert.Greater(t, time.Since(receivedAt), oldVisibility)
+	assert.GreaterOrEqual(t, slowBatchProcessBudget-tail.duration, slowBatchMinHeadroom)
+	assert.Greater(t, time.Since(receivedAt), slowBatchOldVisibility)
 	assert.GreaterOrEqual(t, receives.successful, 2, "consumer B must complete successful polls while A owns the batch")
 	assert.Positive(t, receives.successfulDuringHead, "consumer B must poll successfully while A holds the head")
 	assert.Positive(t, receives.successfulAfterOld, "consumer B must poll successfully after the old visibility boundary")
