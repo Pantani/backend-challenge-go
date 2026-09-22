@@ -458,6 +458,22 @@ func TestConsumerReleasesGroupTailWhenDLQSendFails(t *testing.T) {
 	assert.Equal(t, map[string]int32{"rh-a2": 0}, f.api.visibility)
 }
 
+func TestDLQDeleteFailureBlocksGroupTail(t *testing.T) {
+	t.Parallel()
+	proc := &fakeProcessor{}
+	f := newConsumer(t, proc,
+		groupMessage("a1", "garbage", "1", testWalletA),
+		groupMessage("a2", bodyAt("m-a2", "2026-09-08T12:00:00Z", "1.00", testWalletA), "1", testWalletA))
+	f.api.errs["delete"] = errBoom
+
+	f.c.PollOnce(context.Background())
+
+	require.Len(t, f.api.sent, 1, "the invalid head is copied to the DLQ")
+	assert.Zero(t, proc.calls, "the tail waits until its head leaves the source queue")
+	assert.Equal(t, map[string]int32{"rh-a2": 0}, f.api.visibility, "the unstarted tail is released")
+	assert.Contains(t, f.logs.String(), "sqs delete failed; redelivery will be deduplicated")
+}
+
 func TestDeadLetterKeepsMessageGroup(t *testing.T) {
 	t.Parallel()
 	f := newConsumer(t, &fakeProcessor{}, groupMessage("a", "garbage", "1", "wallet-a"), groupMessage("b", "garbage", "1", ""))

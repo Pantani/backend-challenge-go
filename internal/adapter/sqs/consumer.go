@@ -260,12 +260,14 @@ func (c *Consumer) ack(parent context.Context, m types.Message, res app.ConsumeR
 	c.delete(ctx, m)
 }
 
-func (c *Consumer) delete(ctx context.Context, m types.Message) {
+func (c *Consumer) delete(ctx context.Context, m types.Message) bool {
 	_, err := c.api.DeleteMessage(ctx, &sqs.DeleteMessageInput{QueueUrl: aws.String(c.cfg.QueueURL), ReceiptHandle: m.ReceiptHandle})
 	if err != nil {
 		// The handling is committed; a redelivery is absorbed by the inbox.
 		c.logger.WarnContext(ctx, "sqs delete failed; redelivery will be deduplicated", "error", err)
+		return false
 	}
+	return true
 }
 
 // retry hides the message for an exponential backoff based on its receive
@@ -315,8 +317,8 @@ func (c *Consumer) changeVisibility(ctx context.Context, m types.Message, d time
 // deadLetter copies the message to the DLQ with the failure reason, keeping
 // its MessageGroupId (so a DLQ replay preserves the wallet order), then
 // removes it from the input queue. It reports whether the message left the
-// input queue: if the copy fails the message stays, its group tail is
-// released and the redrive policy eventually moves it.
+// input queue: if the copy or source deletion fails the message stays, its
+// group tail is released and the redrive policy eventually moves it.
 func (c *Consumer) deadLetter(parent context.Context, m types.Message, cause error) bool {
 	ctx, cancel := worker.Detach(parent, c.cfg.ackTimeout())
 	defer cancel()
@@ -339,8 +341,7 @@ func (c *Consumer) deadLetter(parent context.Context, m types.Message, cause err
 		return false
 	}
 	c.metrics.SQSMessage(OutcomeDLQ)
-	c.delete(ctx, m)
-	return true
+	return c.delete(ctx, m)
 }
 
 // truncate replaces invalid bytes and cuts s to at most n bytes without
