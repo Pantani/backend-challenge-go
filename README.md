@@ -151,6 +151,10 @@ Os códigos HTTP, os corpos de erro e os `failureCode` estão em [`ARCHITECTURE.
 
 ## Testes
 
+### How to test
+
+See [the complete testing walkthrough](docs/TESTING.md) for prerequisites, manual commands, expected balances, and the full regression sequence. Run `make test-walkthrough` to execute every business step with real dependencies and a separate result per step.
+
 ```sh
 go test ./...          # unitários (sem Docker)
 go test -race ./...

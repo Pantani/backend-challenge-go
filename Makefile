@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: all build test test-race vet lint test-integration test-e2e coverage up down clean logs migrate-up migrate-down provision-queues
+.PHONY: all build test test-race vet lint test-integration test-walkthrough test-e2e coverage up down clean logs migrate-up migrate-down provision-queues
 
 all: vet lint test-race
 
@@ -25,6 +25,10 @@ lint:
 ## Integration tests: real PostgreSQL, LocalStack and Keycloak via testcontainers.
 test-integration:
 	go test -race -count=1 -tags integration ./test/integration/...
+
+## Ordered business walkthrough with a visible result for each step.
+test-walkthrough:
+	go test -race -count=1 -timeout 10m -v -tags integration ./test/integration/... -run '^TestWalkthrough$$'
 
 ## End-to-end: the compiled binary as 3 independent processes + crash/restart.
 test-e2e:
