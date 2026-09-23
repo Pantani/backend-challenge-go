@@ -205,6 +205,34 @@ func TestServeAppliesStartupDeadline(t *testing.T) {
 	assert.Less(t, time.Since(started), time.Second)
 }
 
+// failingApp starts and then reports a shutdown request with exitCode, as
+// bootstrap does when the HTTP server dies.
+type failingApp struct {
+	exitCode int
+	stopped  bool
+}
+
+func (*failingApp) Err() error                   { return nil }
+func (*failingApp) Start(context.Context) error  { return nil }
+func (a *failingApp) Stop(context.Context) error { a.stopped = true; return nil }
+func (a *failingApp) Wait() <-chan fx.ShutdownSignal {
+	ch := make(chan fx.ShutdownSignal, 1)
+	ch <- fx.ShutdownSignal{ExitCode: a.exitCode}
+	return ch
+}
+
+// Not parallel: it swaps the package-level application constructor.
+func TestServeStopsAndFailsWhenTheApplicationShutsDown(t *testing.T) {
+	fake := &failingApp{exitCode: 1}
+	newApp = func(context.Context, config.Config) application { return fake }
+	t.Cleanup(func() { newApp = defaultApp })
+	cfg, err := config.Load(config.MapLookup(nil))
+	require.NoError(t, err)
+
+	require.ErrorContains(t, serve(context.Background(), cfg), "exit code 1")
+	assert.True(t, fake.stopped)
+}
+
 // Not parallel: it swaps every external constructor.
 func TestMalformedConfigurationAllocatesNoResources(t *testing.T) {
 	var migrators, sqsClients, applications int

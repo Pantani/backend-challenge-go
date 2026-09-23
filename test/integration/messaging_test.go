@@ -418,11 +418,18 @@ func TestPublicationRetriesWithBackoff(t *testing.T) {
 var localSenders = sqsadapter.SenderPolicy{"000000000000": {"*"}}
 
 // consumerFor builds a consumer on the test queues.
+// itMaxReceiveCount is the consumer limit of consumerFor.
+const itMaxReceiveCount = 2
+
 func consumerFor(api sqsadapter.API, q sqsadapter.Queues, svc sqsadapter.Processor) *sqsadapter.Consumer {
+	return consumerWithLimit(api, q, svc, itMaxReceiveCount)
+}
+
+func consumerWithLimit(api sqsadapter.API, q sqsadapter.Queues, svc sqsadapter.Processor, maxReceiveCount int) *sqsadapter.Consumer {
 	return sqsadapter.NewConsumer(api, sqsadapter.ConsumerConfig{
 		Name: "it-consumer", QueueURL: q.Input, DLQURL: q.DLQ, MaxMessages: 10, WaitTime: time.Second,
 		VisibilityTimeout: 2 * time.Second, ProcessTimeout: time.Second, RetryBase: time.Second, RetryMax: time.Second,
-		Senders: localSenders,
+		MaxReceiveCount: maxReceiveCount, Senders: localSenders,
 	}, svc, observability.NewLogger(io.Discard, "error", "c"), testutil.NewMetrics())
 }
 
@@ -705,7 +712,7 @@ func TestVisibilityProtectsSlowBatchFromSecondConsumer(t *testing.T) {
 	consumerConfig := sqsadapter.ConsumerConfig{
 		Name: "slow-batch", QueueURL: q.Input, DLQURL: q.DLQ, MaxMessages: 2, WaitTime: 3 * time.Second,
 		VisibilityTimeout: slowBatchVisibility, ProcessTimeout: slowBatchProcessBudget, AckTimeout: slowBatchAckBudget,
-		RetryBase: time.Second, RetryMax: time.Second, Senders: localSenders,
+		RetryBase: time.Second, RetryMax: time.Second, MaxReceiveCount: 20, Senders: localSenders,
 	}
 	logger := observability.NewLogger(io.Discard, "error", "slow-batch")
 	consumerA := sqsadapter.NewConsumer(&prefetchedAPI{API: api, batch: batch}, consumerConfig, processorA, logger, testutil.NewMetrics())
@@ -885,35 +892,112 @@ func (flakyProcessor) ConsumeMessage(context.Context, app.InboundMessage) (app.C
 	return app.ConsumeResult{}, app.ErrUnavailable
 }
 
-func TestTransientFailuresAreRetriedThenRedrivenToTheDLQ(t *testing.T) {
-	t.Parallel()
-	s := newServices(t, defaultPolicy)
-	api, q, _ := provisionQueues(t, 2)
-	w := s.openWallet(t, "100.00")
-	sendMessage(t, api, q, s.prefix+"flaky", s.input(w, "provider-a", "flaky", "BET", "1.00", ""))
-
-	c := consumerFor(api, q, flakyProcessor{})
+// awaitDLQDepth polls c until the DLQ holds want messages.
+func awaitDLQDepth(t *testing.T, api sqsadapter.API, q sqsadapter.Queues, c *sqsadapter.Consumer, want int, msg string) {
+	t.Helper()
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
 		c.PollOnce(context.Background())
 		depth, err := queueDepth(api, q.DLQ)
 		if !assert.NoError(collect, err) {
 			return
 		}
-		assert.Equal(collect, 1, depth)
-	}, 30*time.Second, 200*time.Millisecond, "after maxReceiveCount the redrive policy moves it")
+		assert.Equal(collect, want, depth)
+	}, 30*time.Second, 200*time.Millisecond, msg)
+}
+
+// receiveDead removes one DLQ message and returns its body and failureReason.
+func receiveDead(t *testing.T, api sqsadapter.API, q sqsadapter.Queues) (body, reason string) {
+	t.Helper()
+	out, err := api.ReceiveMessage(context.Background(), &awssqs.ReceiveMessageInput{QueueUrl: aws.String(q.DLQ),
+		MaxNumberOfMessages: 10, WaitTimeSeconds: 1, MessageAttributeNames: []string{"All"}})
+	require.NoError(t, err)
+	require.Len(t, out.Messages, 1)
+	m := out.Messages[0]
+	_, err = api.DeleteMessage(context.Background(), &awssqs.DeleteMessageInput{QueueUrl: aws.String(q.DLQ), ReceiptHandle: m.ReceiptHandle})
+	require.NoError(t, err)
+	return aws.ToString(m.Body), aws.ToString(m.MessageAttributes["failureReason"].StringValue)
+}
+
+func TestTransientFailuresAreRetriedThenDeadLetteredWithTheirReason(t *testing.T) {
+	t.Parallel()
+	s := newServices(t, defaultPolicy)
+	api, q, _ := provisionQueues(t, sqsadapter.RedriveMaxReceiveCount(itMaxReceiveCount))
+	w := s.openWallet(t, "100.00")
+	sendMessage(t, api, q, s.prefix+"flaky", s.input(w, "provider-a", "flaky", "BET", "1.00", ""))
+
+	awaitDLQDepth(t, api, q, consumerFor(api, q, flakyProcessor{}), 1,
+		"after SQS_MAX_RECEIVE_COUNT receives the consumer dead-letters it")
 	assert.Equal(t, "100.00", s.balance(t, w))
+	dead, reason := receiveDead(t, api, q)
+	assert.Contains(t, reason, "gave up after 2 receives")
 
 	// Once PostgreSQL is back, replaying the DLQ message processes it once.
-	dead := drain(t, api, q.DLQ)
-	require.Len(t, dead, 1)
 	var replay sqsadapter.Envelope
-	require.NoError(t, json.Unmarshal([]byte(dead[0]), &replay))
+	require.NoError(t, json.Unmarshal([]byte(dead), &replay))
 	replay.MessageID = uuid.NewString()
 	replayBody, err := sqsadapter.EncodeMessage(replay)
 	require.NoError(t, err)
 	sendRaw(t, api, q, replay.MessageID, replayBody, w.ID().String())
 	consumerFor(api, q, s.wagers).PollOnce(context.Background())
 	assert.Equal(t, "99.00", s.balance(t, w))
+}
+
+func TestQueueRedriveRemainsASafetyNet(t *testing.T) {
+	t.Parallel()
+	s := newServices(t, defaultPolicy)
+	api, q, _ := provisionQueues(t, 2)
+	w := s.openWallet(t, "100.00")
+	sendMessage(t, api, q, s.prefix+"flaky", s.input(w, "provider-a", "flaky", "BET", "1.00", ""))
+
+	// A consumer whose own limit is never reached leaves it to the broker.
+	awaitDLQDepth(t, api, q, consumerWithLimit(api, q, flakyProcessor{}, 100), 1,
+		"after maxReceiveCount the redrive policy moves it")
+	assert.Equal(t, "100.00", s.balance(t, w))
+}
+
+// failingHead fails one message transiently and processes the others.
+type failingHead struct {
+	messageID string
+	next      sqsadapter.Processor
+}
+
+func (p failingHead) ConsumeMessage(ctx context.Context, msg app.InboundMessage) (app.ConsumeResult, error) {
+	if msg.MessageID == p.messageID {
+		return app.ConsumeResult{}, app.ErrUnavailable
+	}
+	return p.next.ConsumeMessage(ctx, msg)
+}
+
+// A FIFO receive returns the retried head together with the messages behind
+// it, so their receive counts climb with the head's. Before the consumer had
+// its own limit, the redrive moved those never-attempted followers to the
+// DLQ, without a failureReason, together with the head.
+func TestFollowerOfAFailingHeadIsNotDeadLettered(t *testing.T) {
+	t.Parallel()
+	s := newServices(t, defaultPolicy)
+	api, q, _ := provisionQueues(t, sqsadapter.RedriveMaxReceiveCount(itMaxReceiveCount))
+	w := s.openWallet(t, "100.00")
+	head := s.prefix + "head"
+	sendMessage(t, api, q, head, s.input(w, "provider-a", "head", "BET", "1.00", ""))
+	sendMessage(t, api, q, s.prefix+"follower", s.input(w, "provider-a", "follower", "BET", "2.00", ""))
+
+	c := consumerFor(api, q, failingHead{messageID: head, next: s.wagers})
+	awaitDLQDepth(t, api, q, c, 1, "the head is dead-lettered by the consumer")
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		c.PollOnce(context.Background())
+		depth, err := queueDepth(api, q.Input)
+		if assert.NoError(collect, err) {
+			assert.Zero(collect, depth)
+		}
+	}, 30*time.Second, 200*time.Millisecond)
+
+	dead, reason := receiveDead(t, api, q)
+	assert.Contains(t, dead, head, "only the failing head is in the DLQ")
+	assert.Contains(t, reason, "unavailable")
+	assert.Equal(t, "98.00", s.balance(t, w), "the follower was processed")
+	depth, err := queueDepth(api, q.DLQ)
+	require.NoError(t, err)
+	assert.Zero(t, depth)
 }
 
 func TestSameOperationThroughHTTPAndSQS(t *testing.T) {
@@ -1064,7 +1148,7 @@ func TestSQSSenderMustBeBoundToTheProvider(t *testing.T) {
 	onlyB := sqsadapter.NewConsumer(api, sqsadapter.ConsumerConfig{
 		Name: "it-consumer", QueueURL: q.Input, DLQURL: q.DLQ, MaxMessages: 10, WaitTime: time.Second,
 		VisibilityTimeout: 2 * time.Second, ProcessTimeout: time.Second, RetryBase: time.Second, RetryMax: time.Second,
-		Senders: sqsadapter.SenderPolicy{"000000000000": {"provider-b"}},
+		MaxReceiveCount: 5, Senders: sqsadapter.SenderPolicy{"000000000000": {"provider-b"}},
 	}, s.wagers, observability.NewLogger(io.Discard, "error", "c"), testutil.NewMetrics())
 	onlyB.PollOnce(context.Background())
 

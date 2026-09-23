@@ -1,6 +1,7 @@
 package httpapi_test
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -164,6 +165,32 @@ func TestSubmitStatuses(t *testing.T) {
 		assert.Equal(t, tc.replay, resp["idempotentReplay"])
 		assert.Equal(t, "provider-a:transaction-123", got.IdempotencyKey)
 	}
+}
+
+func TestAccessLogCarriesCallerWalletAndTransaction(t *testing.T) {
+	t.Parallel()
+	tx := sampleTx(t, "provider-a", wager.StatusProcessed)
+	var got app.SubmitCommand
+	f := &fixture{wagers: fakeWagers{submit: func(c app.SubmitCommand) (app.SubmitResult, error) {
+		got = c
+		return app.SubmitResult{Transaction: tx}, nil
+	}}}
+	rec, _ := f.do(t, call{method: http.MethodPost, path: "/wagering/transactions", token: "provider-a", body: submitBody,
+		headers: map[string]string{"Idempotency-Key": "provider-a:transaction-123"}})
+	require.Equal(t, http.StatusCreated, rec.Code)
+	var access map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(f.logs.String()), "\n") {
+		var record map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &record))
+		if record["msg"] == "http request" {
+			access = record
+		}
+	}
+	require.NotNil(t, access, "access log written")
+	assert.Equal(t, "provider-a", access["providerId"])
+	assert.Equal(t, got.WalletID.String(), access["walletId"])
+	assert.Equal(t, tx.ID().String(), access["transactionId"])
+	assert.NotEmpty(t, access["correlationId"])
 }
 
 func TestSubmitErrors(t *testing.T) {

@@ -23,8 +23,8 @@ func logScenarioFailure(t *testing.T) {
 		if !t.Failed() {
 			return
 		}
-		for _, inst := range fixture.instances {
-			t.Logf("instance %s pid=%d logs:\n%s", inst.name, inst.cmd.Process.Pid, inst.logs.String())
+		for _, run := range fixture.runs {
+			t.Logf("instance %s pid=%d logs:\n%s", run.name, run.cmd.Process.Pid, run.logs.String())
 		}
 	})
 }

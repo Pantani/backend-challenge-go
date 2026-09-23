@@ -1,2 +1,0 @@
-example.com/wallet/cmd/wallet
-example.com/wallet/internal/service

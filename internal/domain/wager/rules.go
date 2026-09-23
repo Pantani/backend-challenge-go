@@ -56,6 +56,9 @@ func Decide(in DecisionInput) Decision {
 	return decideMovement(in.Wallet, in.Transaction, in.Reference)
 }
 
+// checkOwnership rejects a player/wallet mismatch. Callers load the wallet by
+// the transaction's wallet id, so the wallet-id comparison is only a cheap
+// invariant guard; the player comparison is the actual business rule.
 func checkOwnership(w *wallet.Wallet, t *Transaction) FailureCode {
 	if w.PlayerID() != t.PlayerID() || w.ID() != t.WalletID() {
 		return CodePlayerWalletMismatch

@@ -71,13 +71,19 @@ func (g *Group) Running() int {
 	return g.running
 }
 
-// Stop cancels the workers and waits for them within ctx. It is safe to
-// call more than once.
-func (g *Group) Stop(ctx context.Context) error {
+// Cancel asks the workers to return without waiting for them; later Go
+// calls are dropped. It is safe to call more than once.
+func (g *Group) Cancel() {
 	g.mu.Lock()
 	g.stopped = true
 	g.mu.Unlock()
 	g.cancel()
+}
+
+// Stop cancels the workers and waits for them within ctx. It is safe to
+// call more than once.
+func (g *Group) Stop(ctx context.Context) error {
+	g.Cancel()
 	done := make(chan struct{})
 	go func() {
 		g.wg.Wait()

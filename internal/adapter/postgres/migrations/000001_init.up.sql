@@ -66,7 +66,9 @@ CREATE TABLE wager_transactions (
     ),
     CONSTRAINT wager_transactions_pending_schedule CHECK (
         status <> 'PENDING_REFERENCE' OR next_attempt_at IS NOT NULL
-    )
+    ),
+    -- Target of the ledger foreign key (see ledger_entries_transaction_fkey).
+    CONSTRAINT wager_transactions_ledger_target UNIQUE (id, wallet_id, currency, amount_minor)
 );
 
 -- A wallet has at most one opening credit.
@@ -119,14 +121,18 @@ CREATE TABLE ledger_entries (
     seq                  BIGINT GENERATED ALWAYS AS IDENTITY UNIQUE,
     id                   UUID PRIMARY KEY,
     wallet_id            UUID        NOT NULL REFERENCES wallets (id),
-    transaction_id       UUID        NOT NULL REFERENCES wager_transactions (id),
+    transaction_id       UUID        NOT NULL,
     direction            TEXT        NOT NULL CHECK (direction IN ('DEBIT', 'CREDIT')),
     amount_minor         BIGINT      NOT NULL CHECK (amount_minor > 0),
     currency             CHAR(3)     NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
     balance_before_minor BIGINT      NOT NULL CHECK (balance_before_minor >= 0),
     balance_after_minor  BIGINT      NOT NULL CHECK (balance_after_minor >= 0),
     created_at           TIMESTAMPTZ NOT NULL,
-    CONSTRAINT ledger_entries_wallet_transaction_key UNIQUE (wallet_id, transaction_id),
+    -- A transaction moves money at most once, and only in its own wallet,
+    -- currency and amount.
+    CONSTRAINT ledger_entries_transaction_key UNIQUE (transaction_id),
+    CONSTRAINT ledger_entries_transaction_fkey FOREIGN KEY (transaction_id, wallet_id, currency, amount_minor)
+        REFERENCES wager_transactions (id, wallet_id, currency, amount_minor),
     CONSTRAINT ledger_entries_balance_math CHECK (
         (direction = 'CREDIT' AND balance_after_minor = balance_before_minor + amount_minor)
         OR (direction = 'DEBIT' AND balance_after_minor = balance_before_minor - amount_minor)
@@ -315,3 +321,21 @@ $$;
 CREATE TRIGGER outbox_events_guard
     BEFORE UPDATE OR DELETE ON outbox_events
     FOR EACH ROW EXECUTE FUNCTION outbox_events_guard();
+
+-- Runtime role. The migrator owns the schema; the service connects as a LOGIN
+-- user that is a member of this NOLOGIN group and is created per environment
+-- (deploy/postgres/init, test/testenv), so no password lives here. Without
+-- ownership or superuser it cannot disable triggers or change
+-- session_replication_role, and it has no UPDATE, DELETE or TRUNCATE on the
+-- ledger. Roles are cluster-wide: an existing role is reused.
+DO $$
+BEGIN
+    CREATE ROLE wallet_app NOLOGIN;
+EXCEPTION WHEN duplicate_object OR unique_violation THEN
+    NULL;
+END;
+$$;
+
+GRANT USAGE ON SCHEMA public TO wallet_app;
+GRANT SELECT, INSERT ON ledger_entries TO wallet_app;
+GRANT SELECT, INSERT, UPDATE ON wallets, wager_transactions, inbox_messages, outbox_events TO wallet_app;

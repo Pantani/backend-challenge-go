@@ -6,7 +6,9 @@ x-app: &app
   restart: unless-stopped
   env_file: .env.example
   environment: &app-env
-    DATABASE_URL: postgres://wallet:wallet@postgres:5432/wallet?sslmode=disable
+    # Least-privilege runtime login (deploy/postgres/init); only the migrate
+    # service connects as the schema owner.
+    DATABASE_URL: postgres://wallet_service:wallet_service@postgres:5432/wallet?sslmode=disable
     AWS_ENDPOINT_URL: http://localstack:4566
     OIDC_ISSUER: http://localhost:8180/realms/wallet
     OIDC_JWKS_URL: http://keycloak:8080/realms/wallet/protocol/openid-connect/certs
@@ -26,6 +28,9 @@ services:
       POSTGRES_USER: wallet
       POSTGRES_PASSWORD: wallet
       POSTGRES_DB: wallet
+    volumes:
+      # Creates the runtime login on first start (empty data directory only).
+      - ./deploy/postgres/init:/docker-entrypoint-initdb.d:ro
     ports: ["5432:5432"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U wallet -d wallet"]
@@ -66,6 +71,10 @@ services:
     <<: *app
     restart: "no"
     command: ["migrate", "up"]
+    environment:
+      <<: *app-env
+      # The schema owner applies the migrations.
+      DATABASE_URL: postgres://wallet:wallet@postgres:5432/wallet?sslmode=disable
     depends_on:
       postgres:
         condition: service_healthy
