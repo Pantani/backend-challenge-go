@@ -90,7 +90,8 @@ func ResolveQueues(ctx context.Context, api API, names QueueNames) (Queues, erro
 type ProvisionConfig struct {
 	// Names are the queues to create.
 	Names QueueNames
-	// MaxReceiveCount is the redrive threshold of the input queue.
+	// MaxReceiveCount is the redrive threshold of the input queue; it must
+	// sit above the consumer's limit (RedriveMaxReceiveCount).
 	MaxReceiveCount int
 	// VisibilityTimeout, in seconds, is the input queue attribute; the
 	// consumer's ConsumerConfig.VisibilityTimeout must agree with it.

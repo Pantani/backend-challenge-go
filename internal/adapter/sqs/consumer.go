@@ -42,7 +42,28 @@ const (
 	deadLetterGroup = "dead-letters"
 	// failureReasonLimit caps the failureReason attribute copied to the DLQ.
 	failureReasonLimit = 256
+	// redriveHeadroom is how far the queue redrive threshold sits above the
+	// consumer's own limit. See RedriveMaxReceiveCount.
+	redriveHeadroom = 20
 )
+
+// RedriveMaxReceiveCount is the maxReceiveCount to provision on the input
+// queue for a consumer that dead-letters at maxReceiveCount receives.
+//
+// In a FIFO queue a receive returns the group's head together with the
+// messages behind it, and every receive increments ApproximateReceiveCount
+// of all of them. While a head is being retried, the messages behind it are
+// received (and released) with it, so their counts climb without them ever
+// being attempted. The consumer therefore dead-letters a failing message
+// itself, with its failureReason, at maxReceiveCount receives, and the
+// broker threshold sits above that: a message behind a failing head
+// accumulates at most maxReceiveCount receives from that head, plus one per
+// message ahead of it within the batch (at most 9) that fails its single
+// remaining attempt, plus a few releases on shutdown. The redrive stays as
+// a safety net (for example when the DLQ copy itself keeps failing).
+func RedriveMaxReceiveCount(maxReceiveCount int) int {
+	return maxReceiveCount + redriveHeadroom
+}
 
 // Processor handles a decoded message (app.WagerService).
 type Processor interface {
@@ -91,6 +112,10 @@ type ConsumerConfig struct {
 	// must not exceed the SQS maximum of 12h.
 	RetryBase time.Duration
 	RetryMax  time.Duration
+	// MaxReceiveCount is the receive count at which a transient failure is
+	// dead-lettered by the consumer instead of retried. The queue redrive
+	// must be provisioned above it (RedriveMaxReceiveCount).
+	MaxReceiveCount int
 	// Senders binds broker identities to the providers they may act for.
 	Senders SenderPolicy
 }
@@ -105,9 +130,9 @@ func (c ConsumerConfig) ackTimeout() time.Duration {
 
 // Consumer polls the FIFO input queue. A message is deleted only after its
 // handling committed; transient failures are retried with exponential
-// backoff through the visibility timeout, and after maxReceiveCount the
-// queue redrive policy moves the message to the DLQ. Invalid messages and
-// permanent errors go to the DLQ immediately. When a message is left in the
+// backoff through the visibility timeout until MaxReceiveCount, when the
+// consumer copies the message to the DLQ with its failure reason. Invalid
+// messages and permanent errors go to the DLQ immediately. When a message is left in the
 // queue (retry, or a failed DLQ copy), the rest of its MessageGroupId in the
 // batch is released unprocessed so the group is redelivered in order.
 type Consumer struct {
@@ -215,6 +240,9 @@ func (c *Consumer) handle(parent context.Context, m types.Message) bool {
 		c.ack(ctx, m, res)
 		return true
 	case app.IsTransient(err):
+		if n := receiveCount(m); n >= c.cfg.MaxReceiveCount {
+			return c.deadLetter(ctx, m, fmt.Errorf("gave up after %d receives: %w", n, err))
+		}
 		c.retry(ctx, m, err)
 		return false
 	default:
@@ -274,7 +302,7 @@ func (c *Consumer) delete(ctx context.Context, m types.Message) bool {
 }
 
 // retry hides the message for an exponential backoff based on its receive
-// count; SQS redrives it to the DLQ after maxReceiveCount receives.
+// count.
 func (c *Consumer) retry(parent context.Context, m types.Message, cause error) {
 	ctx, cancel := worker.Detach(parent, c.cfg.ackTimeout())
 	defer cancel()

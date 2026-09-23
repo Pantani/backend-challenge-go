@@ -2,26 +2,22 @@ package bootstrap
 
 import (
 	"context"
-	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/fx"
 	"go.uber.org/fx/fxtest"
 
-	postgresadapter "github.com/Pantani/backend-challenge-go/internal/adapter/postgres"
 	sqsadapter "github.com/Pantani/backend-challenge-go/internal/adapter/sqs"
 	"github.com/Pantani/backend-challenge-go/internal/app"
 	"github.com/Pantani/backend-challenge-go/internal/config"
@@ -77,34 +73,111 @@ func testConfig(t *testing.T) config.Config {
 	return cfg
 }
 
-func TestStartWorkersRunsAndStopsTheGroup(t *testing.T) {
-	t.Parallel()
+func newWorkerDeps(t *testing.T, lc fx.Lifecycle) workerDeps {
+	t.Helper()
 	cfg := testConfig(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	metrics := testutil.NewMetrics()
-	group := newGroup(logger, &startupRollback{})
-	relay := newRelay(emptyStore{}, noPublisher{}, app.SystemClock{}, cfg, logger, metrics)
-	consumer := sqsadapter.NewConsumer(blockingAPI{}, sqsadapter.ConsumerConfig{QueueURL: "q", WaitTime: time.Second}, nil, logger, metrics)
+	return workerDeps{
+		Lifecycle: lc, Group: newGroup(logger), Consumers: newConsumerGroup(logger), Config: cfg,
+		Relay:    newRelay(emptyStore{}, noPublisher{}, app.SystemClock{}, cfg, logger, metrics),
+		Pending:  worker.NewPendingResolver(nothingPending{}, logger),
+		Consumer: sqsadapter.NewConsumer(blockingAPI{}, sqsadapter.ConsumerConfig{QueueURL: "q", WaitTime: time.Second}, nil, logger, metrics),
+	}
+}
+
+func TestStartWorkersRunsAndStopsTheGroup(t *testing.T) {
+	t.Parallel()
 	lc := fxtest.NewLifecycle(t)
-	startWorkers(workerDeps{Lifecycle: lc, Group: group, Relay: relay, Pending: worker.NewPendingResolver(nothingPending{}, logger),
-		Consumer: consumer, Config: cfg})
+	d := newWorkerDeps(t, lc)
+	startWorkers(d)
 	lc.RequireStart()
-	assert.Equal(t, 2+cfg.SQSConsumers, group.Running(), "relay, pending resolver and one goroutine per consumer")
+	assert.Equal(t, 2, d.Group.Running(), "relay and pending resolver")
+	assert.Equal(t, d.Config.SQSConsumers, d.Consumers.Running(), "one goroutine per consumer")
 	lc.RequireStop()
-	assert.Zero(t, group.Running())
+	assert.Zero(t, d.Group.Running())
+	assert.Zero(t, d.Consumers.Running())
+}
+
+// TestShutdownStopsConsumersBeforeHTTPDrains registers the hooks as the
+// application does and checks that, while an HTTP request is still being
+// drained, the consumers have already stopped fetching.
+func TestShutdownStopsConsumersBeforeHTTPDrains(t *testing.T) {
+	t.Parallel()
+	lc := fxtest.NewLifecycle(t)
+	d := newWorkerDeps(t, lc)
+	entered, release := make(chan struct{}), make(chan struct{})
+	srv := newServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(entered)
+		<-release
+		w.WriteHeader(http.StatusNoContent)
+	}), d.Config)
+	addr := &Addr{}
+	startWorkers(d)
+	startServer(lc, srv, addr, slog.New(slog.NewTextHandler(io.Discard, nil)), noShutdowner{})
+	stopConsumersFirst(lc, d.Consumers)
+	lc.RequireStart()
+
+	status := make(chan int, 1)
+	go func() {
+		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://"+addr.String()+"/", nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			status <- 0
+			return
+		}
+		_ = resp.Body.Close()
+		status <- resp.StatusCode
+	}()
+	<-entered
+	stopped := make(chan error, 1)
+	go func() { stopped <- lc.Stop(context.Background()) }()
+
+	require.Eventually(t, func() bool { return d.Consumers.Running() == 0 }, 5*time.Second, 5*time.Millisecond,
+		"the consumers stop while the request is in flight")
+	assert.Equal(t, 2, d.Group.Running(), "the other workers wait for the HTTP drain")
+	select {
+	case <-stopped:
+		require.Fail(t, "stop returned before the HTTP request was drained")
+	default:
+	}
+	close(release)
+	assert.Equal(t, http.StatusNoContent, <-status, "the in-flight request completes")
+	require.NoError(t, <-stopped)
+	assert.Zero(t, d.Group.Running())
+}
+
+type noShutdowner struct{}
+
+func (noShutdowner) Shutdown(...fx.ShutdownOption) error { return nil }
+
+type shutdownSpy struct{ calls chan struct{} }
+
+func (s shutdownSpy) Shutdown(...fx.ShutdownOption) error {
+	close(s.calls)
+	return nil
+}
+
+func TestServeFailureShutsTheApplicationDown(t *testing.T) {
+	t.Parallel()
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	require.NoError(t, ln.Close()) // Serve fails immediately on a closed listener
+	spy := shutdownSpy{calls: make(chan struct{})}
+	serve(&http.Server{ReadHeaderTimeout: time.Second}, ln, slog.New(slog.NewTextHandler(io.Discard, nil)), spy)
+	assertClosed(t, spy.calls)
 }
 
 func TestStartServerBindsAndClosesTheListener(t *testing.T) {
 	t.Parallel()
 	cfg := testConfig(t)
-	rollback := &startupRollback{}
-	srv := newServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }), cfg, rollback)
+	srv := newServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }), cfg)
 	assert.Equal(t, 5*time.Second, srv.ReadHeaderTimeout)
 	assert.Equal(t, 15*time.Second, srv.ReadTimeout)
 	assert.Equal(t, 30*time.Second, srv.WriteTimeout)
 	addr := &Addr{}
 	lc := fxtest.NewLifecycle(t)
-	startServer(lc, srv, addr, slog.New(slog.NewTextHandler(io.Discard, nil)), rollback)
+	startServer(lc, srv, addr, slog.New(slog.NewTextHandler(io.Discard, nil)), noShutdowner{})
 	assert.Empty(t, addr.String(), "not bound before start")
 	lc.RequireStart()
 	require.NotEmpty(t, addr.String())
@@ -118,10 +191,9 @@ func TestStartServerBindsAndClosesTheListener(t *testing.T) {
 	_, err = (&net.Dialer{Timeout: time.Second}).Dial("tcp", addr.String())
 	require.Error(t, err, "the listener is closed on stop")
 
-	badRollback := &startupRollback{}
-	bad := newServer(srv.Handler, config.Config{HTTPAddr: "256.0.0.1:1"}, badRollback)
+	bad := newServer(srv.Handler, config.Config{HTTPAddr: "256.0.0.1:1"})
 	lc = fxtest.NewLifecycle(t)
-	startServer(lc, bad, &Addr{}, slog.New(slog.NewTextHandler(io.Discard, nil)), badRollback)
+	startServer(lc, bad, &Addr{}, slog.New(slog.NewTextHandler(io.Discard, nil)), noShutdowner{})
 	require.Error(t, lc.Start(context.Background()))
 }
 
@@ -197,387 +269,4 @@ func serveStalledPostgres(t *testing.T, listener net.Listener, accepted chan<- s
 		close(accepted)
 		_, _ = io.Copy(io.Discard, conn)
 	}()
-}
-
-type poolSpy struct {
-	pingErr  error
-	closeErr error
-	ping     func(context.Context) error
-	pings    atomic.Int32
-	closes   atomic.Int32
-}
-
-func (s *poolSpy) open(context.Context, postgresadapter.Config) (poolHandle, error) {
-	return poolHandle{
-		pool: &pgxpool.Pool{},
-		ping: func(ctx context.Context) error {
-			s.pings.Add(1)
-			if s.ping != nil {
-				return s.ping(ctx)
-			}
-			return s.pingErr
-		},
-		close: func() error {
-			s.closes.Add(1)
-			return s.closeErr
-		},
-	}, nil
-}
-
-type failedPoolConsumer struct{}
-
-type lifecycleAppStub struct {
-	start func(context.Context) error
-	stop  func(context.Context) error
-	stops atomic.Int32
-}
-
-func (*lifecycleAppStub) Err() error { return nil }
-
-func (a *lifecycleAppStub) Start(ctx context.Context) error { return a.start(ctx) }
-
-func (a *lifecycleAppStub) Stop(ctx context.Context) error {
-	a.stops.Add(1)
-	if a.stop != nil {
-		return a.stop(ctx)
-	}
-	return nil
-}
-
-func (*lifecycleAppStub) Wait() <-chan fx.ShutdownSignal { return make(chan fx.ShutdownSignal) }
-
-func TestPoolOwnershipClosesExactlyOnce(t *testing.T) {
-	t.Run("downstream construction failure", func(t *testing.T) {
-		spy := &poolSpy{}
-		boom := errors.New("downstream construction failed")
-		ctx, cancel := context.WithCancel(context.Background())
-		app := New(ctx, testConfig(t),
-			fx.Replace(poolFactory(spy.open)),
-			fx.Replace(fx.Annotate(fakeQueueAPI{}, fx.As(new(sqsadapter.API)))),
-			fx.Provide(func(*pgxpool.Pool) (failedPoolConsumer, error) { return failedPoolConsumer{}, boom }),
-			fx.Invoke(func(failedPoolConsumer) {}),
-		)
-
-		assert.ErrorIs(t, app.Err(), boom)
-		cancel()
-		assert.EqualValues(t, 1, spy.closes.Load())
-	})
-
-	t.Run("ping failure", func(t *testing.T) {
-		spy := &poolSpy{pingErr: errors.New("ping failed")}
-		app := newAppWithPoolSpy(context.Background(), t, spy)
-		require.NoError(t, app.Err())
-
-		assert.ErrorIs(t, app.Start(context.Background()), spy.pingErr)
-		require.NoError(t, app.Stop(context.Background()))
-		assert.EqualValues(t, 1, spy.pings.Load())
-		assert.EqualValues(t, 1, spy.closes.Load())
-	})
-
-	t.Run("ping timeout", func(t *testing.T) {
-		spy := &poolSpy{ping: func(ctx context.Context) error {
-			<-ctx.Done()
-			return ctx.Err()
-		}}
-		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
-		defer cancel()
-		app := newAppWithPoolSpy(ctx, t, spy)
-		require.NoError(t, app.Err())
-
-		assert.ErrorIs(t, app.Start(ctx), context.DeadlineExceeded)
-		require.Eventually(t, func() bool { return spy.closes.Load() == 1 }, time.Second, time.Millisecond)
-		require.NoError(t, app.Stop(context.Background()))
-		assert.EqualValues(t, 1, spy.pings.Load())
-		assert.EqualValues(t, 1, spy.closes.Load())
-	})
-
-	t.Run("later hook canceled", func(t *testing.T) {
-		spy := &poolSpy{}
-		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
-		defer cancel()
-		app := newPoolLifecycleApp(ctx, t, spy, fx.Invoke(func(lc fx.Lifecycle) {
-			lc.Append(fx.StartHook(func(ctx context.Context) error {
-				<-ctx.Done()
-				return ctx.Err()
-			}))
-		}))
-
-		assert.ErrorIs(t, app.Start(ctx), context.DeadlineExceeded)
-		require.Eventually(t, func() bool { return spy.closes.Load() == 1 }, time.Second, time.Millisecond)
-		require.NoError(t, app.Stop(context.Background()))
-		assert.EqualValues(t, 1, spy.pings.Load())
-		assert.EqualValues(t, 1, spy.closes.Load())
-	})
-
-	t.Run("successful full start transfers ownership to stop", func(t *testing.T) {
-		spy := &poolSpy{}
-		ctx, cancel := context.WithCancel(context.Background())
-		app := newPoolLifecycleApp(ctx, t, spy)
-		require.NoError(t, app.Start(ctx))
-
-		cancel()
-		assert.Zero(t, spy.closes.Load(), "startup cancellation no longer owns a successfully started pool")
-		require.NoError(t, app.Stop(context.Background()))
-		require.NoError(t, app.Stop(context.Background()))
-		assert.EqualValues(t, 1, spy.pings.Load())
-		assert.EqualValues(t, 1, spy.closes.Load())
-	})
-}
-
-func TestApplicationStopsBeforeWatchdogClose(t *testing.T) {
-	spy := &poolSpy{}
-	owner := &poolOwner{}
-	ctx, cancel := context.WithCancel(context.Background())
-	handle, err := spy.open(ctx, postgresadapter.Config{})
-	require.NoError(t, err)
-	closeStarted, stopCalled := make(chan struct{}), make(chan struct{})
-	emergencyRelease := make(chan struct{})
-	handle.close = func() error {
-		close(closeStarted)
-		select {
-		case <-stopCalled:
-		case <-emergencyRelease:
-		}
-		spy.closes.Add(1)
-		return nil
-	}
-	owner.Claim(ctx, handle)
-	underlying := &lifecycleAppStub{start: func(context.Context) error {
-		cancel()
-		<-closeStarted
-		return nil
-	}, stop: func(context.Context) error {
-		close(stopCalled)
-		return nil
-	}}
-	app := newApplication(underlying, owner, &startupRollback{}, time.Second)
-	result := make(chan error, 1)
-	go func() { result <- app.Start(ctx) }()
-
-	select {
-	case err := <-result:
-		assert.ErrorIs(t, err, context.Canceled)
-	case <-time.After(time.Second):
-		close(emergencyRelease)
-		require.Fail(t, "Start did not stop runtime before waiting for watchdog close")
-	}
-	assert.EqualValues(t, 1, spy.closes.Load())
-	assert.EqualValues(t, 1, underlying.stops.Load())
-}
-
-func TestApplicationStartErrorJoinsCleanupFailures(t *testing.T) {
-	startErr, stopErr, closeErr := errors.New("start failed"), errors.New("stop failed"), errors.New("close failed")
-	spy := &poolSpy{closeErr: closeErr}
-	owner := &poolOwner{}
-	handle, err := spy.open(context.Background(), postgresadapter.Config{})
-	require.NoError(t, err)
-	stopCalled := make(chan struct{})
-	emergencyRelease := make(chan struct{})
-	originalClose := handle.close
-	handle.close = func() error {
-		select {
-		case <-stopCalled:
-		case <-emergencyRelease:
-		}
-		return originalClose()
-	}
-	owner.Claim(context.Background(), handle)
-	underlying := &lifecycleAppStub{
-		start: func(context.Context) error { return startErr },
-		stop: func(context.Context) error {
-			close(stopCalled)
-			return stopErr
-		},
-	}
-	app := newApplication(underlying, owner, &startupRollback{}, time.Second)
-	result := make(chan error, 1)
-	go func() { result <- app.Start(context.Background()) }()
-
-	select {
-	case err := <-result:
-		assert.ErrorIs(t, err, startErr)
-		assert.ErrorIs(t, err, stopErr)
-		assert.ErrorIs(t, err, closeErr)
-	case <-time.After(time.Second):
-		close(emergencyRelease)
-		require.Fail(t, "Start error did not stop runtime before waiting for close")
-	}
-	assert.EqualValues(t, 1, spy.closes.Load())
-	assert.EqualValues(t, 1, underlying.stops.Load())
-}
-
-func TestApplicationDirectRollbackOwnsCanceledStartup(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	spy := &poolSpy{}
-	owner, rollback := newStartupOwners(ctx, time.Second)
-	workerDone := make(chan struct{})
-	addr := &Addr{}
-	poolClosedAfterRuntime := atomic.Bool{}
-	handle, err := spy.open(ctx, postgresadapter.Config{})
-	require.NoError(t, err)
-	originalClose := handle.close
-	handle.close = func() error {
-		poolClosedAfterRuntime.Store(channelClosed(workerDone) && listenerClosed(addr.String()))
-		return originalClose()
-	}
-	owner.Claim(ctx, handle)
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	group := newGroup(logger, rollback)
-	cfg := testConfig(t)
-	server := newServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), cfg, rollback)
-	runtimeHookCalled := atomic.Bool{}
-
-	fxApp := fx.New(fx.Invoke(func(lc fx.Lifecycle) {
-		startServer(lc, server, addr, logger, rollback)
-		lc.Append(fx.StartHook(func() {
-			group.Go("rollback-test", func(ctx context.Context) {
-				<-ctx.Done()
-				close(workerDone)
-			})
-		}))
-		lc.Append(fx.Hook{
-			OnStart: func(context.Context) error { return nil },
-			OnStop: func(context.Context) error {
-				runtimeHookCalled.Store(true)
-				return nil
-			},
-		})
-		lc.Append(fx.StartHook(func(context.Context) error {
-			cancel()
-			return context.Canceled
-		}))
-	}))
-	app := newApplication(fxApp, owner, rollback, time.Second)
-	result := make(chan error, 1)
-	go func() { result <- app.Start(ctx) }()
-
-	select {
-	case err := <-result:
-		assert.ErrorIs(t, err, context.Canceled)
-	case <-time.After(2 * time.Second):
-		require.Fail(t, "failed-start direct rollback hung")
-	}
-	assert.True(t, channelClosed(workerDone), "direct rollback joins the worker group")
-	assert.True(t, listenerClosed(addr.String()), "direct rollback closes HTTP admission")
-	assert.False(t, runtimeHookCalled.Load(), "Fx skips rollback hooks after the startup context is canceled")
-	assert.True(t, poolClosedAfterRuntime.Load(), "runtime admission and workers close before the pool")
-	assert.EqualValues(t, 1, spy.closes.Load())
-}
-
-func TestStartupRollbackClosesResourcesRegisteredDuringCleanup(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	rollback := &startupRollback{}
-	initialGroup := worker.NewGroup(context.Background(), logger)
-	workerStopping := make(chan struct{})
-	releaseWorker := make(chan struct{})
-	release := sync.OnceFunc(func() { close(releaseWorker) })
-	defer release()
-	initialGroup.Go("hold-cleanup", func(ctx context.Context) {
-		<-ctx.Done()
-		close(workerStopping)
-		<-releaseWorker
-	})
-	rollback.SetGroup(initialGroup)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	cleanupDone := make(chan error, 1)
-	go func() { cleanupDone <- rollback.Cleanup(ctx) }()
-	require.Eventually(t, func() bool { return channelClosed(workerStopping) }, time.Second, time.Millisecond)
-
-	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer listener.Close()
-	rollback.SetListener(listener)
-	assert.True(t, listenerClosed(listener.Addr().String()), "late listener must close on registration")
-
-	serverListener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	server := &http.Server{}
-	serveDone := make(chan struct{})
-	go func() {
-		_ = server.Serve(serverListener)
-		close(serveDone)
-	}()
-	rollback.SetServer(server)
-	require.Eventually(t, func() bool { return channelClosed(serveDone) }, time.Second, time.Millisecond,
-		"late server must shut down on registration")
-
-	lateGroup := worker.NewGroup(context.Background(), logger)
-	lateWorkerDone := make(chan struct{})
-	lateGroup.Go("late-worker", func(ctx context.Context) {
-		<-ctx.Done()
-		close(lateWorkerDone)
-	})
-	rollback.SetGroup(lateGroup)
-	require.Eventually(t, func() bool { return channelClosed(lateWorkerDone) }, time.Second, time.Millisecond,
-		"late group must stop on registration")
-
-	release()
-	require.NoError(t, <-cleanupDone)
-}
-
-func TestStartupRollbackLateGroupUsesCleanupDeadline(t *testing.T) {
-	rollback := &startupRollback{}
-	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
-	defer cancel()
-	require.NoError(t, rollback.Cleanup(ctx))
-
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	group := worker.NewGroup(context.Background(), logger)
-	workerStopping := make(chan struct{})
-	releaseWorker := make(chan struct{})
-	defer close(releaseWorker)
-	group.Go("slow-worker", func(ctx context.Context) {
-		<-ctx.Done()
-		close(workerStopping)
-		<-releaseWorker
-	})
-	setterDone := make(chan struct{})
-	go func() {
-		rollback.SetGroup(group)
-		close(setterDone)
-	}()
-	require.Eventually(t, func() bool { return channelClosed(workerStopping) }, time.Second, time.Millisecond,
-		"late group must receive cancellation")
-	require.Eventually(t, func() bool { return channelClosed(setterDone) }, time.Second, time.Millisecond,
-		"late group registration must obey the cleanup deadline")
-}
-
-func channelClosed(ch <-chan struct{}) bool {
-	select {
-	case <-ch:
-		return true
-	default:
-		return false
-	}
-}
-
-func listenerClosed(addr string) bool {
-	conn, err := (&net.Dialer{Timeout: 50 * time.Millisecond}).Dial("tcp", addr)
-	if err != nil {
-		return true
-	}
-	_ = conn.Close()
-	return false
-}
-
-func newAppWithPoolSpy(ctx context.Context, t *testing.T, spy *poolSpy) *Application {
-	t.Helper()
-	return New(ctx, testConfig(t),
-		fx.Replace(poolFactory(spy.open)),
-		fx.Replace(fx.Annotate(fakeQueueAPI{}, fx.As(new(sqsadapter.API)))),
-	)
-}
-
-func newPoolLifecycleApp(ctx context.Context, t *testing.T, spy *poolSpy, extra ...fx.Option) *Application {
-	t.Helper()
-	owner := &poolOwner{}
-	options := []fx.Option{
-		fx.Supply(startupContext{Context: ctx}, testConfig(t), owner, poolFactory(spy.open)),
-		fx.Provide(newPool),
-		fx.Invoke(func(*pgxpool.Pool) {}),
-	}
-	options = append(options, extra...)
-	return newApplication(fx.New(options...), owner, &startupRollback{}, testConfig(t).ShutdownTimeout)
 }

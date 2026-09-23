@@ -70,6 +70,4 @@ func TestDirection(t *testing.T) {
 	assert.True(t, wallet.Debit.Valid())
 	assert.True(t, wallet.Credit.Valid())
 	assert.False(t, wallet.Direction("X").Valid())
-	assert.Equal(t, wallet.Credit, wallet.Debit.Opposite())
-	assert.Equal(t, wallet.Debit, wallet.Credit.Opposite())
 }

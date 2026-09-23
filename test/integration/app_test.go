@@ -27,7 +27,7 @@ import (
 type runningApp struct {
 	http   testenv.Client
 	group  *worker.Group
-	app    *bootstrap.Application
+	app    *fx.App
 	api    sqsadapter.API
 	queues sqsadapter.Queues
 }
@@ -36,7 +36,7 @@ func queueVars(names sqsadapter.QueueNames) map[string]string {
 	return map[string]string{"SQS_INPUT_QUEUE": names.Input, "SQS_DLQ": names.DLQ, "SQS_EVENTS_QUEUE": names.Events}
 }
 
-func newApp(t *testing.T, overrides map[string]string) (*bootstrap.Application, *bootstrap.Addr, *worker.Group, context.Context, context.CancelFunc) {
+func newApp(t *testing.T, overrides map[string]string) (*fx.App, *bootstrap.Addr, *worker.Group, context.Context, context.CancelFunc) {
 	t.Helper()
 	cfg, err := env.Config(overrides)
 	require.NoError(t, err)
@@ -265,9 +265,9 @@ func (r *hookRecorder) index(caller string) int {
 }
 
 // TestFxStopsServerThenWorkersThenPool is the regression test for the stop
-// order: the HTTP server closes first, the worker group (consumers, relay,
-// resolver) stops next and the database pool closes last, so no worker
-// runs against a closed pool.
+// order: the consumers stop fetching first, the HTTP server drains next, the
+// worker group (in-flight consumers, relay, resolver) stops after it and the
+// database pool closes last, so no worker runs against a closed pool.
 func TestFxStopsServerThenWorkersThenPool(t *testing.T) {
 	t.Parallel()
 	_, _, names := provisionQueues(t, 3)
@@ -284,10 +284,13 @@ func TestFxStopsServerThenWorkersThenPool(t *testing.T) {
 	defer cancel()
 	require.NoError(t, a.Stop(ctx))
 
+	consumers := rec.index("bootstrap.stopConsumersFirst")
 	server, workers, pool := rec.index("bootstrap.startServer"), rec.index("bootstrap.startWorkers"), rec.index("bootstrap.newPool")
+	require.GreaterOrEqual(t, consumers, 0, rec.stops)
 	require.GreaterOrEqual(t, server, 0, rec.stops)
 	require.GreaterOrEqual(t, workers, 0, rec.stops)
 	require.GreaterOrEqual(t, pool, 0, rec.stops)
+	assert.Less(t, consumers, server, "no new queue input while HTTP drains: %v", rec.stops)
 	assert.Less(t, server, workers, "no new inputs before the workers stop: %v", rec.stops)
 	assert.Less(t, workers, pool, "workers stop before the pool closes: %v", rec.stops)
 }

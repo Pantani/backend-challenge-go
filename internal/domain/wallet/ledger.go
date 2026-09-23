@@ -21,15 +21,6 @@ const (
 // Valid reports whether d is a known direction.
 func (d Direction) Valid() bool { return d == Debit || d == Credit }
 
-// Opposite returns the reverse direction. An invalid direction maps to Debit;
-// callers must check Valid first.
-func (d Direction) Opposite() Direction {
-	if d == Debit {
-		return Credit
-	}
-	return Debit
-}
-
 // signed returns +amount for credits and -amount for debits.
 func (d Direction) signed(amount money.Money) money.Money {
 	if d == Debit {

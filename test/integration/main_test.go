@@ -32,8 +32,12 @@ import (
 )
 
 var (
-	env  *testenv.Env
+	env *testenv.Env
+	// pool connects as the least-privilege runtime login the service uses.
 	pool *pgxpool.Pool
+	// ownerPool connects as the schema owner: administration and assertions
+	// on the owner-level guards (triggers).
+	ownerPool *pgxpool.Pool
 )
 
 func TestMain(m *testing.M) {
@@ -59,22 +63,32 @@ func TestMain(m *testing.M) {
 func runWithDatabase(ctx context.Context, m *testing.M) int {
 	err := migrateDatabase()
 	if err == nil {
-		var databaseURL string
-		databaseURL, err = boundedDatabaseURL(env.DatabaseURL)
-		if err == nil {
-			pool, err = postgres.NewPool(ctx, postgres.Config{URL: databaseURL, MaxConns: 60, LockTimeout: 5 * time.Second, StatementTimeout: 10 * time.Second})
-		}
+		pool, err = newTestPool(ctx, env.DatabaseURL, 60)
+	}
+	if err == nil {
+		defer pool.Close()
+		ownerPool, err = newTestPool(ctx, env.OwnerDatabaseURL, 10)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "database:", err)
 		return 1
 	}
-	defer pool.Close()
+	defer ownerPool.Close()
 	return m.Run()
 }
 
+func newTestPool(ctx context.Context, rawURL string, maxConns int32) (*pgxpool.Pool, error) {
+	databaseURL, err := boundedDatabaseURL(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	return postgres.NewPool(ctx, postgres.Config{URL: databaseURL, MaxConns: maxConns, LockTimeout: 5 * time.Second, StatementTimeout: 10 * time.Second})
+}
+
+// migrateDatabase applies the migrations as the schema owner, like the
+// compose "migrate" service.
 func migrateDatabase() (err error) {
-	databaseURL, err := boundedDatabaseURL(env.DatabaseURL)
+	databaseURL, err := boundedDatabaseURL(env.OwnerDatabaseURL)
 	if err != nil {
 		return err
 	}
@@ -101,24 +115,25 @@ func boundedDatabaseURL(databaseURL string) (string, error) {
 	return u.String(), nil
 }
 
+// databaseForTest creates an empty database and returns its owner URL.
 func databaseForTest(t *testing.T, prefix string) string {
 	t.Helper()
 	name := prefix + "_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	identifier := pgx.Identifier{name}.Sanitize()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_, err := pool.Exec(ctx, "CREATE DATABASE "+identifier)
+	_, err := ownerPool.Exec(ctx, "CREATE DATABASE "+identifier)
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cleanupCancel()
-		_, err := pool.Exec(cleanupCtx, "DROP DATABASE "+identifier)
+		_, err := ownerPool.Exec(cleanupCtx, "DROP DATABASE "+identifier)
 		require.NoError(t, err)
 		var count int
-		require.NoError(t, pool.QueryRow(cleanupCtx, `SELECT count(*) FROM pg_database WHERE datname = $1`, name).Scan(&count))
+		require.NoError(t, ownerPool.QueryRow(cleanupCtx, `SELECT count(*) FROM pg_database WHERE datname = $1`, name).Scan(&count))
 		require.Zero(t, count, "temporary database removed")
 	})
-	u, err := url.Parse(env.DatabaseURL)
+	u, err := url.Parse(env.OwnerDatabaseURL)
 	require.NoError(t, err)
 	u.Path = "/" + name
 	boundedURL, err := boundedDatabaseURL(u.String())

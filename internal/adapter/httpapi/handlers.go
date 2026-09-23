@@ -10,7 +10,6 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/Pantani/backend-challenge-go/internal/app"
-	"github.com/Pantani/backend-challenge-go/internal/observability"
 )
 
 // maxIdempotencyKeyLen bounds the Idempotency-Key header.
@@ -55,8 +54,9 @@ func (h *handler) getWallet(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, err)
 		return
 	}
-	wal, err := h.Wallets.Get(r.Context(), id)
-	reply(h, w, r, http.StatusOK, wal, err, newWalletResponse)
+	ctx := annotate(r.Context(), slog.String("walletId", id.String()))
+	wal, err := h.Wallets.Get(ctx, id)
+	reply(h, w, r.WithContext(ctx), http.StatusOK, wal, err, newWalletResponse)
 }
 
 // getLedger handles GET /wallets/{walletId}/ledger.
@@ -66,8 +66,9 @@ func (h *handler) getLedger(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, err)
 		return
 	}
-	page, err := h.Wallets.Ledger(r.Context(), id, r.URL.Query().Get("cursor"), limit)
-	reply(h, w, r, http.StatusOK, page, err, func(p app.LedgerPage) ledgerResponse { return newLedgerResponse(id, p) })
+	ctx := annotate(r.Context(), slog.String("walletId", id.String()))
+	page, err := h.Wallets.Ledger(ctx, id, r.URL.Query().Get("cursor"), limit)
+	reply(h, w, r.WithContext(ctx), http.StatusOK, page, err, func(p app.LedgerPage) ledgerResponse { return newLedgerResponse(id, p) })
 }
 
 // ledgerParams reads the wallet id and page size of a ledger request.
@@ -101,8 +102,9 @@ func (h *handler) reconcile(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, err)
 		return
 	}
-	rec, err := h.Wallets.Reconcile(r.Context(), id)
-	reply(h, w, r, http.StatusOK, rec, err, newReconciliationResponse)
+	ctx := annotate(r.Context(), slog.String("walletId", id.String()))
+	rec, err := h.Wallets.Reconcile(ctx, id)
+	reply(h, w, r.WithContext(ctx), http.StatusOK, rec, err, newReconciliationResponse)
 }
 
 // submit handles POST /wagering/transactions. The providerId of the body
@@ -113,13 +115,14 @@ func (h *handler) submit(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, err)
 		return
 	}
-	ctx := observability.WithAttrs(r.Context(), slog.String("walletId", cmd.WalletID.String()))
+	ctx := annotate(r.Context(), slog.String("walletId", cmd.WalletID.String()))
 	res, err := h.Wagers.Submit(ctx, cmd)
 	if err != nil {
 		h.fail(w, r.WithContext(ctx), err)
 		return
 	}
-	h.Logger.InfoContext(ctx, "wager transaction submitted", "transactionId", res.Transaction.ID(),
+	ctx = annotate(ctx, slog.String("transactionId", res.Transaction.ID().String()))
+	h.Logger.InfoContext(ctx, "wager transaction submitted",
 		"status", res.Transaction.Status(), "idempotentReplay", res.Replay)
 	writeJSON(w, submitStatus(res), newSubmitResponse(res))
 }
@@ -179,8 +182,9 @@ func (h *handler) getTransaction(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, err)
 		return
 	}
-	t, err := h.Wagers.Get(r.Context(), callerFrom(r), id)
-	reply(h, w, r, http.StatusOK, t, err, newTransactionResponse)
+	ctx := annotate(r.Context(), slog.String("transactionId", id.String()))
+	t, err := h.Wagers.Get(ctx, callerFrom(r), id)
+	reply(h, w, r.WithContext(ctx), http.StatusOK, t, err, newTransactionResponse)
 }
 
 // getTransactionByExternal handles

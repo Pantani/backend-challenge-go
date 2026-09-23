@@ -42,23 +42,21 @@ type Wallet struct {
 type Client struct {
 	Base  string
 	Token func(ctx context.Context, client string) (string, error)
-	HTTP  http.Client
 }
+
+// requestTimeout bounds one call, token fetch included.
+const requestTimeout = 10 * time.Second
 
 // Do sends a request and returns transport errors instead of failing, so it
 // is safe from worker goroutines.
 func (c Client) Do(ctx context.Context, method, path, client, body string, headers map[string]string) (Response, error) {
-	httpClient := c.HTTP
-	if httpClient.Timeout <= 0 {
-		httpClient.Timeout = 10 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(ctx, httpClient.Timeout)
+	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 	req, err := c.request(ctx, method, path, client, body, headers)
 	if err != nil {
 		return Response{}, err
 	}
-	resp, err := httpClient.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return Response{}, err
 	}

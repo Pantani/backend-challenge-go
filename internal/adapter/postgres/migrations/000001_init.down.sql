@@ -11,3 +11,23 @@ DROP FUNCTION IF EXISTS wager_transactions_guard();
 DROP TABLE IF EXISTS wallets;
 DROP FUNCTION IF EXISTS wallets_match_ledger();
 DROP FUNCTION IF EXISTS wallets_guard();
+
+-- The table grants went with the tables. The role is cluster-wide: it is
+-- dropped only when no login user is a member and no other database still
+-- grants it anything; otherwise it is kept.
+DO $$
+BEGIN
+    IF to_regrole('wallet_app') IS NULL THEN
+        RETURN;
+    END IF;
+    REVOKE USAGE ON SCHEMA public FROM wallet_app;
+    IF EXISTS (SELECT FROM pg_auth_members WHERE roleid = 'wallet_app'::regrole) THEN
+        RETURN;
+    END IF;
+    BEGIN
+        DROP ROLE wallet_app;
+    EXCEPTION WHEN dependent_objects_still_exist THEN
+        RAISE NOTICE 'role wallet_app is still used by another database; kept';
+    END;
+END;
+$$;

@@ -35,7 +35,8 @@ type SubmitInput struct {
 	// Currency is the ISO 4217 code.
 	Currency string
 	// ReferenceExternalTransactionID is the reversed operation (REFUND,
-	// ROLLBACK) or the settled bet (WIN, LOSS); it may be empty for WIN/LOSS.
+	// ROLLBACK, required) or the settled bet (WIN, optional). LOSS must not
+	// carry one.
 	ReferenceExternalTransactionID string
 	// CorrelationID traces the operation across services.
 	CorrelationID string
