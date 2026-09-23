@@ -4,6 +4,8 @@ Serviço em Go 1.27 + Uber Fx que movimenta carteiras de jogadores a partir de u
 
 - Enunciado original: [`docs/CHALLENGE.md`](docs/CHALLENGE.md)
 - Decisões técnicas, limitações e interpretações: [`ARCHITECTURE.md`](ARCHITECTURE.md)
+- Broker policy examples and verification limits: [`docs/BROKER_SECURITY.md`](docs/BROKER_SECURITY.md)
+- Outbox retry and quarantine recovery: [`docs/OUTBOX_RECOVERY.md`](docs/OUTBOX_RECOVERY.md)
 
 ## Pré-requisitos
 
@@ -153,7 +155,7 @@ Os códigos HTTP, os corpos de erro e os `failureCode` estão em [`ARCHITECTURE.
 go test ./...          # unitários (sem Docker)
 go test -race ./...
 make vet               # go vet, também com as tags integration e e2e
-make lint              # gofmt/goimports, gocyclo ≤ 15, gocognit ≤ 20 (código e testes)
+make lint              # gofmt/goimports, gocyclo ≤ 6, gocognit ≤ 10 (code and tests)
 make                   # vet + lint + testes unitários com -race
 ```
 

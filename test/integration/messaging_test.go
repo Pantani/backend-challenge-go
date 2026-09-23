@@ -1229,7 +1229,7 @@ type poisonPublisher struct {
 
 func (p *poisonPublisher) Publish(ctx context.Context, m app.OutboxMessage) error {
 	if m.EventID == p.poison {
-		return fmt.Errorf("broker refuses this event")
+		return fmt.Errorf("%w: broker refuses this event", worker.ErrPermanentPublish)
 	}
 	return p.recordingPublisher.Publish(ctx, m)
 }
@@ -1259,7 +1259,7 @@ func TestPoisonOutboxEventIsDeadLetteredAndUnblocksItsWallet(t *testing.T) {
 	require.NoError(t, pool.QueryRow(context.Background(), `SELECT dead_lettered_at IS NOT NULL, last_error FROM outbox_events
 		WHERE event_id = $1`, poison).Scan(&dead, &lastError))
 	assert.True(t, dead)
-	assert.Equal(t, "broker refuses this event", lastError)
+	assert.Contains(t, lastError, "broker refuses this event")
 	assert.Zero(t, pub.count(poison))
 }
 

@@ -463,10 +463,10 @@ func (m *memStore) Reconcile(_ context.Context, walletID uuid.UUID) (app.Reconci
 
 func addSigned(snap *app.ReconciliationSnapshot, e wallet.LedgerEntry) {
 	if e.Direction() == wallet.Credit {
-		snap.Credits += e.Amount().Minor()
+		snap.NetMinor += e.Amount().Minor()
 		return
 	}
-	snap.Debits += e.Amount().Minor()
+	snap.NetMinor -= e.Amount().Minor()
 }
 
 func (m *memStore) ListDuePending(_ context.Context, now time.Time, limit int) ([]app.DueTransaction, error) {

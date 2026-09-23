@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -132,6 +133,7 @@ func TestDefensiveTransitionsOnTerminalRows(t *testing.T) {
 		}
 		h.store.lockMutate = func(s *wager.Snapshot) {
 			s.Status, s.ResultBalance = wager.StatusProcessed, testutil.BRL(t, "1.00")
+			s.ReferenceTxID = uuid.New()
 		}
 		assert.Zero(t, h.resolve(t), name)
 		assert.Contains(t, h.logs.String(), "could not mark pending reference as failed", name)
@@ -145,6 +147,7 @@ func TestDefensiveRejectOnTerminalRow(t *testing.T) {
 	h.store.putTx(res.Transaction.ID(), func(s *wager.Snapshot) { s.Attempts = 99 })
 	h.store.lockMutate = func(s *wager.Snapshot) {
 		s.Status, s.FailureCode = wager.StatusRejected, wager.CodeReferenceNotFound
+		s.ResultBalance = testutil.BRL(t, "1.00")
 	}
 	assert.Zero(t, h.resolve(t))
 	assert.Contains(t, h.logs.String(), "pending reference failed permanently")

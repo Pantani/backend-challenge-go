@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -9,6 +10,10 @@ import (
 
 	"github.com/Pantani/backend-challenge-go/internal/app"
 )
+
+// ErrPermanentPublish marks an invalid event payload that retrying cannot repair.
+// All unclassified publisher errors remain retryable, including configuration errors.
+var ErrPermanentPublish = errors.New("permanently invalid event payload")
 
 // Publisher delivers one outbox record to the broker.
 type Publisher interface {
@@ -24,7 +29,7 @@ type RelayMetrics interface {
 	OutboxPublished()
 	// OutboxFailure counts a failed publication attempt.
 	OutboxFailure()
-	// OutboxDeadLettered counts a record abandoned after MaxAttempts.
+	// OutboxDeadLettered counts a permanently invalid payload quarantined after MaxAttempts.
 	OutboxDeadLettered()
 	// OutboxLag reports the age of the oldest pending record (0 when none).
 	OutboxLag(d time.Duration)
@@ -50,7 +55,8 @@ type RelayConfig struct {
 	// accounting and the confirmation, retry or dead-letter mutation). A
 	// whole publication fits PublishTime + FinalizeTime, below Lease.
 	FinalizeTime time.Duration
-	// MaxAttempts dead-letters a record after that many failed publications.
+	// MaxAttempts quarantines explicitly permanent payload failures at this count.
+	// Transient and unclassified errors keep retrying with capped backoff.
 	MaxAttempts int
 }
 
@@ -131,18 +137,11 @@ func (r *Relay) publish(parent context.Context, m app.OutboxMessage) {
 	r.confirm(ctx, log, m)
 }
 
-// failed schedules a retry with backoff, or dead-letters a record that
-// exhausted its attempts so it stops blocking its wallet's later events.
+// failed preserves recovery after any number of transient failures. Only an
+// explicitly permanent payload can exhaust its attempts and be quarantined.
 func (r *Relay) failed(ctx context.Context, log *slog.Logger, m app.OutboxMessage, cause error) {
-	if m.Attempts >= r.cfg.MaxAttempts {
-		ok, err := r.store.MarkDead(ctx, m.EventID, m.ClaimID, r.clock.Now(), cause.Error())
-		if err != nil || !ok {
-			log.WarnContext(ctx, "outbox failure not recorded; lease expiry will release it", "error", err)
-			return
-		}
-		r.metrics.OutboxFailure()
-		r.metrics.OutboxDeadLettered()
-		log.ErrorContext(ctx, "outbox event dead-lettered after exhausting its attempts", "attempts", m.Attempts, "error", cause)
+	if errors.Is(cause, ErrPermanentPublish) && m.Attempts >= r.cfg.MaxAttempts {
+		r.quarantine(ctx, log, m, cause)
 		return
 	}
 	ok, err := r.store.MarkFailed(ctx, m.EventID, m.ClaimID, r.clock.Now().Add(r.backoff(m.Attempts)), cause.Error())
@@ -152,6 +151,17 @@ func (r *Relay) failed(ctx context.Context, log *slog.Logger, m app.OutboxMessag
 	}
 	r.metrics.OutboxFailure()
 	log.WarnContext(ctx, "outbox publish failed", "attempts", m.Attempts, "error", cause)
+}
+
+func (r *Relay) quarantine(ctx context.Context, log *slog.Logger, m app.OutboxMessage, cause error) {
+	ok, err := r.store.MarkDead(ctx, m.EventID, m.ClaimID, r.clock.Now(), cause.Error())
+	if err != nil || !ok {
+		log.WarnContext(ctx, "outbox failure not recorded; lease expiry will release it", "error", err)
+		return
+	}
+	r.metrics.OutboxFailure()
+	r.metrics.OutboxDeadLettered()
+	log.ErrorContext(ctx, "outbox event dead-lettered after exhausting its attempts", "attempts", m.Attempts, "error", cause)
 }
 
 // confirm records the publication. If this fails (or the lease was lost) the

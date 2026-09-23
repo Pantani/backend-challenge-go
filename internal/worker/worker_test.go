@@ -185,8 +185,9 @@ func (s *fakeStore) OldestPending(context.Context) (time.Time, bool, error) {
 }
 
 type fakePublisher struct {
-	fail map[uuid.UUID]bool
-	hook func(ctx context.Context, m app.OutboxMessage) // observes each call
+	fail      map[uuid.UUID]bool
+	permanent bool
+	hook      func(ctx context.Context, m app.OutboxMessage) // observes each call
 }
 
 func (p fakePublisher) Publish(ctx context.Context, m app.OutboxMessage) error {
@@ -194,6 +195,9 @@ func (p fakePublisher) Publish(ctx context.Context, m app.OutboxMessage) error {
 		p.hook(ctx, m)
 	}
 	if p.fail[m.EventID] {
+		if p.permanent {
+			return errors.Join(worker.ErrPermanentPublish, errBoom)
+		}
 		return errBoom
 	}
 	return nil
@@ -320,7 +324,7 @@ func TestRelayDeadLettersPoisonEvents(t *testing.T) {
 		{EventID: poison, Attempts: 49}, {EventID: last, Attempts: 48},
 	}}
 	logs := &testutil.SyncBuffer{}
-	newRelay(store, fakePublisher{fail: map[uuid.UUID]bool{poison: true, last: true}}, logs).Tick(context.Background())
+	newRelay(store, fakePublisher{fail: map[uuid.UUID]bool{poison: true, last: true}, permanent: true}, logs).Tick(context.Background())
 	assert.Equal(t, []uuid.UUID{poison}, store.dead)
 	assert.NotContains(t, store.failed, poison, "a dead-lettered event is not rescheduled")
 	assert.Contains(t, store.failed, last, "one attempt short of the limit is still retried")
@@ -331,7 +335,7 @@ func TestRelayMarkDeadFailureIsLogged(t *testing.T) {
 	poison := uuid.New()
 	store := &fakeStore{failed: map[uuid.UUID]time.Time{}, msgs: []app.OutboxMessage{{EventID: poison, Attempts: 49}}, markFailErr: errBoom}
 	logs := &testutil.SyncBuffer{}
-	newRelay(store, fakePublisher{fail: map[uuid.UUID]bool{poison: true}}, logs).Tick(context.Background())
+	newRelay(store, fakePublisher{fail: map[uuid.UUID]bool{poison: true}, permanent: true}, logs).Tick(context.Background())
 	assert.Equal(t, []uuid.UUID{poison}, store.dead, "MarkDead was attempted")
 	assert.Contains(t, logs.String(), "failure not recorded; lease expiry will release it")
 }
@@ -375,7 +379,7 @@ func TestRelayDeadMetricsRequireDurableMutation(t *testing.T) {
 	}
 	metrics := &relayMetrics{}
 
-	deadlineRelay(store, &deadlinePublisher{}, metrics).Tick(context.Background())
+	deadlineRelay(store, fakePublisher{fail: map[uuid.UUID]bool{id: true}, permanent: true}, metrics).Tick(context.Background())
 
 	assert.Equal(t, 0, metrics.failures, "a stale claim does not count a durable failure")
 	assert.Equal(t, 0, metrics.dead, "dead-lettering is counted only after MarkDead succeeds")
@@ -399,7 +403,7 @@ func TestRelayCountsDurableDeadLetter(t *testing.T) {
 	store := &fakeStore{failed: map[uuid.UUID]time.Time{}, msgs: []app.OutboxMessage{{EventID: id, Attempts: 1}}}
 	metrics := &relayMetrics{}
 
-	deadlineRelay(store, &deadlinePublisher{}, metrics).Tick(context.Background())
+	deadlineRelay(store, fakePublisher{fail: map[uuid.UUID]bool{id: true}, permanent: true}, metrics).Tick(context.Background())
 
 	assert.Equal(t, 1, metrics.failures)
 	assert.Equal(t, 1, metrics.dead)

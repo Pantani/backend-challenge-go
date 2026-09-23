@@ -191,34 +191,35 @@ func Rehydrate(s Snapshot) (*Transaction, error) {
 		createdAt: s.CreatedAt.UTC(), updatedAt: s.UpdatedAt.UTC()}, nil
 }
 
-func (s Snapshot) validate() error {
-	if err := validateCore(s.ID, s.WalletID, s.PlayerID, s.CreatedAt); err != nil {
-		return err
+func (t *Transaction) ensureOpen(target Status, now time.Time) error {
+	if t == nil {
+		return fmt.Errorf("%w: uninitialized transaction", ErrInvalidTransaction)
 	}
-	if !s.Kind.Valid() || !s.Status.Valid() || s.Amount.Validate() != nil {
-		return fmt.Errorf("%w: invalid kind, status or amount in snapshot", ErrInvalidTransaction)
-	}
-	if (s.Origin == OriginInternal) != (s.Kind == KindOpening) {
-		return fmt.Errorf("%w: origin %q does not match kind %s", ErrInvalidTransaction, s.Origin, s.Kind)
-	}
-	return validateReference(s.Kind, s.External.ReferenceExternalID)
-}
-
-func (t *Transaction) ensureOpen(target Status) error {
-	if t.status.Terminal() {
+	if t.status != StatusPending && t.status != StatusPendingReference {
 		return fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, t.status, target)
 	}
-	return nil
+	if err := t.snapshot().validate(); err != nil {
+		return err
+	}
+	return validateTimestamp(now, t.updatedAt)
+}
+
+func (t *Transaction) snapshot() Snapshot {
+	return Snapshot{ID: t.id, Origin: t.origin, Kind: t.kind, Status: t.status,
+		WalletID: t.walletID, PlayerID: t.playerID, Amount: t.amount, External: t.external,
+		ReferenceTxID: t.referenceTxID, FailureCode: t.failureCode, ResultBalance: t.resultBalance,
+		Attempts: t.attempts, NextAttemptAt: t.nextAttemptAt, CorrelationID: t.correlationID,
+		CreatedAt: t.createdAt, UpdatedAt: t.updatedAt}
 }
 
 // Process moves the transaction to PROCESSED, recording the balance returned
 // to the provider and the resolved reference. The reference must be uuid.Nil
-// for kinds that accept none and must be set for kinds that require one.
+// when no external reference was supplied and must be set when one was supplied.
 func (t *Transaction) Process(balance money.Money, referenceTxID uuid.UUID, now time.Time) error {
-	if err := t.ensureOpen(StatusProcessed); err != nil {
+	if err := t.ensureOpen(StatusProcessed, now); err != nil {
 		return err
 	}
-	if err := requireBalance(balance, "processed"); err != nil {
+	if err := requireProcessedBalance(balance, t.amount); err != nil {
 		return err
 	}
 	if err := t.checkResolvedReference(referenceTxID); err != nil {
@@ -233,8 +234,8 @@ func (t *Transaction) checkResolvedReference(referenceTxID uuid.UUID) error {
 	if referenceTxID != uuid.Nil && !t.kind.AcceptsReference() {
 		return fmt.Errorf("%w: %s cannot resolve a reference", ErrInvalidTransaction, t.kind)
 	}
-	if referenceTxID == uuid.Nil && t.kind.RequiresReference() {
-		return fmt.Errorf("%w: %s needs a resolved reference", ErrInvalidTransaction, t.kind)
+	if (referenceTxID != uuid.Nil) != (t.external.ReferenceExternalID != "") {
+		return fmt.Errorf("%w: resolved and external references must agree", ErrInvalidTransaction)
 	}
 	return nil
 }
@@ -242,7 +243,7 @@ func (t *Transaction) checkResolvedReference(referenceTxID uuid.UUID) error {
 // Reject moves the transaction to REJECTED with a business failure code and
 // the balance observed at decision time.
 func (t *Transaction) Reject(code FailureCode, observed money.Money, now time.Time) error {
-	if err := t.ensureOpen(StatusRejected); err != nil {
+	if err := t.ensureOpen(StatusRejected, now); err != nil {
 		return err
 	}
 	if err := requireCode(code, "rejection"); err != nil {
@@ -258,7 +259,7 @@ func (t *Transaction) Reject(code FailureCode, observed money.Money, now time.Ti
 
 // Fail moves the transaction to FAILED after a permanent infrastructure error.
 func (t *Transaction) Fail(code FailureCode, now time.Time) error {
-	if err := t.ensureOpen(StatusFailed); err != nil {
+	if err := t.ensureOpen(StatusFailed, now); err != nil {
 		return err
 	}
 	if err := requireCode(code, "failure"); err != nil {
@@ -276,8 +277,18 @@ func requireCode(code FailureCode, what string) error {
 	return nil
 }
 
+func requireProcessedBalance(balance, amount money.Money) error {
+	if err := requireBalance(balance, "processed"); err != nil {
+		return err
+	}
+	if balance.Currency() != amount.Currency() {
+		return fmt.Errorf("%w: processed balance currency differs from amount", ErrInvalidTransaction)
+	}
+	return nil
+}
+
 func requireBalance(balance money.Money, what string) error {
-	if balance.Validate() != nil {
+	if balance.Validate() != nil || balance.IsNegative() {
 		return fmt.Errorf("%w: %s transaction needs a result balance", ErrInvalidTransaction, what)
 	}
 	return nil
@@ -286,11 +297,14 @@ func requireBalance(balance money.Money, what string) error {
 // AwaitReference moves the transaction to PENDING_REFERENCE, counting the
 // attempt and scheduling the next resolution try.
 func (t *Transaction) AwaitReference(next, now time.Time) error {
-	if err := t.ensureOpen(StatusPendingReference); err != nil {
+	if err := t.ensureOpen(StatusPendingReference, now); err != nil {
 		return err
 	}
 	if !t.kind.AcceptsReference() || t.external.ReferenceExternalID == "" {
 		return fmt.Errorf("%w: %s has no reference to wait for", ErrInvalidTransition, t.kind)
+	}
+	if err := validateTimestamp(next, now); err != nil {
+		return err
 	}
 	t.status = StatusPendingReference
 	t.attempts++

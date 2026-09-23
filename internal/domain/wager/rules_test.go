@@ -167,7 +167,8 @@ func TestDecideReferenceMismatch(t *testing.T) {
 		mutate(&p)
 		ref, err := wager.NewExternal(p)
 		require.NoError(t, err)
-		require.NoError(t, ref.Process(f.wallet.Balance(), uuid.Nil, now))
+		balance := testutil.Money(t, "90.00", string(p.Amount.Currency()))
+		require.NoError(t, ref.Process(balance, uuid.Nil, now))
 		got := decide(f, f.tx(t, wager.KindRefund, "10.00", "b"), ref, false)
 		assert.Equal(t, wager.CodeReferenceMismatch, got.Code, name)
 	}

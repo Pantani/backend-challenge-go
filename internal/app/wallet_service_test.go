@@ -151,10 +151,8 @@ func TestReconcileOverflow(t *testing.T) {
 	maxM, err := money.FromMinor(math.MaxInt64, "BRL")
 	require.NoError(t, err)
 	snaps := []app.ReconciliationSnapshot{
-		{Stored: testutil.BRL(t, "0.00"), Credits: math.MinInt64},
-		{Stored: testutil.BRL(t, "0.00"), Debits: math.MinInt64},
-		{Stored: maxM, Debits: math.MaxInt64},
-		{Stored: testutil.BRL(t, "0.00"), Credits: math.MaxInt64, Debits: -math.MaxInt64},
+		{Stored: testutil.BRL(t, "0.00"), NetMinor: math.MinInt64},
+		{Stored: maxM, NetMinor: -math.MaxInt64},
 	}
 	for i, snap := range snaps {
 		svc := app.NewWalletService(app.WalletDeps{Deps: app.Deps{Queries: reconcileStub{newMemStore(), snap}}})

@@ -252,7 +252,7 @@ func TestGetTransactionRoutes(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, "PENDING_REFERENCE", resp["status"])
 	assert.Equal(t, "2026-09-08T12:00:00.000Z", resp["nextAttemptAt"])
-	assert.Equal(t, tx.ReferenceTxID().String(), resp["referenceTransactionId"])
+	assert.NotContains(t, resp, "referenceTransactionId", "pending reference is not resolved yet")
 	assert.NotContains(t, resp, "balance", "pending operations have no result balance yet")
 
 	rec, _ = f.do(t, call{method: http.MethodGet, path: "/wagering/transactions/" + uuid.NewString(), token: "admin"})

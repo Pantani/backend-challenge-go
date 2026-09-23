@@ -184,7 +184,7 @@ func (s *WalletService) Reconcile(ctx context.Context, walletID uuid.UUID) (Reco
 	if err != nil {
 		return Reconciliation{}, err
 	}
-	calculated, err := signedSum(snap)
+	calculated, err := money.FromMinor(snap.NetMinor, snap.Stored.Currency())
 	if err != nil {
 		return Reconciliation{}, err
 	}
@@ -200,16 +200,4 @@ func (s *WalletService) Reconcile(ctx context.Context, walletID uuid.UUID) (Reco
 			"stored", snap.Stored.Amount(), "calculated", calculated.Amount(), "difference", diff.Amount())
 	}
 	return rec, nil
-}
-
-func signedSum(snap ReconciliationSnapshot) (money.Money, error) {
-	credits, err := money.FromMinor(snap.Credits, snap.Stored.Currency())
-	if err != nil {
-		return money.Money{}, err
-	}
-	debits, err := money.FromMinor(snap.Debits, snap.Stored.Currency())
-	if err != nil {
-		return money.Money{}, err
-	}
-	return credits.Sub(debits)
 }

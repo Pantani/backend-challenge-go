@@ -26,11 +26,11 @@ linters:
     - copyloopvar
   settings:
     gocyclo:
-      # Reports functions whose cyclomatic complexity is greater than 15.
-      min-complexity: 15
+      # Reports functions whose cyclomatic complexity is greater than 6.
+      min-complexity: 6
     gocognit:
-      # Reports functions whose cognitive complexity is greater than 20.
-      min-complexity: 20
+      # Reports functions whose cognitive complexity is greater than 10.
+      min-complexity: 10
     gosec:
       excludes:
         - G115 # int conversions are bounds-checked explicitly where needed

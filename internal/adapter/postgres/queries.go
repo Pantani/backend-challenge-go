@@ -57,11 +57,11 @@ func (q *Queries) Reconcile(ctx context.Context, walletID uuid.UUID) (app.Reconc
 		currency string
 	)
 	err := q.pool.QueryRow(ctx, `SELECT w.balance_minor, w.currency,
-			COALESCE(SUM(l.amount_minor) FILTER (WHERE l.direction = 'CREDIT'), 0)::BIGINT,
-			COALESCE(SUM(l.amount_minor) FILTER (WHERE l.direction = 'DEBIT'), 0)::BIGINT,
+			COALESCE(SUM(CASE l.direction WHEN 'CREDIT' THEN l.amount_minor
+				ELSE -l.amount_minor END), 0)::BIGINT,
 			COUNT(l.id)
 		FROM wallets w LEFT JOIN ledger_entries l ON l.wallet_id = w.id
-		WHERE w.id = $1 GROUP BY w.id`, walletID).Scan(&stored, &currency, &snap.Credits, &snap.Debits, &snap.Entries)
+		WHERE w.id = $1 GROUP BY w.id`, walletID).Scan(&stored, &currency, &snap.NetMinor, &snap.Entries)
 	if err != nil {
 		return snap, notFound(err, app.ErrWalletNotFound)
 	}
