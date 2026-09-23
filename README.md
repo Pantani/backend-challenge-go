@@ -50,7 +50,7 @@ Há uma única migration inicial (`000001_init`) com o schema completo. Revertê
 - A `000001` cria o grupo `NOLOGIN` `wallet_app`, com `SELECT, INSERT` em `ledger_entries` e `SELECT, INSERT, UPDATE` em `wallets`, `wager_transactions`, `inbox_messages` e `outbox_events`.
 - O login `wallet_service` (membro de `wallet_app`, senha só local) é criado por `deploy/postgres/init/01-runtime-user.sql`, no compose e nos testcontainers. `app-1..3` conectam com ele; só o serviço `migrate` usa o dono. O `.env.example` também aponta para `wallet_service`.
 - O script de init só roda com o volume vazio: num volume antigo, recrie com `docker compose down -v` (`make clean`).
-- Em produção, o migrador precisa de `CREATEROLE` (ou um DBA cria `wallet_app` antes), e a senha do login vem de um cofre de segredos.
+- Em produção, o migrador precisa de `CREATEROLE` (ou um DBA cria `wallet_app` antes). O login é criado por um passo de provisionamento, fora das migrations, com a senha vinda de um cofre de segredos: `CREATE ROLE wallet_service LOGIN PASSWORD '…' IN ROLE wallet_app;` (ou `GRANT wallet_app TO wallet_service;` para um login existente).
 
 O binário devolve `0` em sucesso, `2` para comando ou argumentos inválidos (imprime o uso) e `1` para qualquer outra falha; erros vão para `stderr`, os logs JSON para `stdout`.
 
@@ -85,7 +85,7 @@ Todas têm padrão local, exceto `AWS_ENDPOINT_URL`, que vazio significa a AWS r
 | `STARTUP_TIMEOUT` | `25s` | prazo para construir e iniciar a aplicação |
 | `SHUTDOWN_TIMEOUT` | `61s` | prazo total do encerramento gracioso (consumidores param de buscar, HTTP drena, workers terminam, pool fecha) |
 
-A configuração é validada no início (`internal/config`) e todos os erros são reportados juntos: parse, `LOG_LEVEL`, valores não positivos, limites do SQS (`SQS_MAX_MESSAGES` 1–10, `SQS_WAIT_TIME` 0–20 s, visibilidade, `SQS_PROCESS_TIMEOUT`, `SQS_ACK_TIMEOUT` e `SQS_RETRY_MAX` ≤ 12 h), durações do SQS em segundos inteiros e timeouts do PostgreSQL em milissegundos inteiros (até 2147483647 ms) (os adaptadores truncariam o resto, e `0` desliga o timeout no PostgreSQL), bases de backoff ≤ máximos e `SQS_SENDER_PROVIDERS`. Duas relações evitam processamento duplicado: `SQS_VISIBILITY_TIMEOUT > SQS_MAX_MESSAGES × (SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT)` e `OUTBOX_PUBLISH_TIMEOUT + OUTBOX_FINALIZE_TIMEOUT < OUTBOX_LEASE`.
+A configuração é validada no início (`internal/config`) e todos os erros são reportados juntos: parse, `LOG_LEVEL`, valores não positivos, limites do SQS (`SQS_MAX_MESSAGES` 1–10, `SQS_WAIT_TIME` 0–20 s, visibilidade, `SQS_PROCESS_TIMEOUT`, `SQS_ACK_TIMEOUT` e `SQS_RETRY_MAX` ≤ 12 h), durações do SQS em segundos inteiros e timeouts do PostgreSQL em milissegundos inteiros, de 1 a 2147483647 ms (os adaptadores truncariam o resto; `0` é rejeitado porque desligaria o timeout), bases de backoff ≤ máximos e `SQS_SENDER_PROVIDERS`. Duas relações evitam processamento duplicado: `SQS_VISIBILITY_TIMEOUT > SQS_MAX_MESSAGES × (SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT)` e `OUTBOX_PUBLISH_TIMEOUT + OUTBOX_FINALIZE_TIMEOUT < OUTBOX_LEASE`.
 
 ## Autenticação
 
