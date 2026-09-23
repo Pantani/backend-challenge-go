@@ -154,6 +154,9 @@ func scanTransaction(row pgx.Row) (*wager.Transaction, error) {
 // toDomain rehydrates the row. Unknown currencies, of the amount or of the
 // observed result balance, are reported instead of being silently dropped.
 func (r transactionRow) toDomain() (*wager.Transaction, error) {
+	if wager.Status(r.status) == wager.StatusPending {
+		return nil, wager.ErrInvalidTransaction
+	}
 	amount, err := money.FromMinor(r.amount, money.Currency(r.currency))
 	if err != nil {
 		return nil, err

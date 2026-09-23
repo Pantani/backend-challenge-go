@@ -120,8 +120,8 @@ func (s Snapshot) validateWaiting() error {
 	if !s.Kind.AcceptsReference() || s.External.ReferenceExternalID == "" {
 		return fmt.Errorf("%w: waiting transaction has no reference", ErrInvalidTransaction)
 	}
-	if s.Attempts == 0 || s.NextAttemptAt.IsZero() {
-		return fmt.Errorf("%w: waiting transaction needs attempt and schedule", ErrInvalidTransaction)
+	if s.Attempts == 0 {
+		return fmt.Errorf("%w: waiting transaction needs an attempt", ErrInvalidTransaction)
 	}
-	return nil
+	return validateTimestamp(s.NextAttemptAt, s.UpdatedAt)
 }

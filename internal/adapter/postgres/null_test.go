@@ -74,18 +74,13 @@ func TestToDomain(t *testing.T) {
 	t.Parallel()
 	row := validRow()
 	row.status = "PENDING"
-	tx, err := row.toDomain()
-	require.NoError(t, err)
-	assert.Equal(t, wager.StatusPending, tx.Status())
-	assert.Equal(t, "", tx.External().ProviderID, "NULL columns become empty")
-	assert.Equal(t, uuid.Nil, tx.ReferenceTxID())
-	assert.True(t, tx.NextAttemptAt().IsZero())
-	assert.Error(t, tx.ResultBalance().Validate(), "no result observed")
+	_, err := row.toDomain()
+	require.ErrorIs(t, err, wager.ErrInvalidTransaction)
 
 	result, next, currency := int64(250), time.Now(), "BRL"
 	row.status = "PROCESSED"
 	row.result, row.resultCurrency, row.next = &result, &currency, &next
-	tx, err = row.toDomain()
+	tx, err := row.toDomain()
 	require.NoError(t, err)
 	assert.Equal(t, int64(250), tx.ResultBalance().Minor())
 	assert.Equal(t, uuid.Nil, tx.ReferenceTxID())

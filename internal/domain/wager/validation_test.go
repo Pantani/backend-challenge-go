@@ -175,3 +175,18 @@ func TestWinResolvedReferenceMatchesExternalReference(t *testing.T) {
 		})
 	}
 }
+
+func TestWaitingSnapshotRejectsRegressingSchedule(t *testing.T) {
+	s := validSnapshot(t)
+	s.Status = wager.StatusPendingReference
+	s.Kind = wager.KindRefund
+	s.External.ReferenceExternalID = "bet"
+	s.ResultBalance = money.Money{}
+	s.Attempts = 1
+	s.NextAttemptAt = s.UpdatedAt.Add(-time.Second)
+	_, err := wager.Rehydrate(s)
+	require.ErrorIs(t, err, wager.ErrInvalidTransaction)
+	s.NextAttemptAt = s.UpdatedAt
+	_, err = wager.Rehydrate(s)
+	require.NoError(t, err)
+}
