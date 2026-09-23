@@ -116,10 +116,9 @@ type LedgerRow struct {
 type ReconciliationSnapshot struct {
 	// Stored is the balance kept on the wallet row.
 	Stored money.Money
-	// Credits is the sum of credit entries in minor units.
-	Credits int64
-	// Debits is the sum of debit entries in minor units.
-	Debits int64
+	// NetMinor is the exact sum of credits minus debits in minor units.
+	// Historical turnover may exceed int64; only the net must fit.
+	NetMinor int64
 	// Entries is how many ledger entries were summed (opening included).
 	Entries int64
 }

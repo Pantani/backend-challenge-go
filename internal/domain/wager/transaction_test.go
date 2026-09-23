@@ -236,14 +236,18 @@ func TestPendingReferenceToProcessed(t *testing.T) {
 
 func TestRehydratedTerminalRefusesTransitions(t *testing.T) {
 	t.Parallel()
-	f := newFixture(t, "100.00")
 	bal := testutil.Money(t, "75.00", "BRL")
 	var txs []*wager.Transaction
 	for _, status := range []wager.Status{wager.StatusProcessed, wager.StatusRejected, wager.StatusFailed} {
-		tx, err := wager.Rehydrate(wager.Snapshot{
-			ID: uuid.New(), Origin: wager.OriginExternal, Kind: wager.KindBet, Status: status,
-			WalletID: f.walletID, PlayerID: f.playerID, Amount: testutil.Money(t, "1.00", "BRL"), CreatedAt: now, UpdatedAt: now,
-		})
+		snapshot := validSnapshot(t)
+		snapshot.Status = status
+		if status != wager.StatusProcessed {
+			snapshot.FailureCode = wager.CodeInternalFailure
+		}
+		if status == wager.StatusFailed {
+			snapshot.ResultBalance = money.Money{}
+		}
+		tx, err := wager.Rehydrate(snapshot)
 		require.NoError(t, err)
 		txs = append(txs, tx)
 	}
@@ -296,7 +300,7 @@ func TestRehydrate(t *testing.T) {
 	s := wager.Snapshot{
 		ID: uuid.New(), Origin: wager.OriginExternal, Kind: wager.KindBet, Status: wager.StatusProcessed,
 		WalletID: f.walletID, PlayerID: f.playerID, Amount: testutil.Money(t, "1.00", "BRL"),
-		External: wager.External{ProviderID: "p"}, ResultBalance: testutil.Money(t, "99.00", "BRL"),
+		External: f.params(t, wager.KindBet, "1.00", "").External, ResultBalance: testutil.Money(t, "99.00", "BRL"),
 		Attempts: 3, CorrelationID: "c", CreatedAt: now, UpdatedAt: now,
 	}
 	tx, err := wager.Rehydrate(s)

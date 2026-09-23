@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math/big"
 	"slices"
 	"sync"
 	"time"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/Pantani/backend-challenge-go/internal/app"
 	"github.com/Pantani/backend-challenge-go/internal/domain/event"
+	"github.com/Pantani/backend-challenge-go/internal/domain/money"
 	"github.com/Pantani/backend-challenge-go/internal/domain/wager"
 	"github.com/Pantani/backend-challenge-go/internal/domain/wallet"
 )
@@ -452,21 +454,27 @@ func (m *memStore) Reconcile(_ context.Context, walletID uuid.UUID) (app.Reconci
 		return app.ReconciliationSnapshot{}, app.ErrWalletNotFound
 	}
 	snap := app.ReconciliationSnapshot{Stored: s.Balance}
+	var net big.Int
 	for _, row := range m.st.ledger {
 		if row.Entry.WalletID() == walletID {
 			snap.Entries++
-			addSigned(&snap, row.Entry)
+			addSigned(&net, row.Entry)
 		}
 	}
+	if !net.IsInt64() {
+		return app.ReconciliationSnapshot{}, money.ErrOverflow
+	}
+	snap.NetMinor = net.Int64()
 	return snap, nil
 }
 
-func addSigned(snap *app.ReconciliationSnapshot, e wallet.LedgerEntry) {
+func addSigned(net *big.Int, e wallet.LedgerEntry) {
+	amount := big.NewInt(e.Amount().Minor())
 	if e.Direction() == wallet.Credit {
-		snap.Credits += e.Amount().Minor()
+		net.Add(net, amount)
 		return
 	}
-	snap.Debits += e.Amount().Minor()
+	net.Sub(net, amount)
 }
 
 func (m *memStore) ListDuePending(_ context.Context, now time.Time, limit int) ([]app.DueTransaction, error) {

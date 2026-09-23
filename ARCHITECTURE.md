@@ -25,7 +25,7 @@ O domínio não importa Fx, HTTP, SQS nem pgx (depende só de `google/uuid` e da
 
 Um único helper de backoff exponencial (`app.Backoff(base, máximo, expoente)` = `base × 2^expoente`, limitado ao máximo e sem overflow) serve às referências pendentes, ao consumidor SQS e ao relay da outbox.
 
-Complexidade: `golangci-lint` com `gocyclo` ≤ 15 e `gocognit` ≤ 20 vale para todo o código, testes incluídos.
+Complexity: `golangci-lint` enforces `gocyclo` ≤ 6 and `gocognit` ≤ 10 for production code and tests.
 
 ## 2. Dinheiro
 
@@ -40,6 +40,7 @@ Complexidade: `golangci-lint` com `gocyclo` ≤ 15 e `gocognit` ≤ 20 vale para
 - **Wallet**: `Open` (criação, versão 1; com saldo inicial positivo gera o crédito de abertura sem mudar a versão), `Rehydrate` (sem reaplicar nada) e `Apply(Movement)`, o único caminho que muda o saldo: valida moeda e valor positivo, impede saldo negativo, incrementa a versão e devolve o `LedgerEntry`.
 - **LedgerEntry**: o construtor valida `balanceAfter = balanceBefore ± amount`.
 - **WagerTransaction** (a reidratação também valida a referência, então uma linha corrompida vira erro, nunca pânico nas regras): `NewExternal` (política de zero: `LOSS` = `0.00`, os demais > 0; referência obrigatória em REFUND/ROLLBACK, opcional em WIN, proibida em BET/LOSS), `NewOpening` (sem provedor, chaves, rodada, jogo nem referência) e `Rehydrate`. Transições: `Process`, `Reject`, `Fail` e `AwaitReference`.
+- Rehydration validates identities, origin, operation, timestamps and state-specific fields without replaying transitions. Successful results must match the operation currency and resolved reference metadata. Rejections may retain the wallet balance in another currency when currency mismatch caused the rejection. Zero-value transactions cannot transition.
 - **Regras** (`wager.Decide`, função pura): recebe carteira, operação, referência (ou `nil`) e se a referência já foi revertida, e devolve `Process` (com direção), `Reject(code)` ou `Await`. A direção de um `ROLLBACK` vem de uma tabela explícita (BET → crédito; WIN/REFUND → débito); qualquer alvo fora dela é rejeitado com `REFERENCE_KIND_INVALID`, nunca "processado sem mover dinheiro".
 - **Validações do construtor** que o banco não cobre: uma operação não pode referenciar a si mesma; `Process` exige referência resolvida em REFUND/ROLLBACK e a proíbe em BET/LOSS; `Reject` e `Fail` exigem `failureCode`, e `Reject` valida o saldo observado.
 - Erros de domínio são sentinelas comparáveis com `errors.Is`. Nenhum `panic` representa regra de negócio.
@@ -138,7 +139,7 @@ Todos esses pontos são verificados em `test/integration/schema_test.go`. O pool
 - O relay (uma goroutine por instância) reivindica um evento por vez, imediatamente antes de publicá-lo, até `OUTBOX_BATCH` por rodada. Cada reivindicação grava um lease (`locked_by`, `locked_until`, `claim_id`); o `claim_id` é um token de fencing novo, então nem dois relays com o mesmo nome de instância conseguem aplicar um resultado velho depois que o lease foi retomado.
 - **Ordem por carteira**: cada rodada reivindica, por `partition_key` (carteira), apenas o evento não publicado mais antigo, e só se ele estiver vencido e sem lease. Um evento posterior nunca sai antes do anterior, mesmo que o anterior esteja em backoff ou nas mãos de outro relay, então o SQS FIFO recebe os eventos de cada carteira na ordem do banco. Para drenar carteiras com vários eventos, cada tick executa rodadas até não haver mais nada vencido (limite de 20). O custo é que uma falha no evento da frente segura os demais daquela carteira até o retry, o que é intencional.
 - Antes de publicar, `StartAttempt` confere o `claim_id` e o lease ainda válido, incrementa `attempts` e renova `locked_until`; um claim perdido é logado e abandonado. O cancelamento é verificado antes de cada nova reivindicação, então o shutdown não pega trabalho novo. Um evento já reivindicado termina num contexto desacoplado do `SIGTERM`, com prazo total `OUTBOX_PUBLISH_TIMEOUT + OUTBOX_FINALIZE_TIMEOUT` (a publicação no broker tem só o primeiro), que a configuração exige ser menor que `OUTBOX_LEASE`.
-- Uma publicação com falha libera o lease e agenda `next_attempt_at` com backoff exponencial (`attempts`, `last_error`). Depois de `OUTBOX_MAX_ATTEMPTS`, a linha recebe `dead_lettered_at` e deixa de bloquear a carteira. As métricas de publicado, falha e dead-letter só sobem depois que a escrita com fencing correspondente dá certo.
+- Failed publication releases the lease and schedules `next_attempt_at` with capped exponential backoff (`attempts`, `last_error`). Transient and unclassified errors remain eligible regardless of attempt count, including timeouts, authorization and queue configuration errors. Only an explicit SQS `InvalidMessageContents` payload error is permanent; after `OUTBOX_MAX_ATTEMPTS` it receives `dead_lettered_at` and stops blocking its wallet. Metrics change only after the corresponding fenced write succeeds. See [outbox recovery](docs/OUTBOX_RECOVERY.md) for inspection and recovery of records quarantined by the earlier policy.
 - **Republicação preserva o `eventId`**: ele está no payload imutável e é o `MessageDeduplicationId`. Dentro de 5 min o SQS FIFO descarta a duplicata. Depois disso, o consumidor deduplica por `eventId` (entrega at-least-once).
 - Destino: `wallet-events.fifo`, com `MessageGroupId` = `walletId` (ordem por carteira) e atributos `eventType`, `eventId` e `aggregateType`.
 
@@ -225,7 +226,7 @@ Todos são **resultados definitivos**, persistidos em `REJECTED`/`FAILED`: a ope
 
 ## 15. Reconciliação
 
-`POST /wallets/{id}/reconciliation` lê o saldo guardado e as somas de créditos e débitos do ledger (abertura incluída) **num único comando SQL**, portanto num snapshot consistente. `difference = stored − calculated`. Uma divergência aparece na resposta (`consistent:false`), num log `ERROR` e na métrica `wallet_reconciliation_divergences_total`. O saldo nunca é alterado.
+`POST /wallets/{id}/reconciliation` reads stored balance and the signed ledger sum (including opening) in one SQL statement and one consistent snapshot. PostgreSQL aggregates signed `BIGINT` amounts with exact arithmetic before converting the final net result to `BIGINT`; historical credit/debit turnover is not limited to `int64`. An unrepresentable net value remains an error. `difference = stored - calculated`. A divergence is returned as `consistent:false`, logged at ERROR and counted by `wallet_reconciliation_divergences_total`. Reconciliation never changes the balance.
 
 ## 16. Observabilidade
 
@@ -246,7 +247,7 @@ Todos são **resultados definitivos**, persistidos em `REJECTED`/`FAILED`: a ope
 
 - **Aceite assíncrono**: não há. Operações sem dependência são concluídas na transação da requisição, e só `PENDING_REFERENCE` é persistido e retomado. Por isso o cenário "interromper depois de confirmar `PENDING`" não se aplica: não existe `PENDING` commitado.
 - **Carteira × provedor**: o desafio não associa carteiras a provedores. Qualquer provedor autenticado pode operar numa carteira cujo `walletId`/`playerId` conheça (as operações e leituras continuam isoladas por provedor).
-- **IAM no broker**: o LocalStack community não aplica políticas IAM e reporta todo remetente como `000000000000`, então localmente o vínculo `SenderId` → provedor não distingue provedores. A política recomendada está no §11, e o vínculo está no §9.
+- **Broker IAM**: local sender-policy tests do not prove broker-enforced isolation. The local `000000000000=*` mapping allows every provider for that sender. Concrete same-account producer/runtime policy examples, exact `SenderId` requirements and the unsupported rotating-role-session case are documented in [broker security](docs/BROKER_SECURITY.md). These policies have not been deployed or verified against real AWS.
 - **Deduplicação no consumidor de eventos**: depois da janela de 5 min do SQS FIFO, uma republicação chega de novo com o mesmo `eventId`. Deduplicar por `eventId` é responsabilidade dos consumidores de `wallet-events.fifo`.
 - **Provisionamento**: as filas são criadas só com o atributo imutável `FifoQueue`, e os atributos mutáveis (redrive, visibilidade) são aplicados com `SetQueueAttributes`. Por isso reexecutar `provision-queues` reconcilia filas existentes. Trocar uma fila FIFO por uma padrão (ou o contrário) exige recriá-la.
 - **Retenção**: inbox e outbox publicada crescem indefinidamente. Em produção caberia um job de expurgo por idade (o trigger da outbox bloqueia `DELETE`, que precisaria ser liberado para um papel de manutenção).

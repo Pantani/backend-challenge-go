@@ -129,7 +129,8 @@ type Config struct {
 	OutboxPublishTimeout time.Duration
 	// OutboxFinalizeTimeout is shared by attempt accounting and its durable outcome.
 	OutboxFinalizeTimeout time.Duration
-	// OutboxMaxAttempts dead-letters an event after that many failures.
+	// OutboxMaxAttempts quarantines explicitly permanent payload failures.
+	// Transient publication errors have no attempt limit.
 	OutboxMaxAttempts int
 }
 
@@ -264,18 +265,26 @@ func (s SQS) validate() error {
 		{s.SQSMaxReceiveCount > 0, "SQS_MAX_RECEIVE_COUNT must be positive"},
 		{between(s.SQSMaxMessages, 1, 10), "SQS_MAX_MESSAGES must be between 1 and 10"},
 		// SQS takes wait, visibility and retry delays in whole seconds.
-		{whole(s.SQSWaitTime, time.Second) && s.SQSWaitTime >= 0 && s.SQSWaitTime <= maxSQSWaitTime, "SQS_WAIT_TIME must be whole seconds between 0s and 20s"},
-		{whole(s.SQSVisibilityTimeout, time.Second) && s.SQSVisibilityTimeout > 0 && s.SQSVisibilityTimeout <= maxSQSDuration, "SQS_VISIBILITY_TIMEOUT must be positive whole seconds, at most 12h"},
-		{s.SQSProcessTimeout > 0 && s.SQSProcessTimeout <= maxSQSDuration, "SQS_PROCESS_TIMEOUT must be positive, at most 12h"},
-		{s.SQSAckTimeout > 0 && s.SQSAckTimeout <= maxSQSDuration, "SQS_ACK_TIMEOUT must be positive, at most 12h"},
-		{whole(s.SQSRetryBase, time.Second) && s.SQSRetryBase > 0, "SQS_RETRY_BASE must be positive whole seconds"},
-		{whole(s.SQSRetryMax, time.Second) && s.SQSRetryMax > 0 && s.SQSRetryMax <= maxSQSDuration, "SQS_RETRY_MAX must be positive whole seconds, at most 12h"},
+		{wholeSecondsBetween(s.SQSWaitTime, 0, maxSQSWaitTime), "SQS_WAIT_TIME must be whole seconds between 0s and 20s"},
+		{wholeSecondsBetween(s.SQSVisibilityTimeout, time.Second, maxSQSDuration), "SQS_VISIBILITY_TIMEOUT must be positive whole seconds, at most 12h"},
+		{positiveSQSDuration(s.SQSProcessTimeout), "SQS_PROCESS_TIMEOUT must be positive, at most 12h"},
+		{positiveSQSDuration(s.SQSAckTimeout), "SQS_ACK_TIMEOUT must be positive, at most 12h"},
+		{wholeSecondsBetween(s.SQSRetryBase, time.Second, time.Duration(math.MaxInt64)), "SQS_RETRY_BASE must be positive whole seconds"},
+		{wholeSecondsBetween(s.SQSRetryMax, time.Second, maxSQSDuration), "SQS_RETRY_MAX must be positive whole seconds, at most 12h"},
 		{s.SQSRetryBase <= s.SQSRetryMax, "SQS_RETRY_BASE must not exceed SQS_RETRY_MAX"},
 		// The consumer handles a received batch serially, so the batch stays
 		// invisible for its whole worst case.
 		{s.SQSVisibilityTimeout > batch,
 			"SQS_VISIBILITY_TIMEOUT must exceed SQS_MAX_MESSAGES * (SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT)"},
 	}), namedSenderPolicyError(senderPolicyErr))
+}
+
+func wholeSecondsBetween(d, minimum, maximum time.Duration) bool {
+	return whole(d, time.Second) && d >= minimum && d <= maximum
+}
+
+func positiveSQSDuration(d time.Duration) bool {
+	return d > 0 && d <= maxSQSDuration
 }
 
 // pgTimeout reports whether d fits PostgreSQL's timeout settings: whole

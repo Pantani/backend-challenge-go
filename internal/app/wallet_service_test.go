@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"math"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -151,14 +152,61 @@ func TestReconcileOverflow(t *testing.T) {
 	maxM, err := money.FromMinor(math.MaxInt64, "BRL")
 	require.NoError(t, err)
 	snaps := []app.ReconciliationSnapshot{
-		{Stored: testutil.BRL(t, "0.00"), Credits: math.MinInt64},
-		{Stored: testutil.BRL(t, "0.00"), Debits: math.MinInt64},
-		{Stored: maxM, Debits: math.MaxInt64},
-		{Stored: testutil.BRL(t, "0.00"), Credits: math.MaxInt64, Debits: -math.MaxInt64},
+		{Stored: testutil.BRL(t, "0.00"), NetMinor: math.MinInt64},
+		{Stored: maxM, NetMinor: -math.MaxInt64},
 	}
 	for i, snap := range snaps {
 		svc := app.NewWalletService(app.WalletDeps{Deps: app.Deps{Queries: reconcileStub{newMemStore(), snap}}})
 		_, err := svc.Reconcile(context.Background(), uuid.New())
 		assert.ErrorIs(t, err, money.ErrOverflow, "case %d", i)
 	}
+}
+
+func TestMemReconcileExactAggregate(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		amounts  []int64
+		want     int64
+		overflow bool
+	}{
+		{"credit overflow", []int64{math.MaxInt64, 1}, 0, true},
+		{"debit overflow", []int64{-math.MaxInt64, -2}, 0, true},
+		{"intermediate overflow cancels", []int64{math.MaxInt64, 1, -math.MaxInt64}, 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			w := h.openWallet(t, "0.00")
+			for _, amount := range tc.amounts {
+				h.store.st.ledger = append(h.store.st.ledger, app.LedgerRow{Entry: reconciliationEntry(t, w.ID(), amount)})
+			}
+			got, err := h.store.Reconcile(context.Background(), w.ID())
+			if tc.overflow {
+				require.ErrorIs(t, err, money.ErrOverflow)
+				assert.Zero(t, got.NetMinor)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got.NetMinor)
+		})
+	}
+}
+
+func reconciliationEntry(t *testing.T, id uuid.UUID, minor int64) wallet.LedgerEntry {
+	t.Helper()
+	direction := wallet.Credit
+	before, after := int64(0), minor
+	if minor < 0 {
+		direction = wallet.Debit
+		before, after = -minor, 0
+		minor = -minor
+	}
+	amount, err := money.FromMinor(minor, "BRL")
+	require.NoError(t, err)
+	b, err := money.FromMinor(before, "BRL")
+	require.NoError(t, err)
+	a, err := money.FromMinor(after, "BRL")
+	require.NoError(t, err)
+	entry, err := wallet.NewLedgerEntry(wallet.LedgerEntryParams{ID: uuid.New(), WalletID: id, TransactionID: uuid.New(), Direction: direction, Amount: amount, BalanceBefore: b, BalanceAfter: a, CreatedAt: time.Now()})
+	require.NoError(t, err)
+	return entry
 }

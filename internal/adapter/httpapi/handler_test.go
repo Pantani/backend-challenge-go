@@ -146,12 +146,16 @@ func sampleTx(t *testing.T, provider string, status wager.Status) *wager.Transac
 			RoundID: "r", GameID: "g", ReferenceExternalID: "t-0"},
 		NextAttemptAt: now, CreatedAt: now, UpdatedAt: now,
 	}
-	if status == wager.StatusRejected {
+	if status != wager.StatusProcessed {
+		s.ReferenceTxID = uuid.Nil
+	}
+	if status == wager.StatusRejected || status == wager.StatusFailed {
 		s.FailureCode = wager.CodeInsufficientFunds
 	}
-	if status == wager.StatusPendingReference {
+	if status == wager.StatusPendingReference || status == wager.StatusFailed {
 		s.ResultBalance = money.Money{}
 	}
+	s.Attempts = 1
 	tx, err := wager.Rehydrate(s)
 	require.NoError(t, err)
 	return tx
