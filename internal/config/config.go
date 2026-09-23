@@ -251,8 +251,8 @@ func (d Database) validate() error {
 		{d.DatabaseURL != "", "DATABASE_URL is required"},
 		{between(d.DBMaxConns, 1, math.MaxInt32), "DB_MAX_CONNS must be between 1 and 2147483647"},
 		// PostgreSQL receives these in whole milliseconds, and 0 disables them.
-		{d.DBLockTimeout > 0 && whole(d.DBLockTimeout, time.Millisecond), "DB_LOCK_TIMEOUT must be a positive whole number of milliseconds"},
-		{d.DBStatementTimeout > 0 && whole(d.DBStatementTimeout, time.Millisecond), "DB_STATEMENT_TIMEOUT must be a positive whole number of milliseconds"},
+		{pgTimeout(d.DBLockTimeout), "DB_LOCK_TIMEOUT must be between 1 and 2147483647 whole milliseconds"},
+		{pgTimeout(d.DBStatementTimeout), "DB_STATEMENT_TIMEOUT must be between 1 and 2147483647 whole milliseconds"},
 	})
 }
 
@@ -276,6 +276,12 @@ func (s SQS) validate() error {
 		{s.SQSVisibilityTimeout > batch,
 			"SQS_VISIBILITY_TIMEOUT must exceed SQS_MAX_MESSAGES * (SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT)"},
 	}), namedSenderPolicyError(senderPolicyErr))
+}
+
+// pgTimeout reports whether d fits PostgreSQL's timeout settings: whole
+// milliseconds in a positive int32 (0 would disable the timeout).
+func pgTimeout(d time.Duration) bool {
+	return d > 0 && d <= math.MaxInt32*time.Millisecond && whole(d, time.Millisecond)
 }
 
 // whole reports whether d is an exact multiple of unit.

@@ -85,7 +85,7 @@ Todas têm padrão local, exceto `AWS_ENDPOINT_URL`, que vazio significa a AWS r
 | `STARTUP_TIMEOUT` | `25s` | prazo para construir e iniciar a aplicação |
 | `SHUTDOWN_TIMEOUT` | `61s` | prazo total do encerramento gracioso (consumidores param de buscar, HTTP drena, workers terminam, pool fecha) |
 
-A configuração é validada no início (`internal/config`) e todos os erros são reportados juntos: parse, `LOG_LEVEL`, valores não positivos, limites do SQS (`SQS_MAX_MESSAGES` 1–10, `SQS_WAIT_TIME` 0–20 s, visibilidade, `SQS_PROCESS_TIMEOUT`, `SQS_ACK_TIMEOUT` e `SQS_RETRY_MAX` ≤ 12 h), durações do SQS em segundos inteiros e timeouts do PostgreSQL em milissegundos inteiros (os adaptadores truncariam o resto, e `0` desliga o timeout no PostgreSQL), bases de backoff ≤ máximos e `SQS_SENDER_PROVIDERS`. Duas relações evitam processamento duplicado: `SQS_VISIBILITY_TIMEOUT > SQS_MAX_MESSAGES × (SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT)` e `OUTBOX_PUBLISH_TIMEOUT + OUTBOX_FINALIZE_TIMEOUT < OUTBOX_LEASE`.
+A configuração é validada no início (`internal/config`) e todos os erros são reportados juntos: parse, `LOG_LEVEL`, valores não positivos, limites do SQS (`SQS_MAX_MESSAGES` 1–10, `SQS_WAIT_TIME` 0–20 s, visibilidade, `SQS_PROCESS_TIMEOUT`, `SQS_ACK_TIMEOUT` e `SQS_RETRY_MAX` ≤ 12 h), durações do SQS em segundos inteiros e timeouts do PostgreSQL em milissegundos inteiros (até 2147483647 ms) (os adaptadores truncariam o resto, e `0` desliga o timeout no PostgreSQL), bases de backoff ≤ máximos e `SQS_SENDER_PROVIDERS`. Duas relações evitam processamento duplicado: `SQS_VISIBILITY_TIMEOUT > SQS_MAX_MESSAGES × (SQS_PROCESS_TIMEOUT + SQS_ACK_TIMEOUT)` e `OUTBOX_PUBLISH_TIMEOUT + OUTBOX_FINALIZE_TIMEOUT < OUTBOX_LEASE`.
 
 ## Autenticação
 

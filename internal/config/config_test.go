@@ -120,9 +120,11 @@ func TestLoadRejectsDurationsTheAdaptersWouldTruncate(t *testing.T) {
 func TestLoadRejectsValuesThatWouldOverflow(t *testing.T) {
 	t.Parallel()
 	tests := map[string]map[string]string{
-		"DB_MAX_CONNS":        {"DB_MAX_CONNS": "4294967297"},
-		"SQS_PROCESS_TIMEOUT": {"SQS_PROCESS_TIMEOUT": "2562047h"},
-		"SQS_ACK_TIMEOUT":     {"SQS_ACK_TIMEOUT": "2562047h"},
+		"DB_MAX_CONNS":         {"DB_MAX_CONNS": "4294967297"},
+		"DB_LOCK_TIMEOUT":      {"DB_LOCK_TIMEOUT": "600h"},
+		"DB_STATEMENT_TIMEOUT": {"DB_STATEMENT_TIMEOUT": "600h"},
+		"SQS_PROCESS_TIMEOUT":  {"SQS_PROCESS_TIMEOUT": "2562047h"},
+		"SQS_ACK_TIMEOUT":      {"SQS_ACK_TIMEOUT": "2562047h"},
 		"OUTBOX_LEASE": {
 			"OUTBOX_PUBLISH_TIMEOUT":  "2562047h",
 			"OUTBOX_FINALIZE_TIMEOUT": "2562047h",

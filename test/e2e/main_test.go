@@ -163,7 +163,8 @@ type processRun struct {
 	cmd     *exec.Cmd
 	done    chan struct{} // closed once Wait returned
 	waitErr error
-	killed  bool // crashed on purpose, so its exit status is expected
+	killed  bool  // crashed on purpose, so its exit status is expected
+	killErr error // result of the kill and reap, reported again on cleanup
 	// logs is written by the exec copier goroutine while the process runs.
 	logs testutil.SyncBuffer
 }
@@ -253,7 +254,8 @@ func get(ctx context.Context, url string) (int, error) {
 // kill simulates an abrupt crash (SIGKILL) and reaps the child.
 func (r *processRun) kill(ctx context.Context) error {
 	r.killed = true
-	return errors.Join(processSignalError(r.cmd.Process.Kill()), waitDone(ctx, r.done))
+	r.killErr = errors.Join(processSignalError(r.cmd.Process.Kill()), waitDone(ctx, r.done))
+	return r.killErr
 }
 
 // stop sends SIGTERM and falls back to kill after 15 seconds, which covers
@@ -261,7 +263,7 @@ func (r *processRun) kill(ctx context.Context) error {
 // on its own (not killed by a test) fails the cleanup with its exit status.
 func (r *processRun) stop(ctx context.Context) error {
 	if r.killed {
-		return nil
+		return r.killErr
 	}
 	select {
 	case <-r.done:
