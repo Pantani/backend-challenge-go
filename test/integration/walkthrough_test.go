@@ -44,6 +44,7 @@ func TestWalkthrough(t *testing.T) {
 	}
 }
 
+// walkthroughAccess checks health endpoints and rejects missing or unauthorized credentials.
 func walkthroughAccess(t *testing.T, r runningApp) {
 	t.Helper()
 	for _, path := range []string{"/health/live", "/health/ready"} {
@@ -54,11 +55,13 @@ func walkthroughAccess(t *testing.T, r runningApp) {
 	require.Equal(t, http.StatusForbidden, r.http.Call(t, http.MethodGet, path, "provider-a", "", nil).Status)
 }
 
+// walkthroughBalance checks the persisted wallet balance through the HTTP API.
 func walkthroughBalance(t *testing.T, r runningApp, w testenv.Wallet, amount string) {
 	t.Helper()
 	require.Equal(t, map[string]any{"amount": amount, "currency": "BRL"}, r.wallet(t, w.ID)["balance"])
 }
 
+// walkthroughSubmit submits an authenticated operation and checks its HTTP status.
 func walkthroughSubmit(t *testing.T, r runningApp, w testenv.Wallet, ext, kind, amount, ref string, status int) testenv.Response {
 	t.Helper()
 	res, err := r.http.Submit(t.Context(), w, "provider-a", ext, kind, amount, ref)
@@ -67,6 +70,7 @@ func walkthroughSubmit(t *testing.T, r runningApp, w testenv.Wallet, ext, kind, 
 	return res
 }
 
+// walkthroughBet checks deduplication, conflicting payloads and provider isolation.
 func walkthroughBet(t *testing.T, r runningApp, w testenv.Wallet, prefix string) {
 	t.Helper()
 	ext := prefix + "-bet"
@@ -90,6 +94,7 @@ func walkthroughBet(t *testing.T, r runningApp, w testenv.Wallet, prefix string)
 	walkthroughBalance(t, r, w, "975.00")
 }
 
+// walkthroughOperations checks each operation against independently calculated balances.
 func walkthroughOperations(t *testing.T, r runningApp, w testenv.Wallet, prefix string) {
 	t.Helper()
 	cases := []struct{ ext, kind, amount, ref, balance, status, failure string }{
@@ -117,6 +122,7 @@ func walkthroughOperations(t *testing.T, r runningApp, w testenv.Wallet, prefix 
 	}
 }
 
+// walkthroughAwait waits for asynchronous processing with a bounded deadline.
 func walkthroughAwait(t *testing.T, r runningApp, ext string) {
 	t.Helper()
 	require.EventuallyWithT(t, func(c *assert.CollectT) {
@@ -129,6 +135,7 @@ func walkthroughAwait(t *testing.T, r runningApp, ext string) {
 	}, 30*time.Second, 100*time.Millisecond)
 }
 
+// walkthroughPending checks that a refund waits for its missing bet and then resolves.
 func walkthroughPending(t *testing.T, r runningApp, w testenv.Wallet, prefix string) {
 	t.Helper()
 	bet, refund := prefix+"-late-bet", prefix+"-early-refund"
@@ -141,6 +148,7 @@ func walkthroughPending(t *testing.T, r runningApp, w testenv.Wallet, prefix str
 	walkthroughBalance(t, r, w, "1000.00")
 }
 
+// walkthroughQueue checks SQS processing and a subsequent HTTP replay without a second debit.
 func walkthroughQueue(t *testing.T, r runningApp, w testenv.Wallet, prefix string) {
 	t.Helper()
 	ext, messageID := prefix+"-sqs", prefix+"-message"
@@ -159,6 +167,7 @@ func walkthroughQueue(t *testing.T, r runningApp, w testenv.Wallet, prefix strin
 	walkthroughBalance(t, r, w, "985.00")
 }
 
+// walkthroughLedger checks pagination completeness and reconciles the final balance.
 func walkthroughLedger(t *testing.T, r runningApp, w testenv.Wallet) {
 	t.Helper()
 	cursor := ""
@@ -189,6 +198,7 @@ func walkthroughLedger(t *testing.T, r runningApp, w testenv.Wallet) {
 	require.Equal(t, map[string]any{"amount": "985.00", "currency": "BRL"}, rec.Body["calculatedBalance"])
 }
 
+// walkthroughOutbox waits for publication acknowledgements for every wallet event.
 func walkthroughOutbox(t *testing.T, w testenv.Wallet) {
 	t.Helper()
 	require.EventuallyWithT(t, func(c *assert.CollectT) {

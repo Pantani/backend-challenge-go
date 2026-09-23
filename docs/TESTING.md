@@ -72,6 +72,7 @@ token() {
 }
 ADMIN=$(token wallet-service)
 PROVIDER_A=$(token provider-a)
+PROVIDER_B=$(token provider-b)
 PLAYER=$(uuidgen | tr '[:upper:]' '[:lower:]')
 PREFIX=$(uuidgen | tr '[:upper:]' '[:lower:]')
 WALLET=$(curl -fsS localhost:8080/wallets \
@@ -107,11 +108,27 @@ curl -fsS "localhost:8082/providers/provider-a/wagering/transactions/$PREFIX-ear
 
 Compare each response with the table above. Repeat the last GET until the refund
 is `PROCESSED`; the wallet returns to 1000.00. Re-fetch expired tokens if needed.
-To check access control, GET `/wallets/$WALLET` without a token (401) and with the
-provider token (403). Read the BET using both
-`/providers/provider-a/wagering/transactions/$PREFIX-bet` and
-`/wagering/transactions/<transactionId>` with the provider token. The latter must
-return 404 with a `provider-b` token.
+Check access control and read the BET as its owning provider. Capture the
+transaction ID before attempting the same read as another provider:
+
+```sh
+curl -sS -w '\nHTTP %{http_code}\n' "localhost:8082/wallets/$WALLET"
+# Expected: HTTP 401.
+curl -sS -w '\nHTTP %{http_code}\n' "localhost:8082/wallets/$WALLET" \
+  -H "Authorization: Bearer $PROVIDER_A"
+# Expected: HTTP 403.
+TRANSACTION_ID=$(curl -fsS "localhost:8082/providers/provider-a/wagering/transactions/$PREFIX-bet" \
+  -H "Authorization: Bearer $PROVIDER_A" | jq -er .transactionId)
+curl -sS -w '\nHTTP %{http_code}\n' "localhost:8082/wagering/transactions/$TRANSACTION_ID" \
+  -H "Authorization: Bearer $PROVIDER_A"
+# Expected: HTTP 200, with the same transactionId and status PROCESSED.
+curl -sS -w '\nHTTP %{http_code}\n' "localhost:8082/wagering/transactions/$TRANSACTION_ID" \
+  -H "Authorization: Bearer $PROVIDER_B"
+# Expected: HTTP 404; another provider cannot read this transaction.
+```
+
+The negative checks omit curl's `-f` option so the response body and expected
+HTTP error status remain visible.
 
 Submit the final bet through SQS:
 
